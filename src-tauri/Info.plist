@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>NSContactsUsageDescription</key>
+  <string>Syn utilise les contacts que vous autorisez pour identifier vos correspondants et préparer vos demandes.</string>
+  <key>NSCalendarsFullAccessUsageDescription</key>
+  <string>Syn utilise votre calendrier pour afficher, créer et modifier des événements à votre demande.</string>
+  <key>NSRemindersFullAccessUsageDescription</key>
+  <string>Syn utilise vos rappels pour gérer les tâches que vous lui confiez.</string>
+  <key>NSPhotoLibraryUsageDescription</key>
+  <string>Syn utilise les photos que vous autorisez pour les retrouver et les organiser à votre demande.</string>
+  <key>NSAppleEventsUsageDescription</key>
+  <string>Syn utilise l’automatisation uniquement pour les applications et actions que vous autorisez.</string>
+</dict>
+</plist>

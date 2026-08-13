@@ -1,0 +1,810 @@
+//! Connecteur Files (deep-dive dédié — la brique de la Phase 1).
+//! Lit, extrait, indexe, surveille. N'organise pas (le rangement est un outil).
+//! Moindre privilège : uniquement les dossiers choisis. Tout échec = skip + log.
+
+use crate::bus::{Bus, BusEvent};
+use crate::db::{now, Db};
+use crate::error::Result;
+use crate::ingestion::{self, extract};
+use crate::llm::LlmClient;
+use crate::memory::{self, Item};
+use notify::RecursiveMode;
+use notify_debouncer_mini::{new_debouncer, DebouncedEventKind};
+use rusqlite::params;
+use serde::Serialize;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use tokio::sync::mpsc;
+
+/// Système d'exclusion (Média §B3 — le fix du désastre Minecraft),
+/// appliqué AUSSI à l'indexation (Files §2).
+const EXCLUDED_DIRS: &[&str] = &[
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    "out",
+    "__pycache__",
+    "venv",
+    ".venv",
+    "env",
+    "library",
+    "application support",
+    "caches",
+    "cache",
+    "logs",
+    "tmp",
+    "temp",
+    "minecraft",
+    ".minecraft",
+    "steamapps",
+    "resourcepacks",
+    "texturepacks",
+    "shaderpacks",
+    "saves",
+    "appdata",
+    "program files",
+    "windows",
+];
+const EXCLUDED_BUNDLES: &[&str] = &[
+    ".app",
+    ".bundle",
+    ".framework",
+    ".photoslibrary",
+    ".imovielibrary",
+];
+const PROJECT_MARKERS: &[&str] = &[
+    ".git",
+    "package.json",
+    "Cargo.toml",
+    "pyproject.toml",
+    "go.mod",
+    "pom.xml",
+    "Makefile",
+];
+const SENSITIVE_HINTS: &[&str] = &[
+    "santé",
+    "sante",
+    "medical",
+    "médical",
+    "ordonnance",
+    "mutuelle",
+    "impot",
+    "impôt",
+    "impots",
+    "banque",
+    "iban",
+    "rib",
+    "salaire",
+    "bulletin",
+    "paie",
+    "paye",
+    "passeport",
+    "passport",
+    "cni",
+    "identité",
+    "identite",
+    "carte_identite",
+    "fiche_de_paie",
+    "avis-imposition",
+];
+const MAX_FILE_SIZE: u64 = 200 * 1024 * 1024;
+const TECHNICAL_FILE_NAMES: &[&str] = &[
+    ".ds_store",
+    "thumbs.db",
+    "desktop.ini",
+    "package-lock.json",
+    "cargo.lock",
+];
+const TECHNICAL_EXTENSIONS: &[&str] = &[
+    "db",
+    "db-shm",
+    "db-wal",
+    "sqlite",
+    "sqlite-shm",
+    "sqlite-wal",
+    "sqlite3",
+    "musicdb",
+    "lock",
+    "tmp",
+    "cache",
+];
+
+pub fn is_excluded_dir(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    if lower.starts_with('.') {
+        return true; // dossiers cachés (conventions par OS)
+    }
+    if EXCLUDED_BUNDLES.iter().any(|b| lower.ends_with(b)) {
+        return true;
+    }
+    EXCLUDED_DIRS.iter().any(|d| lower == *d)
+}
+
+pub fn is_project_root(dir: &Path) -> bool {
+    PROJECT_MARKERS.iter().any(|m| dir.join(m).exists())
+}
+
+pub fn looks_sensitive(path: &Path) -> bool {
+    let s = path.to_string_lossy().to_lowercase();
+    SENSITIVE_HINTS.iter().any(|h| s.contains(h))
+}
+
+pub fn is_technical_file(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    TECHNICAL_FILE_NAMES.contains(&name.as_str()) || TECHNICAL_EXTENSIONS.contains(&ext.as_str())
+}
+
+#[derive(Debug)]
+pub enum IndexJob {
+    FullScan(Option<PathBuf>),
+    Paths(Vec<PathBuf>),
+    Shutdown,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct IndexStatus {
+    pub running: bool,
+    pub done: u64,
+    pub total: u64,
+    pub current: Option<String>,
+    pub items_count: i64,
+    pub pending_embeddings: i64,
+    pub sensitive_skipped: i64,
+    pub folders: Vec<FolderStatus>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FolderStatus {
+    pub path: String,
+    pub last_indexed: Option<i64>,
+}
+
+pub struct Indexer {
+    pub tx: mpsc::UnboundedSender<IndexJob>,
+    pub running: Arc<AtomicBool>,
+    pub paused: Arc<AtomicBool>,
+    pub stopping: Arc<AtomicBool>,
+    pub stopped: Arc<AtomicBool>,
+    pub done: Arc<AtomicU64>,
+    pub total: Arc<AtomicU64>,
+    pub current: Arc<std::sync::Mutex<Option<String>>>,
+    _watcher: std::sync::Mutex<Option<notify_debouncer_mini::Debouncer<notify::FsEventWatcher>>>,
+    worker: std::sync::Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
+}
+
+impl Indexer {
+    /// Démarre la boucle d'ingestion (fond, basse priorité, throttlée — Files §6)
+    /// et la surveillance FS (debounce 2 s — Files §5).
+    pub fn start(db: Db, llm: Arc<dyn LlmClient>, bus: Bus, embed_model: String) -> Arc<Indexer> {
+        let (tx, mut rx) = mpsc::unbounded_channel::<IndexJob>();
+        let indexer = Arc::new(Indexer {
+            tx: tx.clone(),
+            running: Arc::new(AtomicBool::new(false)),
+            paused: Arc::new(AtomicBool::new(false)),
+            stopping: Arc::new(AtomicBool::new(false)),
+            stopped: Arc::new(AtomicBool::new(false)),
+            done: Arc::new(AtomicU64::new(0)),
+            total: Arc::new(AtomicU64::new(0)),
+            current: Arc::new(std::sync::Mutex::new(None)),
+            _watcher: std::sync::Mutex::new(None),
+            worker: std::sync::Mutex::new(None),
+        });
+
+        // Watcher FS → jobs incrémentaux.
+        {
+            let tx_watch = tx.clone();
+            let mut debouncer = new_debouncer(
+                std::time::Duration::from_secs(2),
+                move |events: notify_debouncer_mini::DebounceEventResult| {
+                    if let Ok(events) = events {
+                        let paths: Vec<PathBuf> = events
+                            .into_iter()
+                            .filter(|e| matches!(e.kind, DebouncedEventKind::Any))
+                            .map(|e| e.path)
+                            .collect();
+                        if !paths.is_empty() {
+                            let _ = tx_watch.send(IndexJob::Paths(paths));
+                        }
+                    }
+                },
+            )
+            .ok();
+            if let (Some(deb), Ok(folders)) = (debouncer.as_mut(), folder_paths(&db)) {
+                for f in &folders {
+                    let _ = deb.watcher().watch(Path::new(f), RecursiveMode::Recursive);
+                }
+            }
+            *indexer._watcher.lock().unwrap() = debouncer;
+        }
+
+        // Boucle d'ingestion.
+        let ix = indexer.clone();
+        let worker = tauri::async_runtime::spawn(async move {
+            while let Some(job) = rx.recv().await {
+                if ix.stopping.load(Ordering::SeqCst) || matches!(job, IndexJob::Shutdown) {
+                    break;
+                }
+                ix.running.store(true, Ordering::SeqCst);
+                let result = match job {
+                    IndexJob::FullScan(one) => {
+                        ix.full_scan(&db, &llm, &bus, &embed_model, one).await
+                    }
+                    IndexJob::Paths(paths) => {
+                        ix.incremental(&db, &llm, &bus, &embed_model, paths).await
+                    }
+                    IndexJob::Shutdown => break,
+                };
+                if let Err(e) = result {
+                    bus.emit(BusEvent::FilesError {
+                        path: String::new(),
+                        reason: e.to_string(),
+                    });
+                }
+                ix.running.store(false, Ordering::SeqCst);
+                bus.emit(BusEvent::IngestionStatus {
+                    state: "idle".into(),
+                    current: None,
+                    done: ix.done.load(Ordering::SeqCst),
+                    total: ix.total.load(Ordering::SeqCst),
+                });
+            }
+            ix.running.store(false, Ordering::SeqCst);
+            ix.stopped.store(true, Ordering::SeqCst);
+        });
+        *indexer.worker.lock().unwrap() = Some(worker);
+        indexer
+    }
+
+    pub fn watch_folder(&self, path: &Path) {
+        if let Some(deb) = self._watcher.lock().unwrap().as_mut() {
+            let _ = deb.watcher().watch(path, RecursiveMode::Recursive);
+        }
+    }
+
+    pub fn unwatch_folder(&self, path: &Path) {
+        if let Some(deb) = self._watcher.lock().unwrap().as_mut() {
+            let _ = deb.watcher().unwatch(path);
+        }
+    }
+
+    /// Coupe immédiatement le watcher et demande l'arrêt de la boucle. Les scans
+    /// vérifient aussi ce drapeau entre chaque fichier afin qu'un verrouillage ne
+    /// laisse pas l'indexation continuer avec une base déjà ouverte.
+    pub fn stop(&self) {
+        self.stopping.store(true, Ordering::SeqCst);
+        self.paused.store(false, Ordering::SeqCst);
+        *self._watcher.lock().unwrap() = None;
+        let _ = self.tx.send(IndexJob::Shutdown);
+    }
+
+    pub async fn stop_and_wait(&self) {
+        self.stop();
+        let worker = self.worker.lock().unwrap().take();
+        if let Some(worker) = worker {
+            let _ = worker.await;
+        }
+    }
+
+    async fn full_scan(
+        &self,
+        db: &Db,
+        llm: &Arc<dyn LlmClient>,
+        bus: &Bus,
+        embed_model: &str,
+        only: Option<PathBuf>,
+    ) -> Result<()> {
+        let folders = match only {
+            Some(p) => vec![p.to_string_lossy().to_string()],
+            None => folder_paths(db)?,
+        };
+        crate::security::log_access(db, "files", "full_scan", None);
+
+        // 1. Énumération (walk + exclusions + projets atomiques).
+        let mut files: Vec<PathBuf> = vec![];
+        let mut projects: Vec<PathBuf> = vec![];
+        for folder in &folders {
+            walk_collect(
+                Path::new(folder),
+                &mut files,
+                &mut projects,
+                0,
+                &self.stopping,
+            );
+        }
+        self.total
+            .store((files.len() + projects.len()) as u64, Ordering::SeqCst);
+        self.done.store(0, Ordering::SeqCst);
+
+        // 2. Traitement incrémental, throttlé, reprenable (checkpoint = upsert par fichier).
+        for project in projects {
+            if self.stopping.load(Ordering::SeqCst) {
+                break;
+            }
+            if !is_path_in_active_scope(db, &project)? {
+                continue;
+            }
+            self.set_current(&project);
+            if let Err(e) = index_project(db, llm, bus, embed_model, &project).await {
+                bus.emit(BusEvent::FilesError {
+                    path: project.to_string_lossy().into(),
+                    reason: e.to_string(),
+                });
+            }
+            self.tick(bus).await;
+        }
+        for file in files {
+            if self.stopping.load(Ordering::SeqCst) {
+                break;
+            }
+            if !is_path_in_active_scope(db, &file)? {
+                continue;
+            }
+            self.set_current(&file);
+            if let Err(e) = index_file(db, llm, bus, embed_model, &file).await {
+                bus.emit(BusEvent::FilesError {
+                    path: file.to_string_lossy().into(),
+                    reason: e.to_string(),
+                });
+            }
+            self.tick(bus).await;
+        }
+
+        for folder in &folders {
+            db.with(|c| {
+                c.execute(
+                    "UPDATE folders SET last_indexed=?2 WHERE path=?1",
+                    params![folder, now()],
+                )?;
+                Ok(())
+            })?;
+        }
+        *self.current.lock().unwrap() = None;
+        Ok(())
+    }
+
+    async fn incremental(
+        &self,
+        db: &Db,
+        llm: &Arc<dyn LlmClient>,
+        bus: &Bus,
+        embed_model: &str,
+        paths: Vec<PathBuf>,
+    ) -> Result<()> {
+        for path in paths {
+            if self.stopping.load(Ordering::SeqCst) {
+                break;
+            }
+            if !is_path_in_active_scope(db, &path)? {
+                continue;
+            }
+            if path
+                .components()
+                .any(|c| is_excluded_dir(&c.as_os_str().to_string_lossy()))
+            {
+                continue;
+            }
+            if !path.exists() {
+                // Suppression : marquer retiré, ne pas casser les citations passées.
+                let _ = memory::mark_removed(db, "files", &path.to_string_lossy());
+                continue;
+            }
+            if path.is_dir() {
+                continue;
+            }
+            self.set_current(&path);
+            if let Err(e) = index_file(db, llm, bus, embed_model, &path).await {
+                bus.emit(BusEvent::FilesError {
+                    path: path.to_string_lossy().into(),
+                    reason: e.to_string(),
+                });
+            }
+            self.tick(bus).await;
+        }
+        Ok(())
+    }
+
+    fn set_current(&self, p: &Path) {
+        *self.current.lock().unwrap() = Some(p.to_string_lossy().to_string());
+    }
+
+    /// Throttle + pause (mode économie / batterie faible) + progression.
+    async fn tick(&self, bus: &Bus) {
+        let done = self.done.fetch_add(1, Ordering::SeqCst) + 1;
+        let total = self.total.load(Ordering::SeqCst);
+        if done.is_multiple_of(10) || done == total {
+            bus.emit(BusEvent::IngestionStatus {
+                state: "indexing".into(),
+                current: self.current.lock().unwrap().clone(),
+                done,
+                total,
+            });
+        }
+        while self.paused.load(Ordering::SeqCst) {
+            if self.stopping.load(Ordering::SeqCst) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+        // Basse priorité : l'interactif prime toujours.
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+    }
+
+    pub fn status(&self, db: &Db) -> Result<IndexStatus> {
+        let (items_count, pending, sensitive) = db.with(|c| {
+            let items: i64 = c.query_row(
+                "SELECT COUNT(*) FROM items WHERE source='files' AND status='active'",
+                [],
+                |r| r.get(0),
+            )?;
+            let pending: i64 =
+                c.query_row("SELECT COUNT(*) FROM embeddings WHERE vector IS NULL", [], |r| r.get(0))?;
+            let sensitive: i64 = c.query_row(
+                "SELECT COUNT(*) FROM items WHERE source='files' AND type='sensible_non_lu' AND status='active'",
+                [],
+                |r| r.get(0),
+            )?;
+            Ok((items, pending, sensitive))
+        })?;
+        let folders = db.with(|c| {
+            let mut stmt = c.prepare(
+                "SELECT path, last_indexed FROM folders WHERE status='active' ORDER BY path",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok(FolderStatus {
+                    path: r.get(0)?,
+                    last_indexed: r.get(1)?,
+                })
+            })?;
+            let mut out = vec![];
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })?;
+        Ok(IndexStatus {
+            running: self.running.load(Ordering::SeqCst),
+            done: self.done.load(Ordering::SeqCst),
+            total: self.total.load(Ordering::SeqCst),
+            current: self.current.lock().unwrap().clone(),
+            items_count,
+            pending_embeddings: pending,
+            sensitive_skipped: sensitive,
+            folders,
+        })
+    }
+}
+
+pub fn folder_paths(db: &Db) -> Result<Vec<String>> {
+    db.with(|c| {
+        let mut stmt = c.prepare("SELECT path FROM folders WHERE status='active'")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = vec![];
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    })
+}
+
+pub fn is_path_in_active_scope(db: &Db, path: &Path) -> Result<bool> {
+    let candidate = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    Ok(folder_paths(db)?.iter().any(|folder| {
+        let root = Path::new(folder)
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(folder));
+        candidate.starts_with(root)
+    }))
+}
+
+fn walk_collect(
+    dir: &Path,
+    files: &mut Vec<PathBuf>,
+    projects: &mut Vec<PathBuf>,
+    depth: usize,
+    stopping: &AtomicBool,
+) {
+    if depth > 12 || stopping.load(Ordering::SeqCst) {
+        return;
+    }
+    if depth > 0 && is_project_root(dir) {
+        // Le projet est l'unité (Média §B5) : jamais éclaté.
+        projects.push(dir.to_path_buf());
+        return;
+    }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return, // permission refusée → skip + on continue
+    };
+    for entry in entries.flatten() {
+        if stopping.load(Ordering::SeqCst) {
+            return;
+        }
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        // Ne jamais suivre un lien symbolique : il peut sortir du périmètre choisi
+        // (ou former une boucle) tout en apparaissant sous ce périmètre.
+        if entry.file_type().map(|t| t.is_symlink()).unwrap_or(true) {
+            continue;
+        }
+        if path.is_dir() {
+            if !is_excluded_dir(&name) {
+                walk_collect(&path, files, projects, depth + 1, stopping);
+            }
+        } else if !name.starts_with('.') && !is_technical_file(&path) {
+            if let Ok(meta) = entry.metadata() {
+                if meta.len() <= MAX_FILE_SIZE {
+                    files.push(path);
+                }
+            }
+        }
+    }
+}
+
+fn file_hash(path: &Path, meta: &std::fs::Metadata) -> String {
+    // Le contenu participe toujours au hash. Une date/une taille identique ne doit
+    // pas masquer une modification réelle d'un gros document.
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&meta.len().to_le_bytes());
+    if let Ok(modified) = meta.modified() {
+        if let Ok(d) = modified.duration_since(std::time::UNIX_EPOCH) {
+            hasher.update(&d.as_secs().to_le_bytes());
+        }
+    }
+    if let Ok(mut file) = std::fs::File::open(path) {
+        use std::io::Read;
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            match file.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    hasher.update(&buf[..n]);
+                }
+            }
+        }
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+async fn index_file(
+    db: &Db,
+    llm: &Arc<dyn LlmClient>,
+    bus: &Bus,
+    embed_model: &str,
+    path: &Path,
+) -> Result<()> {
+    let source_ref = path.to_string_lossy().to_string();
+    let ignored = db.with(|c| {
+        Ok(c.query_row(
+            "SELECT 1 FROM ignored_items WHERE source='files' AND source_ref=?1",
+            rusqlite::params![source_ref],
+            |_| Ok(true),
+        )
+        .unwrap_or(false))
+    })?;
+    if ignored {
+        return Ok(());
+    }
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(_) => return Ok(()), // disparu en cours de traitement → abandon sans erreur
+    };
+    let hash = file_hash(path, &meta);
+    let consent: bool = db
+        .with(|c| {
+            Ok(c.query_row(
+                "SELECT value FROM settings WHERE key='sensitive_consent'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .map(|v| v == "true")
+            .unwrap_or(false))
+        })
+        .unwrap_or(false);
+    let was_sensitive_metadata_only = db.with(|c| {
+        Ok(c.query_row(
+            "SELECT type='sensible_non_lu' FROM items WHERE source='files' AND source_ref=?1",
+            rusqlite::params![source_ref],
+            |r| r.get::<_, bool>(0),
+        )
+        .unwrap_or(false))
+    })?;
+    if memory::item_hash(db, "files", &source_ref)?.as_deref() == Some(hash.as_str())
+        && !(consent && looks_sensitive(path) && was_sensitive_metadata_only)
+    {
+        return Ok(()); // connu et inchangé → skip (incrémental)
+    }
+
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64);
+    let title = path.file_name().map(|n| n.to_string_lossy().to_string());
+
+    // Gate de lecture des sensibles (Média §B8) : sans consentement, métadonnées seules.
+    let sensitive = looks_sensitive(path);
+
+    let extracted = if sensitive && !consent {
+        extract::Extracted {
+            text: None,
+            kind: "sensible_non_lu",
+            mime: "application/octet-stream".into(),
+        }
+    } else {
+        // Extraction potentiellement lourde → hors du fil d'exécution async.
+        let p = path.to_path_buf();
+        tokio::task::spawn_blocking(move || extract::extract(&p))
+            .await
+            .unwrap_or(extract::Extracted {
+                text: None,
+                kind: "other",
+                mime: "application/octet-stream".into(),
+            })
+    };
+
+    let item = Item {
+        id: String::new(),
+        source: "files".into(),
+        source_ref: source_ref.clone(),
+        r#type: match extracted.kind {
+            "photo" => "photo",
+            "code" => "code",
+            "sensible_non_lu" => "sensible_non_lu",
+            _ => "document",
+        }
+        .into(),
+        title,
+        body: extracted.text.clone(),
+        created_at: mtime,
+        ingested_at: now(),
+        hash: Some(hash),
+        path: Some(source_ref.clone()),
+        mime: Some(extracted.mime),
+        size: Some(meta.len() as i64),
+        mtime,
+        status: "active".into(),
+    };
+    ingestion::ingest_item(db, llm, bus, embed_model, item, extracted.text.as_deref()).await?;
+    // Le contenu d'un document reste une source de contexte non fiable. On ne
+    // transforme jamais automatiquement ses TODO/phrases en engagements.
+    Ok(())
+}
+
+/// Le code est indexé au niveau PROJET (Files §3, Média §B5) : un seul item
+/// (README + arborescence), jamais éclaté fichier par fichier.
+async fn index_project(
+    db: &Db,
+    llm: &Arc<dyn LlmClient>,
+    bus: &Bus,
+    embed_model: &str,
+    dir: &Path,
+) -> Result<()> {
+    let source_ref = dir.to_string_lossy().to_string();
+    let ignored = db.with(|c| {
+        Ok(c.query_row(
+            "SELECT 1 FROM ignored_items WHERE source='files' AND source_ref=?1",
+            rusqlite::params![source_ref],
+            |_| Ok(true),
+        )
+        .unwrap_or(false))
+    })?;
+    if ignored {
+        return Ok(());
+    }
+    let name = dir
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    let mut body = format!("Projet : {name}\nChemin : {source_ref}\n");
+    for readme in ["README.md", "README.txt", "readme.md", "README"] {
+        let p = dir.join(readme);
+        if p.exists() {
+            if let Ok(text) = std::fs::read_to_string(&p) {
+                body.push_str("\n— README —\n");
+                body.push_str(&text.chars().take(8000).collect::<String>());
+                break;
+            }
+        }
+    }
+    body.push_str("\n— Fichiers —\n");
+    let mut count = 0;
+    for entry in walkdir::WalkDir::new(dir)
+        .max_depth(3)
+        .into_iter()
+        .flatten()
+    {
+        let rel = entry.path().strip_prefix(dir).unwrap_or(entry.path());
+        let s = rel.to_string_lossy();
+        if s.is_empty()
+            || rel
+                .components()
+                .any(|c| is_excluded_dir(&c.as_os_str().to_string_lossy()))
+        {
+            continue;
+        }
+        body.push_str(&s);
+        body.push('\n');
+        count += 1;
+        if count >= 200 {
+            body.push_str("…\n");
+            break;
+        }
+    }
+
+    let meta = std::fs::metadata(dir).ok();
+    let mtime = meta
+        .and_then(|m| m.modified().ok())
+        .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64);
+    let hash = blake3::hash(body.as_bytes()).to_hex().to_string();
+    if memory::item_hash(db, "files", &source_ref)?.as_deref() == Some(hash.as_str()) {
+        return Ok(());
+    }
+    let item = Item {
+        id: String::new(),
+        source: "files".into(),
+        source_ref: source_ref.clone(),
+        r#type: "code_project".into(),
+        title: Some(name),
+        body: Some(body.clone()),
+        created_at: mtime,
+        ingested_at: now(),
+        hash: Some(hash),
+        path: Some(source_ref),
+        mime: Some("inode/directory".into()),
+        size: None,
+        mtime,
+        status: "active".into(),
+    };
+    ingestion::ingest_item(db, llm, bus, embed_model, item, Some(&body)).await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exclusions_minecraft_et_caches() {
+        assert!(is_excluded_dir("node_modules"));
+        assert!(is_excluded_dir(".git"));
+        assert!(is_excluded_dir("minecraft"));
+        assert!(is_excluded_dir("resourcepacks"));
+        assert!(is_excluded_dir("Library"));
+        assert!(is_excluded_dir("MonApp.app"));
+        assert!(!is_excluded_dir("Documents"));
+        assert!(!is_excluded_dir("Projets"));
+    }
+
+    #[test]
+    fn detection_sensible() {
+        assert!(looks_sensitive(Path::new(
+            "/Users/x/Documents/bulletin_salaire_mars.pdf"
+        )));
+        assert!(looks_sensitive(Path::new(
+            "/Users/x/Impôts/avis-imposition-2025.pdf"
+        )));
+        assert!(!looks_sensitive(Path::new(
+            "/Users/x/Documents/recette_tarte.md"
+        )));
+    }
+
+    #[test]
+    fn exclusions_fichiers_techniques() {
+        assert!(is_technical_file(Path::new("/Music/Library.musicdb")));
+        assert!(is_technical_file(Path::new("/App/cache.sqlite-wal")));
+        assert!(!is_technical_file(Path::new("/Documents/rapport.pdf")));
+    }
+}

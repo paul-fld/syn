@@ -1,0 +1,66 @@
+[package]
+name = "syn-app"
+version = "0.1.0"
+description = "Syn — assistant de vie numérique local-first"
+authors = ["Syn"]
+edition = "2021"
+
+[lib]
+name = "syn_app"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["macos-private-api", "tray-icon", "image-png"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-notification = "2"
+tauri-plugin-global-shortcut = "2"
+tauri-plugin-opener = "2"
+tauri-plugin-autostart = "2"
+
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+anyhow = "1"
+
+# Stockage chiffré au repos (invariant 4) — SQLCipher AES-256
+rusqlite = { version = "0.31", features = ["bundled-sqlcipher-vendored-openssl", "backup"] }
+
+# Sécurité : dérivation de clé + enveloppement (mot de passe maître / phrase de récupération)
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+rand = "0.8"
+hex = "0.4"
+keyring = "2"
+zeroize = "1"
+
+# LLM local (dev: Ollama en HTTP loopback — seule sortie réseau autorisée par défaut)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+futures-util = "0.3"
+async-trait = "0.1"
+
+# Connecteur Files
+walkdir = "2"
+notify = "6"
+notify-debouncer-mini = "0.4"
+blake3 = "1"
+zip = "2"
+quick-xml = "0.36"
+calamine = "0.24"
+pdf-extract = "0.7"
+mailparse = "0.15"
+kamadak-exif = "0.5"
+
+# Connecteur Système
+sysinfo = "0.30"
+
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+dirs = "5"
+
+[profile.release]
+strip = true
+lto = true

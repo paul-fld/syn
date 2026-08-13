@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#000000" stroke-linecap="round" stroke-linejoin="round" id="Palette--Streamline-Lucide" height="24" width="24">
+  <desc>
+    Palette Streamline Icon: https://streamlinehq.com
+  </desc>
+  <path fill="#000000" d="M13 6.5a0.5 0.5 0 1 0 1 0 0.5 0.5 0 1 0 -1 0" stroke-width="2"></path>
+  <path fill="#000000" d="M17 10.5a0.5 0.5 0 1 0 1 0 0.5 0.5 0 1 0 -1 0" stroke-width="2"></path>
+  <path fill="#000000" d="M8 7.5a0.5 0.5 0 1 0 1 0 0.5 0.5 0 1 0 -1 0" stroke-width="2"></path>
+  <path fill="#000000" d="M6 12.5a0.5 0.5 0 1 0 1 0 0.5 0.5 0 1 0 -1 0" stroke-width="2"></path>
+  <path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c0.926 0 1.648 -0.746 1.648 -1.688 0 -0.437 -0.18 -0.835 -0.437 -1.125 -0.29 -0.289 -0.438 -0.652 -0.438 -1.125a1.64 1.64 0 0 1 1.668 -1.668h1.996c3.051 0 5.555 -2.503 5.555 -5.554C21.965 6.012 17.461 2 12 2z" stroke-width="2"></path>
+</svg>

@@ -115,10 +115,11 @@ pub async fn query(
     state: State<'_, AppState>,
     session_id: Option<String>,
     text: String,
+    screen_context: Option<Value>,
 ) -> Result<crate::router::Answer> {
     let core = state.core()?;
     let sid = session_id.unwrap_or_else(new_id);
-    crate::router::handle_query(&core, &sid, &text).await
+    crate::router::handle_query_with_context(&core, &sid, &text, screen_context.as_ref()).await
 }
 
 #[tauri::command]
@@ -126,7 +127,9 @@ pub fn list_sessions(state: State<'_, AppState>) -> Result<Vec<Value>> {
     let core = state.core()?;
     core.db.with(|c| {
         let mut stmt = c.prepare(
-            "SELECT id, title, created_at, updated_at FROM sessions ORDER BY updated_at DESC LIMIT 100",
+            "SELECT s.id, s.title, s.created_at, s.updated_at, s.project_id, p.name
+             FROM sessions s LEFT JOIN projects p ON p.id = s.project_id
+             ORDER BY s.updated_at DESC LIMIT 100",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok(json!({
@@ -134,6 +137,8 @@ pub fn list_sessions(state: State<'_, AppState>) -> Result<Vec<Value>> {
                 "title": r.get::<_, Option<String>>(1)?,
                 "created_at": r.get::<_, i64>(2)?,
                 "updated_at": r.get::<_, i64>(3)?,
+                "project_id": r.get::<_, Option<String>>(4)?,
+                "project_name": r.get::<_, Option<String>>(5)?,
             }))
         })?;
         let mut out = vec![];
@@ -141,6 +146,132 @@ pub fn list_sessions(state: State<'_, AppState>) -> Result<Vec<Value>> {
             out.push(r?);
         }
         Ok(out)
+    })
+}
+
+#[tauri::command]
+pub fn rename_session(state: State<'_, AppState>, session_id: String, title: String) -> Result<()> {
+    let core = state.core()?;
+    let title = title.trim();
+    if title.is_empty() || title.chars().count() > 120 {
+        return Err(AppError::Invalid(
+            "Le titre doit contenir entre 1 et 120 caractères.".into(),
+        ));
+    }
+    core.db.with(|c| {
+        let changed = c.execute(
+            "UPDATE sessions SET title=?2, updated_at=?3 WHERE id=?1",
+            params![session_id, title, crate::db::now()],
+        )?;
+        if changed == 0 {
+            return Err(AppError::Invalid("Conversation introuvable.".into()));
+        }
+        Ok(())
+    })
+}
+
+#[tauri::command]
+pub fn delete_session(state: State<'_, AppState>, session_id: String) -> Result<()> {
+    let core = state.core()?;
+    core.db.with(|c| {
+        c.execute(
+            "DELETE FROM conversations WHERE session_id=?1",
+            [&session_id],
+        )?;
+        c.execute(
+            "UPDATE actions_log SET status='rejected', result='Conversation supprimée avant validation'
+             WHERE session_id=?1 AND status='awaiting_confirmation'",
+            [&session_id],
+        )?;
+        c.execute(
+            "UPDATE actions_log SET session_id=NULL WHERE session_id=?1",
+            [&session_id],
+        )?;
+        c.execute("DELETE FROM sessions WHERE id=?1", [&session_id])?;
+        Ok(())
+    })
+}
+
+#[tauri::command]
+pub fn list_projects(state: State<'_, AppState>) -> Result<Vec<Value>> {
+    let core = state.core()?;
+    core.db.with(|c| {
+        let mut stmt = c.prepare(
+            "SELECT p.id, p.name, p.created_at, p.updated_at, COUNT(s.id)
+             FROM projects p LEFT JOIN sessions s ON s.project_id=p.id
+             GROUP BY p.id ORDER BY p.updated_at DESC, p.name COLLATE NOCASE",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(json!({
+                "id": r.get::<_, String>(0)?, "name": r.get::<_, String>(1)?,
+                "created_at": r.get::<_, i64>(2)?, "updated_at": r.get::<_, i64>(3)?,
+                "conversation_count": r.get::<_, i64>(4)?,
+            }))
+        })?;
+        let mut out = vec![];
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    })
+}
+
+#[tauri::command]
+pub fn create_project(state: State<'_, AppState>, name: String) -> Result<Value> {
+    let core = state.core()?;
+    let name = name.trim();
+    if name.is_empty() || name.chars().count() > 80 {
+        return Err(AppError::Invalid(
+            "Le nom du projet doit contenir entre 1 et 80 caractères.".into(),
+        ));
+    }
+    let id = new_id();
+    let now = crate::db::now();
+    core.db.with(|c| {
+        let duplicate = c
+            .query_row("SELECT 1 FROM projects WHERE name=?1 COLLATE NOCASE", [name], |_| Ok(()))
+            .is_ok();
+        if duplicate {
+            return Err(AppError::Invalid("Un projet porte déjà ce nom.".into()));
+        }
+        c.execute(
+            "INSERT INTO projects (id, name, created_at, updated_at) VALUES (?1,?2,?3,?3)",
+            params![id, name, now],
+        )?;
+        Ok(json!({"id": id, "name": name, "created_at": now, "updated_at": now, "conversation_count": 0}))
+    })
+}
+
+#[tauri::command]
+pub fn move_session_to_project(
+    state: State<'_, AppState>,
+    session_id: String,
+    project_id: Option<String>,
+) -> Result<()> {
+    let core = state.core()?;
+    core.db.with(|c| {
+        if let Some(id) = &project_id {
+            let exists = c
+                .query_row("SELECT 1 FROM projects WHERE id=?1", [id], |_| Ok(()))
+                .is_ok();
+            if !exists {
+                return Err(AppError::Invalid("Projet introuvable.".into()));
+            }
+        }
+        let changed = c.execute(
+            "UPDATE sessions SET project_id=?2, updated_at=?3 WHERE id=?1",
+            params![session_id, project_id, crate::db::now()],
+        )?;
+        if changed == 0 {
+            return Err(AppError::Invalid("Conversation introuvable.".into()));
+        }
+        if let Some(id) = project_id {
+            c.execute(
+                "UPDATE projects SET updated_at=?2 WHERE id=?1",
+                params![id, crate::db::now()],
+            )?;
+        }
+        Ok(())
     })
 }
 
@@ -319,18 +450,18 @@ pub fn native_permissions(state: State<'_, AppState>) -> Result<Value> {
     #[cfg(target_os = "macos")]
     {
         let folders = files::folder_paths(&core.db)?;
-        let screen_status = connectors::is_connected(&core.db, "screen");
+        let full_files = files::full_disk_access_granted();
         return Ok(json!({
             "platform": "macos",
             "provider": "Apple",
             "services": [
-                {"id":"files", "label":"Fichiers et dossiers", "status": if folders.is_empty() {"needs_selection"} else {"granted"}, "detail": format!("{} dossier(s) autorisé(s)", folders.len()), "settings":"files", "operational":true},
+                {"id":"files", "label":"Fichiers de ce Mac", "status": if full_files {"granted"} else {"needs_permission"}, "detail": if full_files {"Accès aux fichiers personnels autorisé ; éléments système et techniques exclus".to_string()} else {format!("Accès complet au disque non accordé ({} ancien(s) périmètre(s) enregistré(s))", folders.len())}, "settings":"all_files", "operational":true},
                 {"id":"mail", "label":"Apple Mail", "status": if mail::native_available() {"granted"} else {"needs_permission"}, "detail":"Lecture locale des messages synchronisés", "settings":"all_files", "operational":true},
                 {"id":"contacts", "label":"Contacts", "status": connectors::native::permission_status("contacts"), "detail":"API Contacts native", "settings":"contacts", "operational":true},
                 {"id":"calendar", "label":"Calendrier", "status": connectors::native::permission_status("calendar"), "detail":"EventKit natif en lecture et écriture", "settings":"calendars", "operational":true},
                 {"id":"reminders", "label":"Rappels", "status": connectors::native::permission_status("reminders"), "detail":"Autorisation prête ; synchronisation des tâches à finaliser", "settings":"reminders", "operational":false},
                 {"id":"photos", "label":"Photos", "status": connectors::native::permission_status("photos"), "detail":"Autorisation prête ; recherche PhotoKit à finaliser", "settings":"photos", "operational":false},
-                {"id":"screen", "label":"Contexte d’écran", "status": if screen_status || connectors::native::permission_status("screen") == "granted" {"granted"} else {"needs_permission"}, "detail":"Application et fenêtre actives", "settings":"accessibility", "operational":true}
+                {"id":"screen", "label":"Contexte d’écran", "status": connectors::native::permission_status("screen"), "detail":"Capture ponctuelle locale, OCR et disposition visuelle ; l’image est supprimée aussitôt", "settings":"screen_recording", "operational":true}
             ]
         }));
     }
@@ -370,6 +501,7 @@ pub fn open_native_settings(section: String) -> Result<()> {
             "reminders" => "Privacy_Reminders",
             "photos" => "Privacy_Photos",
             "accessibility" => "Privacy_Accessibility",
+            "screen_recording" => "Privacy_ScreenCapture",
             _ => "Privacy",
         };
         std::process::Command::new("open")
@@ -426,19 +558,19 @@ pub async fn connector_connect(state: State<'_, AppState>, id: String) -> Result
             )
         }
         "screen" => {
-            let ctx = screen::frontmost_context();
-            if ctx["available"].as_bool() == Some(true) {
+            if connectors::native::permission_status("screen") == "granted" {
                 connectors::set_status(&core.db, "screen", "screen", "connected")?;
                 Ok(json!({"status": "connected"}))
             } else {
                 connectors::set_status(&core.db, "screen", "screen", "needs_permission")?;
-                Ok(json!({"status": "needs_permission", "message": ctx["reason"]}))
+                Ok(
+                    json!({"status": "needs_permission", "message": "Autorise Enregistrement de l’écran dans les réglages macOS."}),
+                )
             }
         }
-        "google" | "microsoft" | "slack" | "github" => Ok(json!({
-            "status": "needs_configuration",
-            "message": "Ce connecteur exige l'enregistrement OAuth de l'application auprès du fournisseur (scopes sensibles : vérification d'app, audit CASA côté Google). À configurer avant activation."
-        })),
+        "google" | "microsoft" | "slack" | "github" => {
+            connectors::oauth::start(&core.db, &id).await
+        }
         "files" | "system" => {
             connectors::set_status(&core.db, &id, &id, "connected")?;
             Ok(json!({"status": "connected"}))
@@ -455,6 +587,9 @@ pub fn connector_disconnect(state: State<'_, AppState>, id: String) -> Result<()
             "Apple est intégré à macOS : révoque séparément les autorisations dans Réglages système.".into(),
         ));
     }
+    if matches!(id.as_str(), "google" | "microsoft" | "slack" | "github") {
+        connectors::oauth::revoke_local(&id);
+    }
     connectors::set_status(&core.db, &id, &id, "disconnected")?;
     if id == "apple" {
         core.db.with(|c| {
@@ -467,15 +602,12 @@ pub fn connector_disconnect(state: State<'_, AppState>, id: String) -> Result<()
 }
 
 #[tauri::command]
-pub fn screen_context(state: State<'_, AppState>) -> Result<Value> {
+pub async fn screen_context(state: State<'_, AppState>) -> Result<Value> {
     let core = state.core()?;
-    if !connectors::is_connected(&core.db, "screen") {
-        return Err(AppError::Security(
-            "Le connecteur Contexte d'écran n'est pas activé.".into(),
-        ));
-    }
-    crate::security::log_access(&core.db, "screen", "frontmost", None);
-    Ok(screen::frontmost_context())
+    crate::security::log_access(&core.db, "screen", "capture_ocr", None);
+    tokio::task::spawn_blocking(screen::capture_context)
+        .await
+        .map_err(|e| AppError::Other(format!("Capture interrompue : {e}")))?
 }
 
 // ————————————————— Réglages —————————————————
@@ -610,6 +742,55 @@ pub async fn model_pull(state: State<'_, AppState>, model: String) -> Result<()>
 // ————————————————— Files —————————————————
 
 #[tauri::command]
+pub fn files_request_full_access(state: State<'_, AppState>) -> Result<Value> {
+    let core = state.core()?;
+    crate::settings::set_key(&core.db, "files_full_access_requested", &Value::Bool(true))?;
+    if files::full_disk_access_granted() {
+        crate::settings::set_key(&core.db, "sensitive_consent", &Value::Bool(true))?;
+        let (root, started) = files::ensure_full_access_scope(&core.db)?;
+        if started {
+            core.indexer.watch_folder(std::path::Path::new(&root));
+            let _ = core
+                .indexer
+                .tx
+                .send(files::IndexJob::FullScan(Some(root.clone().into())));
+        }
+        return Ok(
+            json!({"status":"granted", "message":"Accès vérifié. L’indexation automatique a commencé.", "root":root}),
+        );
+    }
+    #[cfg(target_os = "macos")]
+    std::process::Command::new("open")
+        .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")
+        .spawn()
+        .map_err(|e| AppError::Other(format!("Impossible d’ouvrir les réglages : {e}")))?;
+    Ok(json!({
+        "status":"needs_permission",
+        "message":"Ajoute ou active Syn dans Accès complet au disque. macOS peut demander de relancer l’application."
+    }))
+}
+
+#[tauri::command]
+pub fn files_activate_full_access(state: State<'_, AppState>) -> Result<Value> {
+    let core = state.core()?;
+    if !files::full_disk_access_granted() {
+        return Ok(json!({"status":"needs_permission"}));
+    }
+    crate::settings::set_key(&core.db, "files_full_access_requested", &Value::Bool(true))?;
+    let sensitive_was_disabled = !crate::settings::load(&core.db)?.sensitive_consent;
+    crate::settings::set_key(&core.db, "sensitive_consent", &Value::Bool(true))?;
+    let (root, started) = files::ensure_full_access_scope(&core.db)?;
+    if started || sensitive_was_disabled {
+        core.indexer.watch_folder(std::path::Path::new(&root));
+        let _ = core
+            .indexer
+            .tx
+            .send(files::IndexJob::FullScan(Some(root.clone().into())));
+    }
+    Ok(json!({"status":"granted", "root":root, "started":started || sensitive_was_disabled}))
+}
+
+#[tauri::command]
 pub fn files_add_folder(state: State<'_, AppState>, path: String) -> Result<()> {
     let core = state.core()?;
     let canonical = std::path::Path::new(&path)
@@ -718,6 +899,81 @@ pub fn knowledge_stats(state: State<'_, AppState>) -> Result<Value> {
         let embeddings: i64 = c.query_row("SELECT COUNT(*) FROM embeddings WHERE vector IS NOT NULL", [], |r| r.get(0))?;
         let facts: i64 = c.query_row("SELECT COUNT(*) FROM items WHERE type='fact' AND status='active'", [], |r| r.get(0))?;
         Ok(json!({"by_type": by, "people": people, "embeddings": embeddings, "facts": facts}))
+    })
+}
+
+/// Vue compacte des fichiers connus : l'interface n'a pas à afficher des
+/// milliers de lignes pour expliquer ce que Syn sait rechercher.
+#[tauri::command]
+pub fn knowledge_file_groups(state: State<'_, AppState>) -> Result<Vec<Value>> {
+    use std::collections::{BTreeMap, HashMap};
+
+    let core = state.core()?;
+    let home = dirs::home_dir();
+    core.db.with(|c| {
+        let mut stmt = c.prepare(
+            "SELECT type, title, path, ingested_at FROM items
+             WHERE source='files' AND status='active' ORDER BY ingested_at DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?;
+        #[derive(Default)]
+        struct Group {
+            count: i64,
+            latest: i64,
+            types: HashMap<String, i64>,
+            examples: Vec<Value>,
+        }
+        let mut groups: BTreeMap<String, Group> = BTreeMap::new();
+        for row in rows {
+            let (kind, title, path, ingested_at) = row?;
+            let category = if kind == "code_project" {
+                "Projets".to_string()
+            } else {
+                path.as_deref()
+                    .and_then(|raw| home.as_ref().and_then(|root| std::path::Path::new(raw).strip_prefix(root).ok()))
+                    .and_then(|relative| relative.components().next())
+                    .map(|component| match component.as_os_str().to_string_lossy().as_ref() {
+                        "Desktop" => "Bureau".to_string(),
+                        "Documents" => "Documents".to_string(),
+                        "Downloads" => "Téléchargements".to_string(),
+                        "Pictures" => "Images".to_string(),
+                        "Movies" => "Vidéos".to_string(),
+                        "Music" => "Musique".to_string(),
+                        name => name.to_string(),
+                    })
+                    .unwrap_or_else(|| "Autres fichiers".to_string())
+            };
+            let group = groups.entry(category).or_default();
+            group.count += 1;
+            group.latest = group.latest.max(ingested_at);
+            *group.types.entry(kind.clone()).or_insert(0) += 1;
+            if group.examples.len() < 5 {
+                group.examples.push(json!({
+                    "title": title.or_else(|| path.as_ref().and_then(|value| std::path::Path::new(value).file_name().map(|name| name.to_string_lossy().to_string()))),
+                    "path": path,
+                    "type": kind
+                }));
+            }
+        }
+        let mut result: Vec<Value> = groups
+            .into_iter()
+            .map(|(name, group)| json!({
+                "name": name,
+                "count": group.count,
+                "latest": group.latest,
+                "types": group.types,
+                "examples": group.examples
+            }))
+            .collect();
+        result.sort_by(|a, b| b["count"].as_i64().cmp(&a["count"].as_i64()));
+        Ok(result)
     })
 }
 

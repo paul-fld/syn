@@ -9,6 +9,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0002_provenance_cleanup",
         include_str!("../../migrations/0002_provenance_cleanup.sql"),
     ),
+    (
+        "0003_conversation_projects",
+        include_str!("../../migrations/0003_conversation_projects.sql"),
+    ),
 ];
 
 /// Connexion SQLite chiffrée (SQLCipher AES-256). La vérité est dans les sources ;

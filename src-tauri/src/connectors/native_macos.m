@@ -1,8 +1,11 @@
 #import <Foundation/Foundation.h>
+#import <AppKit/AppKit.h>
 #import <Contacts/Contacts.h>
 #import <EventKit/EventKit.h>
 #import <Photos/Photos.h>
 #import <ApplicationServices/ApplicationServices.h>
+#import <CoreGraphics/CoreGraphics.h>
+#import <Vision/Vision.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -35,15 +38,18 @@ int32_t syn_native_permission_status(const char *raw_service) {
         PHAuthorizationStatus s = [PHPhotoLibrary authorizationStatusForAccessLevel:PHAccessLevelReadWrite];
         return s == PHAuthorizationStatusAuthorized ? 1 : s == PHAuthorizationStatusLimited ? 4 : s == PHAuthorizationStatusDenied ? 2 : s == PHAuthorizationStatusRestricted ? 3 : 0;
     }
-    if ([service isEqualToString:@"screen"]) return AXIsProcessTrusted() ? 1 : 0;
+    if ([service isEqualToString:@"screen"]) {
+        if (@available(macOS 10.15, *)) return CGPreflightScreenCaptureAccess() ? 1 : 0;
+        return 1;
+    }
     return -1;
 }
 
 int32_t syn_native_request_permission(const char *raw_service) {
     NSString *service = [NSString stringWithUTF8String:raw_service ?: ""];
     if ([service isEqualToString:@"screen"]) {
-        NSDictionary *options = @{(__bridge NSString *)kAXTrustedCheckOptionPrompt: @YES};
-        return AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)options) ? 1 : 0;
+        if (@available(macOS 10.15, *)) return CGRequestScreenCaptureAccess() ? 1 : 0;
+        return 1;
     }
     dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
     __block BOOL granted = NO;
@@ -78,6 +84,53 @@ int32_t syn_native_request_permission(const char *raw_service) {
     }
     dispatch_semaphore_wait(semaphore, DISPATCH_TIME_FOREVER);
     return granted ? 1 : syn_native_permission_status(raw_service);
+}
+
+char *syn_native_ocr_image_json(const char *raw_path) {
+    NSString *path = [NSString stringWithUTF8String:raw_path ?: ""];
+    NSURL *url = [NSURL fileURLWithPath:path];
+    VNRecognizeTextRequest *request = [[VNRecognizeTextRequest alloc] init];
+    request.recognitionLevel = VNRequestTextRecognitionLevelAccurate;
+    request.usesLanguageCorrection = YES;
+    request.recognitionLanguages = @[@"fr-FR", @"en-US"];
+    VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithURL:url options:@{}];
+    NSError *error = nil;
+    if (![handler performRequests:@[request] error:&error] || error) return NULL;
+
+    NSMutableArray *items = [NSMutableArray array];
+    NSUInteger limit = MIN(request.results.count, (NSUInteger)300);
+    for (NSUInteger i = 0; i < limit; i++) {
+        VNRecognizedTextObservation *observation = request.results[i];
+        VNRecognizedText *candidate = [observation topCandidates:1].firstObject;
+        if (!candidate || candidate.string.length == 0) continue;
+        CGRect box = observation.boundingBox;
+        [items addObject:@{
+            @"text": candidate.string,
+            @"confidence": @(candidate.confidence),
+            @"x": @(box.origin.x), @"y": @(box.origin.y),
+            @"width": @(box.size.width), @"height": @(box.size.height)
+        }];
+    }
+    return syn_copy_json(items);
+}
+
+char *syn_native_frontmost_context_json(void) {
+    NSRunningApplication *front = NSWorkspace.sharedWorkspace.frontmostApplication;
+    NSString *app = front.localizedName ?: @"";
+    NSString *title = @"";
+    pid_t pid = front.processIdentifier;
+    CFArrayRef rawWindows = CGWindowListCopyWindowInfo(
+        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
+        kCGNullWindowID
+    );
+    NSArray *windows = CFBridgingRelease(rawWindows);
+    for (NSDictionary *window in windows) {
+        if ([window[(id)kCGWindowOwnerPID] intValue] != pid) continue;
+        if ([window[(id)kCGWindowLayer] intValue] != 0) continue;
+        NSString *candidate = window[(id)kCGWindowName];
+        if (candidate.length > 0) { title = candidate; break; }
+    }
+    return syn_copy_json(@{@"available": @YES, @"app": app, @"window": title});
 }
 
 char *syn_native_contacts_json(void) {

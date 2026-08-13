@@ -15,7 +15,39 @@ unsafe extern "C" {
         location: *const std::os::raw::c_char,
     ) -> *mut std::os::raw::c_char;
     fn syn_native_calendar_delete(identifier: *const std::os::raw::c_char) -> i32;
+    fn syn_native_ocr_image_json(path: *const std::os::raw::c_char) -> *mut std::os::raw::c_char;
+    fn syn_native_frontmost_context_json() -> *mut std::os::raw::c_char;
     fn syn_native_free(value: *mut std::os::raw::c_char);
+}
+
+pub fn ocr_image(path: &std::path::Path) -> Result<Vec<Value>> {
+    #[cfg(target_os = "macos")]
+    {
+        let path = CString::new(path.to_string_lossy().as_bytes())
+            .map_err(|_| AppError::Invalid("chemin de capture invalide".into()))?;
+        let value = take_json(
+            unsafe { syn_native_ocr_image_json(path.as_ptr()) },
+            "La reconnaissance du contenu affiché a échoué.",
+        )?;
+        return Ok(value.as_array().cloned().unwrap_or_default());
+    }
+    #[allow(unreachable_code)]
+    Err(AppError::Invalid("OCR natif indisponible".into()))
+}
+
+pub fn frontmost_context() -> Value {
+    #[cfg(target_os = "macos")]
+    {
+        return take_json(
+            unsafe { syn_native_frontmost_context_json() },
+            "Impossible d’identifier l’application visible.",
+        )
+        .unwrap_or_else(|_| serde_json::json!({"available": true, "app": "", "window": ""}));
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        serde_json::json!({"available": false, "app": "", "window": ""})
+    }
 }
 
 pub fn permission_status(service: &str) -> &'static str {

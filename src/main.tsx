@@ -119,7 +119,7 @@ function AlertsPopover(): JSX.Element {
   const [open, setOpen] = createSignal(false);
   return (
     <>
-      <button class="topbar-btn" title="Surfaçages de Syn" onClick={() => setOpen(!open())}>
+      <button class="topbar-btn" title="Notifications de Syn" onClick={() => setOpen(!open())}>
         <Icon name={alerts().length > 0 ? "bell-dot" : "bell"} size={17} />
         <Show when={alerts().length > 0}>
           <span class="badge-dot" />
@@ -170,12 +170,12 @@ function AppShell(): JSX.Element {
       <div class="app-body">
         <Sidebar />
         <main class="content">
+          <Show when={sidebarCollapsed()}>
+            <button class="topbar-btn sidebar-reopen" title="Afficher la barre latérale" onClick={() => setSidebarCollapsed(false)}>
+              <Icon name="panel-left" size={16} />
+            </button>
+          </Show>
           <div class="content-topbar" style={{ top: "10px", position: "absolute" }}>
-            <Show when={sidebarCollapsed()}>
-              <button class="topbar-btn" title="Afficher la barre latérale" onClick={() => setSidebarCollapsed(false)}>
-                <Icon name="panel-left" size={16} />
-              </button>
-            </Show>
             <div style={{ position: "relative", display: "flex", gap: "12px" }}>
               <AlertsPopover />
               <button class="topbar-btn" title={status()?.email ?? "Profil"} onClick={() => {

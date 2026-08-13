@@ -6,7 +6,8 @@ import { emitTo } from "@tauri-apps/api/event";
 import "./styles/global.css";
 import { Icon } from "./components/Icon";
 import { SynGlyph } from "./components/Logo";
-import { ipc, on, type AgentProgress, type PendingRef } from "./lib/ipc";
+import { ipc, on, type AgentProgress, type PendingRef, type ScreenContext } from "./lib/ipc";
+import { captureVisibleScreen } from "./lib/screenContext";
 
 interface BarMessage {
   role: "user" | "assistant";
@@ -21,6 +22,9 @@ function Bar(): JSX.Element {
   const [thinking, setThinking] = createSignal(false);
   const [progress, setProgress] = createSignal<AgentProgress[]>([]);
   const [expanded, setExpanded] = createSignal(false);
+  const [screenContext, setScreenContext] = createSignal<ScreenContext | null>(null);
+  const [capturing, setCapturing] = createSignal(false);
+  const [captureError, setCaptureError] = createSignal("");
   let inputEl: HTMLInputElement | undefined;
 
   const resize = async (open: boolean) => {
@@ -56,11 +60,13 @@ function Bar(): JSX.Element {
     setSessionId(sid);
     setProgress([]);
     setText("");
+    const context = screenContext();
+    setScreenContext(null);
     setMessages((m) => [...m, { role: "user", content: t }]);
     setThinking(true);
     await resize(true);
     try {
-      const answer = await ipc.query(sid, t);
+      const answer = await ipc.query(sid, t, context);
       setSessionId(answer.session_id);
       setMessages((m) => [...m, { role: "assistant", content: answer.text }]);
       setPending(answer.pending_actions);
@@ -129,7 +135,7 @@ function Bar(): JSX.Element {
         </button>
         <input
           ref={inputEl}
-          placeholder="Demander à Syn"
+          placeholder={captureError() ? "Capture impossible — survole l’icône" : screenContext() ? "Contexte d’écran joint — que veux-tu faire ?" : "Demander à Syn"}
           value={text()}
           disabled={thinking()}
           onInput={(e) => setText(e.currentTarget.value)}
@@ -138,11 +144,25 @@ function Bar(): JSX.Element {
             if (e.key === "Escape") ipc.hideBar();
           }}
         />
-        <button title="Contexte d'écran" onClick={async () => {
-          const ctx = await ipc.screenContext();
-          if (ctx?.available) setText(`À propos de ${ctx.app}${ctx.window ? ` — ${ctx.window}` : ""} : `);
-        }}>
-          <Icon name="box-select" size={19} />
+        <button
+          title={captureError() || (screenContext() ? `Contexte joint : ${screenContext()!.app}${screenContext()!.window ? ` — ${screenContext()!.window}` : ""}` : "Joindre le contexte visible à l’écran")}
+          classList={{ active: !!screenContext(), error: !!captureError(), capturing: capturing() }}
+          aria-pressed={!!screenContext()}
+          disabled={capturing() || thinking()}
+          onClick={async () => {
+            setCapturing(true);
+            setCaptureError("");
+            try {
+              const ctx = await captureVisibleScreen();
+              if (ctx.available) setScreenContext(ctx);
+            } catch (e: any) {
+              setCaptureError(e?.message ?? String(e));
+            } finally {
+              setCapturing(false);
+              setTimeout(() => inputEl?.focus(), 30);
+            }
+          }}>
+          <Icon name={screenContext() ? "check" : "box-select"} size={19} />
         </button>
         <button title="Réduire" onClick={() => resize(!expanded())}>
           <Icon name={expanded() ? "chevron-down" : "chevron-up"} size={19} />

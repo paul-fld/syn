@@ -64,6 +64,13 @@ impl AppState {
         }
         let db = Db::open(&self.db_path(), key_hex)?;
         let settings = crate::settings::load(&db)?;
+        if cfg!(target_os = "macos")
+            && settings.files_full_access_requested
+            && crate::connectors::files::full_disk_access_granted()
+        {
+            crate::settings::set_key(&db, "sensitive_consent", &serde_json::Value::Bool(true))?;
+            let _ = crate::connectors::files::ensure_full_access_scope(&db)?;
+        }
         let llm: Arc<dyn LlmClient> = Arc::new(OllamaClient::new(
             &settings.ollama_url,
             &settings.chat_model,
@@ -88,6 +95,15 @@ impl AppState {
             key_hex: Arc::new(std::sync::Mutex::new(key_hex.to_string())),
         });
         *self.core.write().unwrap() = Some(core.clone());
+        if cfg!(target_os = "macos")
+            && settings.files_full_access_requested
+            && crate::connectors::files::full_disk_access_granted()
+        {
+            let _ = core
+                .indexer
+                .tx
+                .send(crate::connectors::files::IndexJob::FullScan(None));
+        }
         // Sur macOS, Apple est intégré : si l'utilisateur a déjà accordé l'accès
         // à Mail et terminé l'onboarding, la synchronisation reprend sans faux login.
         if cfg!(target_os = "macos")

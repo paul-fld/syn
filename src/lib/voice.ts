@@ -18,7 +18,7 @@ const CATALOG: Record<string, Entry> = {
     tu: "Exemple : #Tu peux t'arrêter à partir de 19h00",
     vous: "Exemple : #Tu peux t'arrêter à partir de 19h00",
   },
-  "archives.title": { tu: "Tes archives", vous: "Vos archives" },
+  "archives.title": { tu: "Ton activité", vous: "Votre activité" },
   "knowledge.sub": {
     tu: "Gère ce que Syn a appris de ta vie numérique. Tout est local, chiffré, supprimable.",
     vous: "Gérez ce que Syn a appris de votre vie numérique. Tout est local, chiffré, supprimable.",

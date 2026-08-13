@@ -1,5 +1,5 @@
 // Sidebar (maquette App desktop) : Accueil … Déconnexion.
-import { For, type JSX } from "solid-js";
+import { createResource, For, type JSX } from "solid-js";
 import { Icon } from "./Icon";
 import { Logo } from "./Logo";
 import {
@@ -15,12 +15,12 @@ import { ipc } from "../lib/ipc";
 
 const MAIN_ITEMS: { id: PageId; label: string; icon: string }[] = [
   { id: "accueil", label: "Accueil", icon: "home" },
-  { id: "conversations", label: "Conversations", icon: "message-square" },
+  { id: "conversations", label: "Conversations", icon: "messages-square" },
   { id: "apprendre", label: "Apprendre à Syn", icon: "book-open" },
   { id: "connaissances", label: "Connaissances", icon: "library-big" },
   { id: "connecteurs", label: "Connecteurs", icon: "workflow" },
   { id: "appareil", label: "Mon appareil", icon: "laptop" },
-  { id: "archives", label: "Mes archives", icon: "archive" },
+  { id: "archives", label: "Activité", icon: "square-activity" },
   { id: "programmations", label: "Mes programmations", icon: "clock" },
 ];
 
@@ -30,6 +30,11 @@ const MODE_ITEMS: { id: PageId; label: string; icon: string }[] = [
 ];
 
 export function Sidebar(): JSX.Element {
+  const [system] = createResource(() => ipc.systemSnapshot().catch(() => null));
+  const batteryIcon = () => {
+    const pct = Number(system()?.snapshot?.battery?.pct ?? 100);
+    return pct < 30 ? "battery-low" : pct < 70 ? "battery-medium" : "battery-full";
+  };
   const logout = async () => {
     await ipc.lock();
     setScreen("locked");
@@ -54,7 +59,7 @@ export function Sidebar(): JSX.Element {
             classList={{ active: page() === item.id }}
             onClick={() => setPage(item.id)}
           >
-            <Icon name={item.icon} size={15} />
+            <Icon name={item.id === "economie" ? batteryIcon() : item.icon} size={15} />
             {item.label}
           </button>
         )}

@@ -76,6 +76,11 @@ pub fn run() {
             ipc::query,
             ipc::list_sessions,
             ipc::get_conversation,
+            ipc::rename_session,
+            ipc::delete_session,
+            ipc::list_projects,
+            ipc::create_project,
+            ipc::move_session_to_project,
             ipc::get_startup_brief,
             ipc::get_daily_wrap,
             // actions
@@ -100,6 +105,8 @@ pub fn run() {
             ipc::model_pull,
             // files
             ipc::files_add_folder,
+            ipc::files_request_full_access,
+            ipc::files_activate_full_access,
             ipc::files_remove_folder,
             ipc::files_reindex,
             ipc::files_index_status,
@@ -107,6 +114,7 @@ pub fn run() {
             ipc::search_memory,
             // connaissances
             ipc::knowledge_stats,
+            ipc::knowledge_file_groups,
             ipc::list_knowledge,
             ipc::forget_item,
             // personnes

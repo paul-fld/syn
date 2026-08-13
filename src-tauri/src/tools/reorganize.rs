@@ -190,7 +190,7 @@ pub fn resolve_location(db: &Db, target: &str) -> Result<PathBuf> {
     match matches.as_slice() {
         [only] => Ok(only.clone()),
         [] => Err(AppError::NotFound(format!(
-            "Emplacement « {label} » introuvable dans les dossiers autorisés. Indique son chemin ou ajoute-le dans Connecteurs → Dossiers indexés."
+            "Emplacement « {label} » introuvable parmi les fichiers autorisés. Vérifie Connecteurs → Accès aux fichiers ou indique son chemin."
         ))),
         many => Err(AppError::Invalid(format!(
             "Plusieurs éléments portent le nom « {label} » : {}. Indique le chemin exact.",
@@ -311,7 +311,7 @@ pub async fn build_plan(db: &Db, llm: &Arc<dyn LlmClient>, target: &str) -> Resu
     });
     if !in_scope {
         return Err(AppError::Security(
-            "Ce dossier est hors du périmètre confié à Syn. Ajoute-le d'abord aux dossiers indexés.".into(),
+            "Ce dossier est hors des fichiers auxquels Syn a accès. Vérifie l’autorisation dans Connecteurs → Accès aux fichiers.".into(),
         ));
     }
 

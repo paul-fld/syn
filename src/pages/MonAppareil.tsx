@@ -68,7 +68,7 @@ export function MonAppareil(): JSX.Element {
             <Show when={s.battery}>
               <div class="section-label">Batterie</div>
               <div class="row-line">
-                <Icon name="leaf" size={14} />
+                <Icon name="battery" size={14} />
                 <span class="grow">{s.battery.pct} %</span>
                 <span class="sub">{s.battery.charging ? "Sur secteur" : "Sur batterie"}</span>
               </div>

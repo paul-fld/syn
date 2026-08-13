@@ -3,19 +3,25 @@ import { createSignal, type JSX } from "solid-js";
 import { Icon } from "./Icon";
 import { label } from "../lib/voice";
 import { settings } from "../lib/state";
-import { ipc } from "../lib/ipc";
+import type { ScreenContext } from "../lib/ipc";
+import { captureVisibleScreen } from "../lib/screenContext";
 
 export function AskBar(props: {
-  onSubmit: (text: string) => void;
+  onSubmit: (text: string, screenContext?: ScreenContext | null) => void;
   autofocus?: boolean;
   disabled?: boolean;
 }): JSX.Element {
   const [text, setText] = createSignal("");
+  const [screenContext, setScreenContext] = createSignal<ScreenContext | null>(null);
+  const [capturing, setCapturing] = createSignal(false);
+  const [captureError, setCaptureError] = createSignal("");
   const submit = () => {
     const t = text().trim();
     if (!t || props.disabled) return;
     setText("");
-    props.onSubmit(t);
+    const context = screenContext();
+    setScreenContext(null);
+    props.onSubmit(t, context);
   };
   return (
     <div class="askbar">
@@ -23,20 +29,31 @@ export function AskBar(props: {
         <Icon name="plus" size={16} />
       </button>
       <input
-        placeholder={label("ask.placeholder", settings()?.voice)}
+        placeholder={captureError() ? "Capture impossible — survole l’icône pour le détail" : screenContext() ? "Contexte d’écran joint — que veux-tu faire ?" : label("ask.placeholder", settings()?.voice)}
         value={text()}
         disabled={props.disabled}
         onInput={(e) => setText(e.currentTarget.value)}
         onKeyDown={(e) => e.key === "Enter" && submit()}
         ref={(el) => props.autofocus && setTimeout(() => el.focus(), 50)}
       />
-      <button title="Contexte d'écran" onClick={async () => {
+      <button
+        title={captureError() || (screenContext() ? `Contexte joint : ${screenContext()!.app}${screenContext()!.window ? ` — ${screenContext()!.window}` : ""}` : "Joindre le contexte visible à l’écran")}
+        classList={{ active: !!screenContext(), error: !!captureError(), capturing: capturing() }}
+        aria-pressed={!!screenContext()}
+        disabled={capturing() || props.disabled}
+        onClick={async () => {
+        setCapturing(true);
+        setCaptureError("");
         try {
-          const ctx = await ipc.screenContext();
-          if (ctx?.available) setText(`À propos de ${ctx.app}${ctx.window ? ` — ${ctx.window}` : ""} : `);
-        } catch {}
+          const ctx = await captureVisibleScreen();
+          if (ctx.available) setScreenContext(ctx);
+        } catch (e: any) {
+          setCaptureError(e?.message ?? String(e));
+        } finally {
+          setCapturing(false);
+        }
       }}>
-        <Icon name="box-select" size={15} />
+        <Icon name={screenContext() ? "check" : "box-select"} size={15} />
       </button>
       <button title="Dictée non disponible dans cette version" disabled>
         <Icon name="mic" size={15} />

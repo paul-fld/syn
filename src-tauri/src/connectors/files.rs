@@ -1,6 +1,7 @@
 //! Connecteur Files (deep-dive dédié — la brique de la Phase 1).
 //! Lit, extrait, indexe, surveille. N'organise pas (le rangement est un outil).
-//! Moindre privilège : uniquement les dossiers choisis. Tout échec = skip + log.
+//! Périmètre utilisateur autorisé par macOS, avec exclusions strictes des zones
+//! système et techniques. Tout échec = skip + log.
 
 use crate::bus::{Bus, BusEvent};
 use crate::db::{now, Db};
@@ -495,6 +496,68 @@ pub fn folder_paths(db: &Db) -> Result<Vec<String>> {
         }
         Ok(out)
     })
+}
+
+/// macOS ne fournit pas d'API permettant d'accorder l'accès complet au disque.
+/// Ce test vérifie donc l'accès effectif à plusieurs emplacements protégés par TCC.
+/// Il ne se contente jamais de la présence d'un chemin dans la base Syn.
+pub fn full_disk_access_granted() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let Some(home) = dirs::home_dir() else {
+            return false;
+        };
+        let protected = [
+            home.join("Library/Mail"),
+            home.join("Library/Messages"),
+            home.join("Library/Safari"),
+        ];
+        let existing: Vec<_> = protected.into_iter().filter(|path| path.exists()).collect();
+        !existing.is_empty() && existing.iter().any(|path| std::fs::read_dir(path).is_ok())
+    }
+    #[cfg(not(target_os = "macos"))]
+    false
+}
+
+/// Active un unique périmètre utilisateur. Les dossiers techniques, cachés,
+/// caches et bibliothèques système restent exclus par `walk_collect`.
+/// Retourne `(racine, nouvellement_activée)` pour éviter de relancer un scan en boucle.
+pub fn ensure_full_access_scope(db: &Db) -> Result<(String, bool)> {
+    let home = dirs::home_dir().ok_or_else(|| {
+        crate::error::AppError::NotFound("dossier utilisateur introuvable".into())
+    })?;
+    let root = home
+        .canonicalize()
+        .unwrap_or(home)
+        .to_string_lossy()
+        .to_string();
+    let existed = db.with(|c| {
+        Ok(c.query_row(
+            "SELECT status='active' FROM folders WHERE path=?1",
+            rusqlite::params![root],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap_or(false))
+    })?;
+    let prefix = format!(
+        "{}{}%",
+        root.trim_end_matches(std::path::MAIN_SEPARATOR),
+        std::path::MAIN_SEPARATOR
+    );
+    db.with(|c| {
+        // Une seule racine évite les scans doublons comme `~/` + `~/Desktop`.
+        c.execute(
+            "UPDATE folders SET status='removed' WHERE path LIKE ?1",
+            rusqlite::params![prefix],
+        )?;
+        c.execute(
+            "INSERT INTO folders (path, added_at, status) VALUES (?1, ?2, 'active')
+             ON CONFLICT(path) DO UPDATE SET status='active'",
+            rusqlite::params![root, now()],
+        )?;
+        Ok(())
+    })?;
+    Ok((root, !existed))
 }
 
 pub fn is_path_in_active_scope(db: &Db, path: &Path) -> Result<bool> {

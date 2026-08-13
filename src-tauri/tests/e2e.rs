@@ -109,6 +109,35 @@ fn chaine_complete_locale() {
             assert!(answer.degraded, "sans runtime, le mode dégradé doit être signalé");
         }
 
+        // 7b. Les projets regroupent réellement la mémoire des conversations.
+        db.with(|c| {
+            c.execute(
+                "INSERT INTO projects (id, name, created_at, updated_at) VALUES ('project-test','Alpha',0,0)",
+                [],
+            )?;
+            c.execute(
+                "UPDATE sessions SET project_id='project-test' WHERE id='session-test'",
+                [],
+            )?;
+            c.execute(
+                "INSERT INTO sessions (id,title,created_at,updated_at,project_id)
+                 VALUES ('session-soeur','Décisions',0,0,'project-test')",
+                [],
+            )?;
+            c.execute(
+                "INSERT INTO conversations (session_id,turn,role,content,created_at)
+                 VALUES ('session-soeur',0,'user','La couleur retenue est le vert.',0)",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let project_context = syn_app::memory::project_context(&db, "session-test", 10)
+            .unwrap()
+            .expect("mémoire de projet absente");
+        assert_eq!(project_context.1, "Alpha");
+        assert!(project_context.2.contains("couleur retenue est le vert"));
+
         // 8. Porte d'action : un envoi de mail doit rester en attente (plancher).
         let pending_before = syn_app::actions::list_pending(&db).unwrap().len();
         let id = syn_app::actions::queue_pending(

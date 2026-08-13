@@ -55,8 +55,9 @@ pub struct Settings {
     // Confidentialité
     pub cloud_escalation: bool,  // opt-in, OFF par défaut (invariant 2)
     pub sensitive_consent: bool, // gate de lecture des documents sensibles (Média §B8)
-    pub rarity_budget: u32,      // plafond de surfaçages proactifs / jour
-    pub guardian_disk_pct: u8,   // alerte si espace libre < N %
+    pub files_full_access_requested: bool,
+    pub rarity_budget: u32,    // plafond de surfaçages proactifs / jour
+    pub guardian_disk_pct: u8, // alerte si espace libre < N %
     pub guardian_temp_c: u8,
     // Modes
     pub work_mode: bool,
@@ -100,6 +101,7 @@ impl Default for Settings {
             large_text: false,
             cloud_escalation: false,
             sensitive_consent: false,
+            files_full_access_requested: false,
             rarity_budget: 5,
             guardian_disk_pct: 5,
             guardian_temp_c: 90,

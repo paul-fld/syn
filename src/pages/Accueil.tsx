@@ -3,7 +3,7 @@ import { createResource, For, Show, type JSX } from "solid-js";
 import { Icon } from "../components/Icon";
 import { AskBar } from "../components/AskBar";
 import { ActionCard } from "../components/ActionCard";
-import { ipc, type BriefItem } from "../lib/ipc";
+import { ipc, type BriefItem, type ScreenContext } from "../lib/ipc";
 import { label } from "../lib/voice";
 import { briefVersion, pendingActions, setBarQuery, setPage, settings } from "../lib/state";
 
@@ -27,8 +27,8 @@ function splitLines(text: string): [string, string] {
 export function Accueil(): JSX.Element {
   const [brief] = createResource(briefVersion, () => ipc.getStartupBrief());
 
-  const ask = (text: string) => {
-    setBarQuery(text);
+  const ask = (text: string, screenContext?: ScreenContext | null) => {
+    setBarQuery({ text, screenContext });
     setPage("conversations");
   };
 

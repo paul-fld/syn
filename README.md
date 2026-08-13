@@ -14,9 +14,9 @@ npm run tauri dev        # dev
 npm run tauri build      # bundle .app / .dmg
 ```
 
-Au premier lancement : onboarding (mot de passe maître → contacts → services →
-mise en route : détection matérielle, téléchargement des modèles, dossiers à indexer,
-première indexation). Les modèles par palier : `llama3.2:3b` (léger) /
+Au premier lancement : onboarding (mot de passe maître → autorisations → services →
+mise en route : détection matérielle, téléchargement des modèles et première indexation
+automatique après autorisation macOS). Les modèles par palier : `llama3.2:3b` (léger) /
 `llama3.1:8b` (standard) / `qwen3:14b` (costaud) + `nomic-embed-text` (embeddings).
 
 ## Architecture
@@ -41,7 +41,7 @@ première indexation). Les modèles par palier : `llama3.2:3b` (léger) /
 - **Sécurité de l'agent** — séparation instructions/données (marqueurs `<<<DONNÉES…>>>`
   neutralisés contre la fermeture prématurée), contrôle d'egress (loopback seul par
   défaut), journal d'accès, suite de tests d'injection (`cargo test`).
-- **Connecteur Files** — walk + exclusions strictes (fix Minecraft : caches,
+- **Connecteur Files** — autorisation unique via Accès complet au disque, puis walk + exclusions strictes (fix Minecraft : caches,
   `node_modules`, bundles, jeux, dossiers cachés), projets de code = unité atomique,
   gate de lecture des sensibles (métadonnées seules sans consentement), incrémental
   (blake3 + mtime), watching débouncé 2 s, throttlé, skip+log jamais de crash.
@@ -60,8 +60,19 @@ première indexation). Les modèles par palier : `llama3.2:3b` (léger) /
 - **Connecteurs V1** — Files (complet) ; Apple Mail natif local (.emlx, lecture seule,
   sous Accès complet au disque) ; Contacts macOS (best-effort) ; Calendrier local
   (events, invités ⇒ plancher) ; Système (sysinfo + pmset, diagnostic explicable) ;
-  Contexte d'écran v0 (app/fenêtre au premier plan). Google/Microsoft/Slack/Github :
-  statués « configuration requise » (vérification d'app fournisseur, audit CASA).
+  Contexte d'écran v0 (app/fenêtre au premier plan). OAuth de développement prêt :
+  Google/Microsoft en PKCE, GitHub en Device Flow et Slack via callback HTTPS.
+
+## OAuth de développement
+
+Les inscriptions fournisseur ne doivent pas être publiées pour tester les connexions.
+Crée les clients de développement, puis exporte les variables décrites dans
+`.env.example` avant `npm run tauri dev`. Les jetons obtenus sont stockés dans le
+trousseau du système, jamais dans Git ni dans la base Syn.
+
+Google et Microsoft n'utilisent aucun secret embarqué. GitHub ne demande que le
+Client ID du Device Flow. Slack exige son secret et un callback HTTPS : utilise en
+développement un tunnel HTTPS vers le port local configuré.
 
 ## Décisions 🔎 tranchées à ce build
 
@@ -77,8 +88,9 @@ première indexation). Les modèles par palier : `llama3.2:3b` (léger) /
 
 ## Hors de ce build (honnêtement statué dans l'UI)
 
-Envoi SMTP/OAuth réel (l'ossature plancher/brouillon est complète), EventKit natif,
-vision/CLIP des photos (EXIF opérationnel), voix STT/TTS (toggles présents),
+Synchronisation métier des API Google/Microsoft/Slack/GitHub après authentification,
+envoi SMTP/OAuth réel (l'ossature plancher/brouillon est complète), vision/CLIP des
+photos (EXIF opérationnel), voix STT/TTS (toggles présents),
 escalade cloud (toggle présent, egress fermé), reconnaissance faciale **[V2]**,
 réunions **[V2]**, module enfant **[V2]**, coercitif des modes **[V2]**.
 
@@ -88,7 +100,7 @@ réunions **[V2]**, module enfant **[V2]**, coercitif des modes **[V2]**.
 cd src-tauri && cargo test
 ```
 
-16 tests : plancher inviolable à tous les niveaux d'autonomie, invités ⇒ plancher,
+25 tests : plancher inviolable à tous les niveaux d'autonomie, invités ⇒ plancher,
 untrusted ⇒ confirmation, exclusions d'indexation, détection sensible, refus de
 dissolution des garde-fous, tolérance au risque propre acceptée, extraction du profil
 de voix, classification des règles, chiffrement wrap/unwrap, suite d'injection

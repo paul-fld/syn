@@ -41,6 +41,7 @@ export interface Settings {
   large_text: boolean;
   cloud_escalation: boolean;
   sensitive_consent: boolean;
+  files_full_access_requested: boolean;
   rarity_budget: number;
   guardian_disk_pct: number;
   guardian_temp_c: number;
@@ -125,6 +126,42 @@ export interface AgentProgress {
   current: number;
   total: number;
   status: "running" | "waiting" | "done" | "error";
+}
+
+export interface ScreenContextObservation {
+  text: string;
+  confidence: number;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface ScreenContext {
+  available: boolean;
+  app: string;
+  window: string;
+  captured_at: number;
+  source: "capture_locale_ocr";
+  text: string;
+  observations: ScreenContextObservation[];
+}
+
+export interface ConversationSession {
+  id: string;
+  title: string | null;
+  created_at: number;
+  updated_at: number;
+  project_id: string | null;
+  project_name: string | null;
+}
+
+export interface ConversationProject {
+  id: string;
+  name: string;
+  created_at: number;
+  updated_at: number;
+  conversation_count: number;
 }
 
 export interface ConnectorInfo {
@@ -214,10 +251,16 @@ export const ipc = {
   setKeychain: (enabled: boolean) => invoke<void>("set_keychain", { enabled }),
 
   // conversation
-  query: (sessionId: string | null, text: string) =>
-    invoke<Answer>("query", { sessionId, text }),
-  listSessions: () => invoke<any[]>("list_sessions"),
+  query: (sessionId: string | null, text: string, screenContext?: ScreenContext | null) =>
+    invoke<Answer>("query", { sessionId, text, screenContext: screenContext ?? null }),
+  listSessions: () => invoke<ConversationSession[]>("list_sessions"),
   getConversation: (sessionId: string) => invoke<any[]>("get_conversation", { sessionId }),
+  renameSession: (sessionId: string, title: string) => invoke<void>("rename_session", { sessionId, title }),
+  deleteSession: (sessionId: string) => invoke<void>("delete_session", { sessionId }),
+  listProjects: () => invoke<ConversationProject[]>("list_projects"),
+  createProject: (name: string) => invoke<ConversationProject>("create_project", { name }),
+  moveSessionToProject: (sessionId: string, projectId: string | null) =>
+    invoke<void>("move_session_to_project", { sessionId, projectId }),
 
   // briefs
   getStartupBrief: () => invoke<Brief>("get_startup_brief"),
@@ -238,7 +281,7 @@ export const ipc = {
   nativePermissions: () => invoke<NativePermissions>("native_permissions"),
   requestNativePermission: (service: string) => invoke<{ service: string; status: string }>("request_native_permission", { service }),
   openNativeSettings: (section: string) => invoke<void>("open_native_settings", { section }),
-  screenContext: () => invoke<any>("screen_context"),
+  screenContext: () => invoke<ScreenContext>("screen_context"),
 
   // réglages & modèle
   getSettings: () => invoke<Settings>("get_settings"),
@@ -250,6 +293,8 @@ export const ipc = {
 
   // files
   filesAddFolder: (path: string) => invoke<void>("files_add_folder", { path }),
+  filesRequestFullAccess: () => invoke<{ status: string; message: string }>("files_request_full_access"),
+  filesActivateFullAccess: () => invoke<{ status: string; root?: string; started?: boolean }>("files_activate_full_access"),
   filesRemoveFolder: (path: string) => invoke<void>("files_remove_folder", { path }),
   filesReindex: (path?: string) => invoke<void>("files_reindex", { path: path ?? null }),
   filesIndexStatus: () => invoke<IndexStatus>("files_index_status"),
@@ -258,6 +303,7 @@ export const ipc = {
 
   // connaissances
   knowledgeStats: () => invoke<any>("knowledge_stats"),
+  knowledgeFileGroups: () => invoke<any[]>("knowledge_file_groups"),
   listKnowledge: (source: string | null, filter: string | null, limit?: number) =>
     invoke<any[]>("list_knowledge", { source, filter, limit }),
   forgetItem: (itemId: string) => invoke<void>("forget_item", { itemId }),

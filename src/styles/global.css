@@ -212,6 +212,12 @@ button {
   app-region: no-drag;
   z-index: 30;
 }
+.sidebar-reopen {
+  position: absolute;
+  top: 10px;
+  left: 14px;
+  z-index: 31;
+}
 .topbar-btn {
   color: var(--text-secondary);
   display: flex;
@@ -283,6 +289,21 @@ button {
 }
 .askbar button:hover .icon {
   color: var(--text-primary);
+}
+.askbar button.active .icon,
+.bar-pill button.active .icon {
+  color: #39d36f;
+}
+.askbar button.error .icon,
+.bar-pill button.error .icon {
+  color: #ff6961;
+}
+.askbar button.capturing .icon,
+.bar-pill button.capturing .icon {
+  animation: screen-context-pulse 0.7s ease-in-out infinite alternate;
+}
+@keyframes screen-context-pulse {
+  to { opacity: 0.3; transform: scale(0.86); }
 }
 
 .brief-list {
@@ -389,6 +410,127 @@ button {
   text-overflow: ellipsis;
   display: block;
 }
+.convo-list-row {
+  position: relative;
+  display: flex;
+  align-items: center;
+  border-radius: var(--radius-s);
+  margin-bottom: 2px;
+}
+.convo-new-project {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 2px 0 8px;
+  padding: 8px 10px;
+  border-radius: var(--radius-s);
+  color: var(--text-secondary);
+  font-size: 12.5px;
+  text-align: left;
+}
+.convo-new-project .icon:last-child { margin-left: auto; }
+.convo-new-project:hover { color: var(--text-primary); background: rgba(255, 255, 255, 0.05); }
+.convo-list-row .convo-list-item {
+  min-width: 0;
+  flex: 1;
+  margin-bottom: 0;
+  padding-right: 4px;
+}
+.convo-list-row:hover,
+.convo-list-row.active {
+  background: rgba(255, 255, 255, 0.05);
+}
+.convo-list-row.active {
+  background: var(--bg-selected);
+}
+.convo-more {
+  flex: 0 0 27px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-tertiary);
+  opacity: 0.55;
+}
+.convo-list-row:hover .convo-more,
+.convo-list-row.active .convo-more,
+.convo-more[aria-expanded="true"] {
+  opacity: 1;
+}
+.convo-more:hover { color: var(--text-primary); }
+.convo-project-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 12px 8px 5px;
+  color: var(--text-secondary);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.35px;
+  text-transform: uppercase;
+}
+.conversation-menu {
+  position: absolute;
+  z-index: 30;
+  top: 31px;
+  right: 0;
+  width: 205px;
+  padding: 5px;
+  border-radius: 10px;
+  background: var(--bg-modal);
+  box-shadow: 0 12px 34px rgba(0, 0, 0, 0.55), inset 0 0 0 1px var(--border-strong);
+}
+.conversation-menu > button,
+.conversation-project-choices button {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 8px;
+  border-radius: 7px;
+  color: var(--text-primary);
+  text-align: left;
+  font-size: 12px;
+}
+.conversation-menu > button .icon:last-child { margin-left: auto; }
+.conversation-menu button:hover { background: var(--bg-selected); }
+.conversation-menu button.danger { color: var(--danger); }
+.conversation-menu button:disabled { opacity: 0.4; cursor: default; background: transparent; }
+.conversation-project-choices {
+  max-height: 180px;
+  overflow-y: auto;
+  margin: 2px 0 4px;
+  padding: 4px;
+  border-radius: 8px;
+  background: var(--bg-input-deep);
+}
+.conversation-project-choices button.selected::after {
+  content: "✓";
+  margin-left: auto;
+  color: var(--ok);
+}
+.conversation-dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 120;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.56);
+}
+.conversation-dialog {
+  width: min(420px, calc(100vw - 40px));
+  padding: 20px;
+  border-radius: 15px;
+  background: var(--bg-modal);
+  box-shadow: var(--shadow-modal), inset 0 0 0 1px var(--border-subtle);
+}
+.conversation-dialog h3 { margin: 0 0 12px; font-size: 16px; }
+.conversation-dialog p { color: var(--text-secondary); line-height: 1.5; }
+.conversation-dialog-error { margin-top: 9px; color: var(--danger); font-size: 12px; }
+.conversation-dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
+.conversation-dialog-actions .btn.primary.danger { background: var(--danger); color: white; }
 .convo-list-item:hover {
   background: rgba(255, 255, 255, 0.05);
 }
@@ -572,6 +714,95 @@ button {
 .btn:disabled {
   opacity: 0.45;
   cursor: default;
+}
+.btn.active {
+  background: var(--bg-selected);
+}
+
+/* ——— Connaissances compactes ——— */
+.knowledge-stats,
+.knowledge-toolbar {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: 16px;
+}
+.knowledge-toolbar .text-input {
+  max-width: 280px;
+  margin-left: auto;
+}
+.knowledge-overview-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+.knowledge-summary {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  text-align: left;
+  color: var(--text-primary);
+}
+.knowledge-summary span:not(.icon) {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  flex-direction: column;
+  gap: 3px;
+}
+.knowledge-summary small,
+.knowledge-group small {
+  color: var(--text-tertiary);
+  font-size: 11.5px;
+  font-weight: 400;
+}
+.knowledge-explanation {
+  margin-top: 12px;
+}
+.knowledge-group {
+  background: var(--bg-card);
+  border-radius: var(--radius-s);
+  margin-bottom: 6px;
+}
+.knowledge-group summary {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 11px 13px;
+  cursor: pointer;
+  list-style: none;
+}
+.knowledge-group summary::-webkit-details-marker { display: none; }
+.knowledge-group summary .grow {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 2px;
+}
+.knowledge-examples {
+  display: grid;
+  gap: 3px;
+  padding: 0 13px 12px 38px;
+}
+.knowledge-examples button {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  color: var(--text-secondary);
+  text-align: left;
+}
+.knowledge-examples button span:last-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.activity-explanation {
+  margin-bottom: 10px;
+}
+@media (max-width: 1050px) {
+  .knowledge-overview-grid { grid-template-columns: 1fr; }
 }
 
 /* ——— Listes / cartes génériques ——— */

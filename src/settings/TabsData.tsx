@@ -112,7 +112,7 @@ export function TabStockage(): JSX.Element {
       <SettingRow label="Index & mémoire" desc="Base SQLite chiffrée (SQLCipher AES-256). Reconstructible depuis les sources.">
         <span class="pill-status">{stats() ? fmtBytes(stats()!.db_bytes) : "…"}</span>
       </SettingRow>
-      <SettingRow label="Dossiers indexés" desc="Gérés dans Connecteurs.">
+      <SettingRow label="Accès aux fichiers" desc="Autorisation macOS et indexation automatique gérées dans Connecteurs.">
         <span class="pill-status">{index()?.folders.length ?? 0} dossier(s)</span>
       </SettingRow>
       <div class="section-label">Modèles locaux ({llm()?.runtime ?? "…"})</div>
@@ -263,13 +263,10 @@ export function TabConfidentialite(): JSX.Element {
       </SettingRow>
 
       <SettingRow
-        label="Lecture des documents sensibles"
-        desc="Santé, finance, identité : sans ce consentement, Syn n'indexe que leurs métadonnées (gate de lecture)."
+        label="Contenu des fichiers autorisés"
+        desc="Inclus dans l’autorisation unique aux fichiers. Le contenu reste local et chiffré ; les fichiers système et techniques sont exclus."
       >
-        <Toggle
-          checked={settings()?.sensitive_consent ?? false}
-          onChange={(v) => patch({ sensitive_consent: v })}
-        />
+        <span class="pill-status ok">Inclus</span>
       </SettingRow>
 
       <SettingRow label="Budget de rareté" desc="Plafond de surfaçages proactifs par jour. L'urgent passe toujours.">
@@ -300,10 +297,10 @@ export function TabConfidentialite(): JSX.Element {
         <span class="pill-status">V2</span>
       </SettingRow>
 
-      <div class="section-label">Journal d'accès</div>
+      <div class="section-label">Accès aux données</div>
       <div class="muted" style={{ "line-height": "1.6" }}>
-        Chaque lecture de connecteur est tracée — consultable dans <b>Mes archives → Journal
-        d'accès</b>. Zéro télémétrie : rien ne quitte cette machine.
+        Les accès significatifs aux connecteurs sont tracés — consultables dans <b>Activité →
+        Accès aux données</b>. Zéro télémétrie : rien ne quitte cette machine.
       </div>
     </div>
   );

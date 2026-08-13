@@ -14,7 +14,7 @@ use crate::retrieval;
 use crate::security::provenance;
 use crate::state::Core;
 use serde::Serialize;
-use serde_json::json;
+use serde_json::{json, Value};
 
 const MAX_TOOL_ITERATIONS: usize = 5;
 
@@ -36,6 +36,15 @@ pub struct PendingRef {
 }
 
 pub async fn handle_query(core: &Core, session_id: &str, user_text: &str) -> Result<Answer> {
+    handle_query_with_context(core, session_id, user_text, None).await
+}
+
+pub async fn handle_query_with_context(
+    core: &Core,
+    session_id: &str,
+    user_text: &str,
+    screen_context: Option<&Value>,
+) -> Result<Answer> {
     let db = &core.db;
     let settings = crate::settings::load(db)?;
 
@@ -54,18 +63,57 @@ pub async fn handle_query(core: &Core, session_id: &str, user_text: &str) -> Res
     memory::persist_turn(db, session_id, "user", user_text)?;
     let convo = memory::recent_turns(db, session_id, 12)?;
 
+    let device_only = is_device_diagnostic_query(user_text);
     emit_progress(
         core,
         session_id,
         "retrieve",
-        "Recherche du contexte local",
-        Some("Documents, conversations et données autorisées".into()),
+        if device_only {
+            "Lecture directe de l’appareil"
+        } else {
+            "Recherche du contexte local"
+        },
+        Some(if device_only {
+            "Métriques système actuelles, sans recherche documentaire".into()
+        } else {
+            "Documents, conversations et données autorisées".into()
+        }),
         2,
         5,
         "running",
     );
     // 2. RÉCUPÉRER — retrieval hybride borné et sourcé.
-    let ctx = retrieval::assemble(db, &core.llm, user_text).await?;
+    let mut ctx = if device_only {
+        retrieval::ContextBundle {
+            fragments: vec![],
+            sources: vec![],
+            untrusted_text: String::new(),
+        }
+    } else {
+        retrieval::assemble(db, &core.llm, user_text).await?
+    };
+
+    if let Some((project_id, project_name, history)) = memory::project_context(db, session_id, 24)?
+    {
+        let citation = ctx.sources.len() + 1;
+        let source_ref = format!("project:{project_id}");
+        let contextualized =
+            format!("[source:{citation}] Mémoire partagée du projet « {project_name} »\n{history}");
+        ctx.fragments.push((
+            citation,
+            provenance::wrap_untrusted(&source_ref, &contextualized),
+        ));
+        ctx.untrusted_text.push_str(&history);
+        ctx.sources.push(retrieval::Retrieved {
+            item_id: source_ref.clone(),
+            source: "project".into(),
+            source_ref,
+            title: format!("Projet — {project_name}"),
+            path: None,
+            snippet: history.chars().take(500).collect(),
+            score: 1.0,
+        });
+    }
 
     // Règles actives injectées dans le comportement.
     let (style_rules, action_modifiers) = crate::rules::active_rule_texts(db)?;
@@ -80,6 +128,19 @@ pub async fn handle_query(core: &Core, session_id: &str, user_text: &str) -> Res
             tool_name: None,
         })
         .collect();
+
+    // Le message conservé dans l'historique reste la demande de l'utilisateur.
+    // La capture n'est jointe qu'au tour envoyé au modèle, sous marqueurs non fiables.
+    let screen_text = screen_context.and_then(screen_context_text);
+    if let Some(observed) = &screen_text {
+        if let Some(last_user) = messages.iter_mut().rev().find(|m| m.role == "user") {
+            last_user.content.push_str("\n\n");
+            last_user.content.push_str(&provenance::wrap_untrusted(
+                "screen:capture_locale",
+                observed,
+            ));
+        }
+    }
 
     let catalog = crate::tools::catalog();
     let tool_ctx = crate::tools::ToolCtx {
@@ -158,8 +219,12 @@ pub async fn handle_query(core: &Core, session_id: &str, user_text: &str) -> Res
             );
             let args_text = call.arguments.to_string();
             let risk = actions::classify(&call.name, &call.arguments);
+            let all_untrusted = match &screen_text {
+                Some(screen) => format!("{}\n{}", ctx.untrusted_text, screen),
+                None => ctx.untrusted_text.clone(),
+            };
             let untrusted =
-                provenance::args_derived_from_untrusted(&args_text, user_text, &ctx.untrusted_text);
+                provenance::args_derived_from_untrusted(&args_text, user_text, &all_untrusted);
 
             let observation = if untrusted
                 && risk != actions::RiskClass::Read
@@ -302,6 +367,12 @@ pub async fn handle_query(core: &Core, session_id: &str, user_text: &str) -> Res
         };
     }
 
+    // La recherche peut examiner plusieurs fragments sans que la réponse les utilise.
+    // On ne surface que les sources effectivement citées et on renumérote les
+    // citations pour garder les pastilles et le texte parfaitement alignés.
+    let (normalized_text, cited_sources) = cited_sources(&final_text, &ctx.sources);
+    final_text = normalized_text;
+
     // 5. RÉPONDRE — persisté, sourcé.
     memory::persist_turn(db, session_id, "assistant", &final_text)?;
     emit_progress(
@@ -328,7 +399,7 @@ pub async fn handle_query(core: &Core, session_id: &str, user_text: &str) -> Res
     );
     Ok(Answer {
         text: final_text,
-        sources: ctx.sources,
+        sources: cited_sources,
         pending_actions: pending,
         session_id: session_id.to_string(),
         degraded,
@@ -368,6 +439,119 @@ fn progress_title(tool: &str) -> String {
         "system.diagnose" => "Diagnostic de l’appareil".into(),
         _ => format!("Exécution de {tool}"),
     }
+}
+
+fn screen_context_text(context: &Value) -> Option<String> {
+    if context["available"].as_bool() != Some(true) {
+        return None;
+    }
+    let app = context["app"].as_str().unwrap_or("").trim();
+    let window = context["window"].as_str().unwrap_or("").trim();
+    let text = context["text"].as_str().unwrap_or("").trim();
+    let mut out = format!("Capture ponctuelle de l’écran. Application visible : {app}.");
+    if !window.is_empty() {
+        out.push_str(&format!(" Fenêtre : {window}."));
+    }
+    out.push_str(" Les préfixes entre crochets indiquent la zone visuelle approximative.\n");
+    out.extend(text.chars().take(16_000));
+    Some(out)
+}
+
+fn is_device_diagnostic_query(text: &str) -> bool {
+    let text = text.to_lowercase();
+    let device = [
+        "mon mac",
+        "mon ordinateur",
+        "ma machine",
+        "mon appareil",
+        "ce mac",
+        "cpu",
+        "processeur",
+        "mémoire vive",
+        "memoire vive",
+        " ram",
+        "batterie",
+        "température",
+        "temperature",
+        "stockage",
+        "espace disque",
+        "disque dur",
+    ]
+    .iter()
+    .any(|term| text.contains(term));
+    let diagnostic = [
+        "métrique",
+        "metrique",
+        "capacité",
+        "capacite",
+        "état",
+        "etat",
+        "santé",
+        "sante",
+        "chauff",
+        "température",
+        "temperature",
+        "utilisation",
+        "charge",
+        "disponible",
+        "combien",
+        "diagnostic",
+        "performance",
+    ]
+    .iter()
+    .any(|term| text.contains(term));
+    let asks_documents = [
+        "dans mes documents",
+        "dans mes fichiers",
+        "document sur",
+        "fichier sur",
+        "note sur",
+        "pdf sur",
+    ]
+    .iter()
+    .any(|term| text.contains(term));
+    device && diagnostic && !asks_documents
+}
+
+fn cited_sources(
+    text: &str,
+    sources: &[retrieval::Retrieved],
+) -> (String, Vec<retrieval::Retrieved>) {
+    let marker = "[source:";
+    let mut cursor = 0;
+    let mut output = String::with_capacity(text.len());
+    let mut selected: Vec<retrieval::Retrieved> = Vec::new();
+    let mut numbering = std::collections::HashMap::<usize, usize>::new();
+
+    while let Some(relative_start) = text[cursor..].find(marker) {
+        let start = cursor + relative_start;
+        output.push_str(&text[cursor..start]);
+        let number_start = start + marker.len();
+        let Some(relative_end) = text[number_start..].find(']') else {
+            output.push_str(&text[start..]);
+            cursor = text.len();
+            break;
+        };
+        let end = number_start + relative_end;
+        let original = &text[start..=end];
+        let parsed = text[number_start..end].trim().parse::<usize>().ok();
+        if let Some(index) = parsed.filter(|n| *n > 0 && *n <= sources.len()) {
+            let new_number = if let Some(existing) = numbering.get(&index) {
+                *existing
+            } else {
+                let next = selected.len() + 1;
+                numbering.insert(index, next);
+                selected.push(sources[index - 1].clone());
+                next
+            };
+            output.push_str(&format!("[source:{new_number}]"));
+        } else {
+            output.push_str(original);
+        }
+        cursor = end + 1;
+    }
+    output.push_str(&text[cursor..]);
+    (output, selected)
 }
 
 fn explicit_action_intent(user_text: &str, tool: &str) -> bool {
@@ -422,7 +606,13 @@ fn degraded_answer(ctx: &retrieval::ContextBundle, error: &str) -> String {
     } else {
         s.push_str("Voici néanmoins ce que la recherche locale a trouvé :\n");
         for (i, src) in ctx.sources.iter().enumerate() {
-            s.push_str(&format!("{}. {} — {}\n", i + 1, src.title, src.source_ref));
+            s.push_str(&format!(
+                "{}. {} — {} [source:{}]\n",
+                i + 1,
+                src.title,
+                src.source_ref,
+                i + 1
+            ));
         }
     }
     s
@@ -430,7 +620,20 @@ fn degraded_answer(ctx: &retrieval::ContextBundle, error: &str) -> String {
 
 #[cfg(test)]
 mod intent_tests {
-    use super::explicit_action_intent;
+    use super::{cited_sources, explicit_action_intent, is_device_diagnostic_query};
+    use crate::retrieval::Retrieved;
+
+    fn source(title: &str) -> Retrieved {
+        Retrieved {
+            item_id: title.into(),
+            source: "files".into(),
+            source_ref: title.into(),
+            title: title.into(),
+            path: None,
+            snippet: String::new(),
+            score: 1.0,
+        }
+    }
 
     #[test]
     fn une_consigne_de_document_ne_vaut_pas_demande_utilisateur() {
@@ -445,6 +648,43 @@ mod intent_tests {
         assert!(explicit_action_intent(
             "Tu peux ranger le dossier USA dans Photos de famille ?",
             "files.move"
+        ));
+    }
+
+    #[test]
+    fn ne_surface_que_les_sources_reellement_citees() {
+        let sources = vec![source("A"), source("B"), source("C")];
+        let (text, selected) = cited_sources("Réponse système sans citation.", &sources);
+        assert_eq!(text, "Réponse système sans citation.");
+        assert!(selected.is_empty());
+
+        let (text, selected) = cited_sources(
+            "Selon C [source:3], puis A [source:1] et encore C [source:3].",
+            &sources,
+        );
+        assert_eq!(
+            text,
+            "Selon C [source:1], puis A [source:2] et encore C [source:1]."
+        );
+        assert_eq!(
+            selected
+                .iter()
+                .map(|s| s.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["C", "A"]
+        );
+    }
+
+    #[test]
+    fn les_metriques_machine_ninterrogent_pas_les_documents() {
+        assert!(is_device_diagnostic_query(
+            "Tu peux me donner les métriques de capacités de mon ordinateur ?"
+        ));
+        assert!(is_device_diagnostic_query(
+            "Quelle est la température de mon Mac ?"
+        ));
+        assert!(!is_device_diagnostic_query(
+            "Retrouve le document sur les capacités de mon ordinateur"
         ));
     }
 }

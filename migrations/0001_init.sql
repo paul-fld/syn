@@ -151,7 +151,7 @@ CREATE TABLE IF NOT EXISTS llm_profiles (
   params        TEXT
 );
 
--- Périmètre du connecteur Files (moindre privilège : uniquement les dossiers choisis)
+-- Périmètre effectif du connecteur Files (racine utilisateur autorisée par l'OS)
 CREATE TABLE IF NOT EXISTS folders (
   path     TEXT PRIMARY KEY,
   added_at INTEGER NOT NULL,

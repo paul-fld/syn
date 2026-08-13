@@ -206,6 +206,66 @@ pub fn recent_turns(db: &Db, session_id: &str, limit: usize) -> Result<Vec<(Stri
     })
 }
 
+/// Historique des autres conversations du même projet. Ce texte sera injecté
+/// sous provenance non fiable : il apporte la continuité sans rejouer d'anciennes consignes.
+pub fn project_context(
+    db: &Db,
+    session_id: &str,
+    limit: usize,
+) -> Result<Option<(String, String, String)>> {
+    db.with(|c| {
+        let project: Option<(String, String)> = c
+            .query_row(
+                "SELECT p.id, p.name FROM sessions s JOIN projects p ON p.id=s.project_id
+                 WHERE s.id=?1",
+                [session_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map(Some)
+            .or_else(|e| {
+                if e == rusqlite::Error::QueryReturnedNoRows {
+                    Ok(None)
+                } else {
+                    Err(e)
+                }
+            })?;
+        let Some((project_id, project_name)) = project else {
+            return Ok(None);
+        };
+        let mut stmt = c.prepare(
+            "SELECT COALESCE(s.title, 'Sans titre'), c.role, c.content
+             FROM conversations c JOIN sessions s ON s.id=c.session_id
+             WHERE s.project_id=?1 AND s.id<>?2 AND c.role IN ('user','assistant')
+             ORDER BY c.created_at DESC LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![project_id, session_id, limit as i64], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut turns = vec![];
+        for row in rows {
+            turns.push(row?);
+        }
+        if turns.is_empty() {
+            return Ok(None);
+        }
+        turns.reverse();
+        let mut text = String::new();
+        for (title, role, content) in turns {
+            let speaker = if role == "user" { "Utilisateur" } else { "Syn" };
+            let line = format!("[Conversation : {title}] {speaker} : {content}\n");
+            if text.len() + line.len() > 7_000 {
+                break;
+            }
+            text.push_str(&line);
+        }
+        Ok(Some((project_id, project_name, text)))
+    })
+}
+
 // ————— Tâches —————
 
 pub fn create_task(

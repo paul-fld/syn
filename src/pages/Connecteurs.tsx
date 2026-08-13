@@ -1,10 +1,9 @@
-// Connecteurs : dossiers indexés (moindre privilège) + services (Apple local,
-// OAuth globaux honnêtement statués), permissions explicites et révocables.
+// Connecteurs : accès global aux fichiers sous contrôle macOS + services Apple
+// locaux et OAuth externes, permissions explicites et révocables.
 import { createResource, createSignal, For, Show, onCleanup, onMount, type JSX } from "solid-js";
-import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { Icon } from "../components/Icon";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { ipc, on, type ConnectorInfo, type IndexStatus, type NativePermission } from "../lib/ipc";
-import { fmtDate } from "../lib/state";
 
 const BRAND_ICON: Record<string, string> = {
   apple: "apple",
@@ -29,29 +28,40 @@ export function Connecteurs(): JSX.Element {
   const [native, { refetch: refetchNative }] = createResource(() => ipc.nativePermissions());
   const [indexStatus, setIndexStatus] = createSignal<IndexStatus | null>(null);
   const [message, setMessage] = createSignal<string | null>(null);
+  const fileAccess = () => native()?.services.find((service) => service.id === "files");
 
   const refreshIndex = () => ipc.filesIndexStatus().then(setIndexStatus).catch(() => {});
+  const refreshPermissions = async () => {
+    const result = await refetchNative();
+    const files = result?.services?.find((service: NativePermission) => service.id === "files");
+    if (files?.status === "granted") {
+      const activation = await ipc.filesActivateFullAccess().catch(() => null);
+      if (activation?.started) setMessage("Accès vérifié. Syn indexe maintenant automatiquement tes fichiers personnels.");
+    }
+  };
   onMount(() => {
     refreshIndex();
-    const t = setInterval(refreshIndex, 3000);
+    void refreshPermissions();
+    const t = setInterval(() => {
+      refreshIndex();
+      void refreshPermissions();
+      void refetch();
+    }, 3000);
     onCleanup(() => clearInterval(t));
     on("sync_progress", (p) => {
       if (p?.payload?.message || p?.message) setMessage(p.message ?? p?.payload?.message);
     });
   });
 
-  const addFolder = async () => {
-    const dir = await openDialog({ directory: true, multiple: false, title: "Choisir un dossier à indexer" });
-    if (typeof dir === "string") {
-      await ipc.filesAddFolder(dir);
-      refreshIndex();
-    }
-  };
-
   const connect = async (id: string) => {
-    const r = await ipc.connectorConnect(id);
-    if (r?.message) setMessage(r.message);
-    refetch();
+    try {
+      const r = await ipc.connectorConnect(id);
+      if (r?.authorization_url) await openUrl(String(r.authorization_url));
+      if (r?.message) setMessage(r.message);
+      refetch();
+    } catch (error: any) {
+      setMessage(error?.message ?? String(error));
+    }
   };
 
   const services = () => (connectors() ?? []).filter((c) => BRAND_ICON[c.id] && c.id !== "apple");
@@ -73,42 +83,30 @@ export function Connecteurs(): JSX.Element {
       <div class="card">
         <div class="card-title">
           <Icon name="folder-open" size={15} />
-          Dossiers indexés
+          Accès aux fichiers
           <span class="spacer" />
-          <button class="btn" onClick={() => ipc.filesReindex()}>
-            Tout réindexer
-          </button>
-          <button class="btn primary" onClick={addFolder}>
-            Ajouter un dossier
-          </button>
+          <Show when={fileAccess()?.status === "granted"}>
+            <span class="pill-status ok">Autorisé</span>
+          </Show>
         </div>
-        <Show
-          when={(indexStatus()?.folders ?? []).length > 0}
-          fallback={<div class="muted">Aucun dossier — Syn n'indexe que ce que tu lui confies.</div>}
-        >
-          <For each={indexStatus()?.folders ?? []}>
-            {(f) => (
-              <div class="row-line">
-                <Icon name="folder" size={14} />
-                <span class="grow" title={f.path}>
-                  {f.path}
-                  <span class="sub"> · indexé {f.last_indexed ? fmtDate(f.last_indexed) : "jamais"}</span>
-                </span>
-                <button title="Réindexer" onClick={() => ipc.filesReindex(f.path)}>
-                  <Icon name="repeat" size={13} />
-                </button>
-                <button
-                  title="Retirer du périmètre"
-                  onClick={async () => {
-                    await ipc.filesRemoveFolder(f.path);
-                    refreshIndex();
-                  }}
-                >
-                  <Icon name="circle-x" size={13} />
-                </button>
-              </div>
-            )}
-          </For>
+        <div class="sub" style={{ "margin-bottom": "12px", "line-height": "1.5" }}>
+          Une seule autorisation permet à Syn de retrouver automatiquement les fichiers de ton compte.
+          Les fichiers système, caches, dépendances, applications et formats techniques sont ignorés.
+        </div>
+        <Show when={fileAccess()?.status !== "granted"} fallback={
+          <div style={{ display: "flex", gap: "8px", "align-items": "center" }}>
+            <button class="btn" onClick={() => ipc.filesReindex()}>Réindexer maintenant</button>
+            <span class="sub">Surveillance automatique active</span>
+          </div>
+        }>
+          <button class="btn primary" onClick={async () => {
+            const result = await ipc.filesRequestFullAccess();
+            setMessage(result.message);
+            await refreshPermissions();
+          }}>Autoriser l’accès aux fichiers</button>
+          <div class="sub" style={{ "margin-top": "8px" }}>
+            macOS ouvre Confidentialité et sécurité → Accès complet au disque. Active Syn puis reviens dans l’application.
+          </div>
         </Show>
         <Show when={indexStatus()?.running}>
           <div class="sub" style={{ "margin-top": "8px", color: "var(--text-secondary)" }}>
@@ -146,7 +144,7 @@ export function Connecteurs(): JSX.Element {
         <div class="sub" style={{ "margin-bottom": "8px" }}>
           Aucun compte système à connecter : tu accordes ou révoques chaque autorisation séparément.
         </div>
-        <For each={native()?.services ?? []}>
+        <For each={(native()?.services ?? []).filter((service) => service.id !== "files")}>
           {(permission: NativePermission) => (
             <div class="row-line native-permission-row">
               <Icon name={permission.id === "mail" ? "apple-mail" : permission.id === "calendar" ? "calendrier" : permission.id === "files" ? "folder" : permission.id === "screen" ? "app-window-mac" : permission.id === "contacts" ? "contact-round" : permission.id === "photos" ? "image" : "check"} size={15} />
@@ -157,22 +155,18 @@ export function Connecteurs(): JSX.Element {
               <span class={`pill-status ${permission.status === "granted" || permission.status === "limited" ? "ok" : permission.status === "denied" || permission.status === "restricted" ? "err" : ""}`}>
                 {!permission.operational ? "Intégration à finaliser" : permission.status === "granted" ? "Autorisé" : permission.status === "limited" ? "Accès limité" : permission.status === "needs_selection" ? "À sélectionner" : permission.status === "denied" ? "Refusé" : permission.status === "restricted" ? "Restreint" : permission.status === "unavailable" ? "Indisponible" : "À autoriser"}
               </span>
-              <Show when={permission.id === "files"} fallback={
-                <Show when={(permission.id === "mail" && permission.status !== "granted") || permission.status === "denied" || permission.status === "restricted"} fallback={
-                  <button class="btn" disabled={!permission.operational || (permission.status === "granted" && permission.id !== "mail") || permission.status === "unavailable"} onClick={async () => {
-                    if (permission.id === "mail") {
-                      await connect("apple");
-                      return;
-                    }
-                    const result = await ipc.requestNativePermission(permission.id);
-                    setMessage(result.status === "granted" || result.status === "limited" ? `${permission.label} autorisé.` : `${permission.label} n’a pas été autorisé.`);
-                    refetchNative();
-                  }}>{!permission.operational ? "À intégrer" : permission.id === "mail" ? "Synchroniser" : permission.status === "granted" ? "Autorisé" : "Autoriser"}</button>
-                }>
-                  <button class="btn" onClick={async () => { await ipc.openNativeSettings(permission.settings); setMessage("Modifie l’autorisation de Syn dans Réglages système, puis reviens ici."); }}>Ouvrir Réglages</button>
-                </Show>
-              }>
-                <button class="btn" onClick={async () => { await addFolder(); refetchNative(); }}>Choisir…</button>
+              <Show when={permission.operational && ((permission.id === "mail" && permission.status !== "granted") || permission.status === "denied" || permission.status === "restricted")}>
+                <button class="btn" onClick={async () => { await ipc.openNativeSettings(permission.settings); setMessage("Modifie l’autorisation de Syn dans Réglages système, puis reviens ici."); }}>Ouvrir Réglages</button>
+              </Show>
+              <Show when={permission.operational && permission.id !== "mail" && permission.status === "needs_permission"}>
+                <button class="btn primary" onClick={async () => {
+                  const result = await ipc.requestNativePermission(permission.id);
+                  setMessage(result.status === "granted" || result.status === "limited" ? `${permission.label} autorisé.` : `${permission.label} n’a pas été autorisé.`);
+                  refetchNative();
+                }}>Autoriser</button>
+              </Show>
+              <Show when={permission.operational && permission.id === "mail" && permission.status === "granted"}>
+                <button class="btn" onClick={() => connect("apple")}>Synchroniser</button>
               </Show>
             </div>
           )}

@@ -1,6 +1,6 @@
 // Store global de l'app (SolidJS) : statut, réglages, événements backend.
 import { createSignal } from "solid-js";
-import { ipc, on, type AppStatus, type Settings, type PendingAction } from "./ipc";
+import { ipc, on, type AppStatus, type Settings, type PendingAction, type ScreenContext } from "./ipc";
 
 export type Screen = "loading" | "onboarding" | "locked" | "app";
 export type PageId =
@@ -27,7 +27,8 @@ export const [alerts, setAlerts] = createSignal<any[]>([]);
 export const [briefVersion, setBriefVersion] = createSignal(0);
 export const [sessionsVersion, setSessionsVersion] = createSignal(0);
 // Requête envoyée depuis la barre d'interaction → ouvre Conversations.
-export const [barQuery, setBarQuery] = createSignal<string | null>(null);
+export interface PendingQuery { text: string; screenContext?: ScreenContext | null }
+export const [barQuery, setBarQuery] = createSignal<PendingQuery | null>(null);
 
 export async function refreshStatus() {
   const s = await ipc.appStatus();
@@ -84,7 +85,7 @@ export async function wireEvents() {
   });
   await on("bar_query", (text) => {
     if (typeof text === "string" && text.trim()) {
-      setBarQuery(text);
+      setBarQuery({ text });
       setPage("conversations");
     }
   });

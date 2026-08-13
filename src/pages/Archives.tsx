@@ -1,13 +1,13 @@
-// Mes archives (ex-« Activité/Journal ») : actions (+undo), accès, surfaçages.
+// Activité : actions (+annulation), accès aux données et notifications proactives.
 import { createResource, createSignal, For, Show, type JSX } from "solid-js";
 import { Icon } from "../components/Icon";
 import { ipc } from "../lib/ipc";
 import { fmtDate } from "../lib/state";
 
 const TABS = [
-  { id: "actions", label: "Actions" },
-  { id: "access", label: "Journal d'accès" },
-  { id: "proactive", label: "Surfaçages" },
+  { id: "actions", label: "Actions effectuées" },
+  { id: "access", label: "Accès aux données" },
+  { id: "proactive", label: "Notifications de Syn" },
 ];
 
 const STATUS_FR: Record<string, string> = {
@@ -18,6 +18,13 @@ const STATUS_FR: Record<string, string> = {
   failed: "échouée",
 };
 
+const RISK_FR: Record<string, string> = {
+  read: "Lecture seule",
+  reversible_local: "Annulable sur cet appareil",
+  reversible_external: "Action externe annulable",
+  floor: "Confirmation obligatoire",
+};
+
 export function Archives(): JSX.Element {
   const [tab, setTab] = createSignal("actions");
   const [actions, { refetch: refetchActions }] = createResource(() => ipc.listActions(null, 200));
@@ -26,10 +33,10 @@ export function Archives(): JSX.Element {
 
   return (
     <div class="page">
-      <div class="page-title">Mes archives</div>
+      <div class="page-title">Activité</div>
       <div class="page-sub">
-        Tout ce que Syn a fait, lu et signalé — auditable, annulable quand c'est possible. Une
-        tentative d'injection serait visible ici.
+        Consulte ce que Syn a fait, les catégories de données auxquelles il a accédé et les
+        notifications qu’il t’a présentées. Les actions annulables peuvent être restaurées ici.
       </div>
 
       <div style={{ display: "flex", gap: "8px", "margin-bottom": "16px" }}>
@@ -64,7 +71,7 @@ export function Archives(): JSX.Element {
                   <Show when={a.derived_from_untrusted}> · ⚠ dérivée de contenu non fiable</Show>
                 </span>
               </span>
-              <span class={`pill-status ${a.risk_class === "floor" ? "warn" : ""}`}>{a.risk_class}</span>
+              <span class={`pill-status ${a.risk_class === "floor" ? "warn" : ""}`}>{RISK_FR[a.risk_class] ?? a.risk_class}</span>
               <Show when={a.status === "executed" && a.undoable}>
                 <button
                   class="btn"
@@ -87,6 +94,10 @@ export function Archives(): JSX.Element {
       </Show>
 
       <Show when={tab() === "access"}>
+        <div class="empty-note activity-explanation">
+          Ce journal indique quand Syn a recherché, synchronisé ou utilisé une catégorie de données.
+          Il n’enregistre pas chaque fichier parcouru pendant une indexation.
+        </div>
         <Show when={(access() ?? []).length === 0}>
           <div class="empty-note">Aucun accès enregistré.</div>
         </Show>
@@ -107,8 +118,11 @@ export function Archives(): JSX.Element {
       </Show>
 
       <Show when={tab() === "proactive"}>
+        <div class="empty-note activity-explanation">
+          Historique des rappels, alertes et suggestions que Syn a décidé de te présenter, avec leur raison.
+        </div>
         <Show when={(surfacings() ?? []).length === 0}>
-          <div class="empty-note">Aucun surfaçage proactif — Syn ne parle que quand il a une raison.</div>
+          <div class="empty-note">Aucune notification proactive pour l’instant.</div>
         </Show>
         <For each={surfacings() ?? []}>
           {(s: any) => (

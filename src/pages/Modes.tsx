@@ -43,6 +43,10 @@ export function ModeEconomie(): JSX.Element {
     refreshSettings();
   };
   const battery = () => snap()?.snapshot?.battery;
+  const batteryIcon = () => {
+    const pct = Number(battery()?.pct ?? 100);
+    return pct < 30 ? "battery-low" : pct < 70 ? "battery-medium" : "battery-full";
+  };
   return (
     <div class="page">
       <div class="page-title">Mode économie</div>
@@ -52,7 +56,7 @@ export function ModeEconomie(): JSX.Element {
       </div>
       <Show when={battery()}>
         <div class="chip" style={{ "margin-bottom": "14px" }}>
-          <Icon name="leaf" size={13} />
+          <Icon name={batteryIcon()} size={13} />
           Batterie : {battery().pct} % · {battery().charging ? "sur secteur" : "sur batterie"}
         </div>
       </Show>

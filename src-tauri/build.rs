@@ -28,10 +28,13 @@ fn main() {
         println!("cargo:rustc-link-lib=static=syn_native_macos");
         for framework in [
             "Contacts",
+            "AppKit",
             "EventKit",
             "Photos",
             "ApplicationServices",
+            "CoreGraphics",
             "Foundation",
+            "Vision",
         ] {
             println!("cargo:rustc-link-lib=framework={framework}");
         }

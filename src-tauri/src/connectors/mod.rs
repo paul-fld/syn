@@ -5,6 +5,7 @@ pub mod calendar;
 pub mod files;
 pub mod mail;
 pub mod native;
+pub mod oauth;
 pub mod people;
 pub mod screen;
 pub mod system;
@@ -28,7 +29,7 @@ pub struct ConnectorInfo {
 pub fn list(db: &Db) -> Result<Vec<ConnectorInfo>> {
     let mut known: Vec<(&str, &str, &str)> = vec![
         // (id, type, statut par défaut)
-        ("files", "files", "connected"), // périmètre = dossiers choisis
+        ("files", "files", "connected"), // accès effectif contrôlé par macOS
         ("google", "google", "needs_configuration"),
         ("microsoft", "microsoft", "needs_configuration"),
         ("slack", "slack", "needs_configuration"),
@@ -55,11 +56,20 @@ pub fn list(db: &Db) -> Result<Vec<ConnectorInfo>> {
             if id == "apple" && cfg!(target_os = "macos") {
                 status = "connected".into();
             }
+            if matches!(id, "google" | "microsoft" | "slack" | "github") {
+                status = if oauth::has_token(id) {
+                    "connected".into()
+                } else if oauth::is_configured(id) {
+                    "disconnected".into()
+                } else {
+                    "needs_configuration".into()
+                };
+            }
             let detail = match ty {
-                "google" => Some("Nécessite un client OAuth Google (PKCE), les API Gmail/Calendar/Drive et la validation des portées sensibles.".to_string()),
-                "microsoft" => Some("Nécessite une application Microsoft Entra, OAuth PKCE et les permissions Graph déléguées.".to_string()),
-                "slack" => Some("Nécessite une application Slack, OAuth v2 et des portées minimales par espace de travail.".to_string()),
-                "github" => Some("Nécessite une GitHub App ou le Device Flow, avec des permissions dépôt minimales.".to_string()),
+                "google" => Some(oauth::configuration_detail("google")),
+                "microsoft" => Some(oauth::configuration_detail("microsoft")),
+                "slack" => Some(oauth::configuration_detail("slack")),
+                "github" => Some(oauth::configuration_detail("github")),
                 "apple" => Some(
                     "Intégré à ce Mac. Chaque service reste soumis à son autorisation macOS propre.".to_string(),
                 ),

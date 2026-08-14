@@ -14,22 +14,30 @@ export function ModeTravail(): JSX.Element {
     <div class="page">
       <div class="page-title">Mode travail</div>
       <div class="page-sub">
-        Pendant le focus, Syn filtre ses propres surfaçages : seul l'urgent passe et les autres
-        suggestions ne sont pas affichées. Le blocage forcé d'applications ou de sites relève des privilèges de l'OS et
-        arrivera dans une version ultérieure.
+        Réduit les interruptions pendant une session de concentration.
       </div>
       <div class="card">
         <SettingRow
           label="Activer le mode travail"
-          desc="Masque les notifications non urgentes de Syn pendant le focus."
+          desc="Filtre les notifications et les suggestions de Syn."
         >
           <Toggle checked={settings()?.work_mode ?? false} onChange={(v) => patch({ work_mode: v })} />
+        </SettingRow>
+        <SettingRow label="Notifications autorisées" desc="Les alertes urgentes restent toujours visibles.">
+          <select
+            class="select"
+            value={settings()?.work_notification_policy ?? "urgent"}
+            onChange={(event) => patch({ work_notification_policy: event.currentTarget.value })}
+          >
+            <option value="urgent">Urgentes uniquement</option>
+            <option value="relevant">Urgentes, agenda et échéances</option>
+          </select>
         </SettingRow>
       </div>
       <Show when={settings()?.work_mode}>
         <div class="chip">
           <Icon name="briefcase" size={13} />
-          Mode travail actif — seul l'urgent te parviendra.
+          Mode travail actif
         </div>
       </Show>
     </div>
@@ -51,8 +59,7 @@ export function ModeEconomie(): JSX.Element {
     <div class="page">
       <div class="page-title">Mode économie</div>
       <div class="page-sub">
-        Sur batterie faible, Syn se limite à l'essentiel : indexation en pause, proactivité
-        réduite. Agir sur les réglages d'énergie de l'OS dépend des APIs de chaque plateforme.
+        Réduit l'activité de Syn pour préserver la batterie.
       </div>
       <Show when={battery()}>
         <div class="chip" style={{ "margin-bottom": "14px" }}>

@@ -86,7 +86,7 @@ export function Accueil(): JSX.Element {
                             </Show>
                             <button
                               title="Demander à Syn de traiter"
-                              onClick={() => ask(`À propos de : ${item.text} — aide-moi à traiter ça.`)}
+                              onClick={() => ask(`Aide-moi avec ceci : ${item.text}`)}
                             >
                               <Icon name="square-pen" size={13} />
                             </button>

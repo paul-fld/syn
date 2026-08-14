@@ -58,7 +58,7 @@ export function Connaissances(): JSX.Element {
               </button>
             </Show>
             <button title="Faire oublier à Syn" onClick={() => forget(item.id)}>
-              <Icon name="circle-x" size={13} />
+              <Icon name="x" size={13} />
             </button>
           </div>
         )}
@@ -110,8 +110,8 @@ export function Connaissances(): JSX.Element {
           </button>
         </div>
         <div class="empty-note knowledge-explanation">
-          Syn connaît les fichiers utiles pour les retrouver et les utiliser à ta demande. Les caches,
-          dépendances, applications, bases techniques et fichiers système ne sont ni affichés ni indexés.
+          Syn indexe les fichiers personnels utiles à tes recherches. Les éléments techniques et
+          les fichiers système sont ignorés.
         </div>
       </Show>
 
@@ -136,7 +136,7 @@ export function Connaissances(): JSX.Element {
                       )}
                     </For>
                     <Show when={group.count > (group.examples?.length ?? 0)}>
-                      <small>Et {group.count - (group.examples?.length ?? 0)} autres — utilise la recherche pour retrouver un fichier précis.</small>
+                      <small>{group.count - (group.examples?.length ?? 0)} autres éléments. Utilise la recherche pour les retrouver.</small>
                     </Show>
                   </div>
                 </details>

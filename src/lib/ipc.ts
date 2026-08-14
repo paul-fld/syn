@@ -39,6 +39,16 @@ export interface Settings {
   bar_shortcut: string;
   reduce_motion: boolean;
   large_text: boolean;
+  notifications_enabled: boolean;
+  notifications_muted: boolean;
+  notification_sound: boolean;
+  notification_min_priority: "info" | "important" | "urgent";
+  notify_briefs: boolean;
+  notify_events: boolean;
+  notify_commitments: boolean;
+  notify_system: boolean;
+  notify_rules: boolean;
+  work_notification_policy: "urgent" | "relevant";
   cloud_escalation: boolean;
   sensitive_consent: boolean;
   files_full_access_requested: boolean;
@@ -104,6 +114,16 @@ export interface Brief {
   generated_at: number;
 }
 
+export interface SynNotification {
+  id: string;
+  kind: "brief" | "daily_wrap" | "system" | "event" | "commitment" | "rule" | string;
+  reason: string;
+  body: string | null;
+  priority: "info" | "important" | "urgent";
+  surfaced_at: number;
+  dismissed: boolean;
+}
+
 export interface PendingAction {
   id: string;
   tool: string;
@@ -143,6 +163,9 @@ export interface ScreenContext {
   window: string;
   captured_at: number;
   source: "capture_locale_ocr";
+  target_pid: number;
+  selection: "topmost_external_window";
+  syn_windows_excluded: boolean;
   text: string;
   observations: ScreenContextObservation[];
 }
@@ -341,7 +364,7 @@ export const ipc = {
     invoke<void>("rules_set_priority", { id, overId }),
 
   // proactivité & système
-  listSurfacings: (limit?: number) => invoke<any[]>("list_surfacings", { limit }),
+  listSurfacings: (limit?: number) => invoke<SynNotification[]>("list_surfacings", { limit }),
   dismissSurfacing: (id: string) => invoke<void>("dismiss_surfacing", { id }),
   listTriggers: () => invoke<any[]>("list_triggers"),
   triggerToggle: (id: string, enabled: boolean) =>

@@ -141,12 +141,24 @@ pub fn forward_bus(app: &AppHandle) {
             {
                 if priority != "info" {
                     use tauri_plugin_notification::NotificationExt;
-                    let _ = handle
+                    let sound_enabled = handle
+                        .state::<AppState>()
+                        .core()
+                        .ok()
+                        .and_then(|core| crate::settings::load(&core.db).ok())
+                        .map(|settings| settings.notification_sound)
+                        .unwrap_or(false);
+                    let notification = handle
                         .notification()
                         .builder()
                         .title(format!("Syn — {reason}"))
-                        .body(body.clone())
-                        .show();
+                        .body(body.clone());
+                    let notification = if sound_enabled {
+                        notification.sound("default")
+                    } else {
+                        notification
+                    };
+                    let _ = notification.show();
                 }
             }
         }

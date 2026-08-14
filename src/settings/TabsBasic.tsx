@@ -1,5 +1,5 @@
 // Onglets Général, Compte, Personnalisation, Accessibilité.
-import { Show, type JSX } from "solid-js";
+import type { JSX } from "solid-js";
 import { Toggle, SettingRow } from "../components/Toggle";
 import { ipc } from "../lib/ipc";
 import { settings, refreshSettings, status } from "../lib/state";
@@ -16,27 +16,30 @@ export function TabGeneral(): JSX.Element {
 
       <SettingRow
         label="Niveau d'autonomie"
-        desc="Règle le seuil au-dessus du plancher. Le plancher (action irréversible, vers une personne, financière) exige TOUJOURS une confirmation — quel que soit ce niveau."
+        desc="Définit les actions que Syn peut effectuer sans confirmation."
       >
         <select
           class="select"
           value={settings()?.autonomy ?? "assiste"}
           onChange={(e) => patch({ autonomy: e.currentTarget.value })}
         >
-          <option value="prudent">Prudent — tout est confirmé</option>
-          <option value="assiste">Assisté — le réversible-local est automatique</option>
-          <option value="autonome">Autonome — tout sauf le plancher</option>
+          <option value="prudent">Prudent : toujours confirmer</option>
+          <option value="assiste">Assisté : actions locales simples</option>
+          <option value="autonome">Autonome : sauf actions sensibles</option>
         </select>
       </SettingRow>
 
-      <SettingRow label="Brief de démarrage" desc="Au premier réveil du jour : agenda, tâches, engagements.">
+      <SettingRow
+        label="Brief de démarrage"
+        desc="Affiche l'agenda et les tâches au premier lancement du jour."
+      >
         <Toggle
           checked={settings()?.startup_brief_enabled ?? true}
           onChange={(v) => patch({ startup_brief_enabled: v })}
         />
       </SettingRow>
 
-      <SettingRow label="Heure-plancher du brief" desc="Jamais de brief avant cette heure.">
+      <SettingRow label="Heure du brief" desc="N'affiche aucun brief avant cette heure.">
         <select
           class="select"
           value={String(settings()?.brief_floor_hour ?? 7)}
@@ -48,15 +51,87 @@ export function TabGeneral(): JSX.Element {
         </select>
       </SettingRow>
 
-      <SettingRow label="Débrief de fin de journée" desc="Bouclé aujourd'hui, glissé à demain, promesses en cours.">
+      <SettingRow label="Bilan de fin de journée" desc="Résume les tâches terminées, reportées et en cours.">
         <Toggle
           checked={settings()?.daily_wrap_enabled ?? true}
           onChange={(v) => patch({ daily_wrap_enabled: v })}
         />
       </SettingRow>
 
-      <SettingRow label="Lancement au démarrage" desc="Syn démarre avec la session et vit dans la barre des menus.">
+      <SettingRow label="Ouvrir avec la session" desc="Lance Syn à l'ouverture de ta session.">
         <Toggle checked={settings()?.autostart ?? false} onChange={(v) => patch({ autostart: v })} />
+      </SettingRow>
+    </div>
+  );
+}
+
+export function TabNotifications(): JSX.Element {
+  const enabled = () => settings()?.notifications_enabled ?? true;
+  return (
+    <div>
+      <div class="settings-h1">Notifications</div>
+
+      <SettingRow label="Notifications de Syn" desc="Affiche les informations qui demandent ton attention.">
+        <Toggle
+          checked={enabled()}
+          onChange={(value) => patch({ notifications_enabled: value })}
+        />
+      </SettingRow>
+      <SettingRow label="Sourdine" desc="Suspend toutes les notifications jusqu'à sa désactivation.">
+        <Toggle
+          checked={settings()?.notifications_muted ?? false}
+          disabled={!enabled()}
+          onChange={(value) => patch({ notifications_muted: value })}
+        />
+      </SettingRow>
+      <SettingRow label="Son" desc="Joue un son pour les alertes importantes et urgentes.">
+        <Toggle
+          checked={settings()?.notification_sound ?? true}
+          disabled={!enabled()}
+          onChange={(value) => patch({ notification_sound: value })}
+        />
+      </SettingRow>
+      <SettingRow label="Priorité minimale" desc="Masque les notifications moins importantes.">
+        <select
+          class="select"
+          disabled={!enabled()}
+          value={settings()?.notification_min_priority ?? "info"}
+          onChange={(event) => patch({ notification_min_priority: event.currentTarget.value })}
+        >
+          <option value="info">Toutes</option>
+          <option value="important">Importantes et urgentes</option>
+          <option value="urgent">Urgentes uniquement</option>
+        </select>
+      </SettingRow>
+
+      <div class="section-label">Types de notifications</div>
+      <SettingRow label="Résumé du jour" desc="Agenda, tâches et rappels du jour.">
+        <Toggle checked={settings()?.notify_briefs ?? true} disabled={!enabled()} onChange={(value) => patch({ notify_briefs: value })} />
+      </SettingRow>
+      <SettingRow label="Agenda" desc="Événements qui commencent bientôt.">
+        <Toggle checked={settings()?.notify_events ?? true} disabled={!enabled()} onChange={(value) => patch({ notify_events: value })} />
+      </SettingRow>
+      <SettingRow label="Échéances" desc="Engagements arrivant à leur terme.">
+        <Toggle checked={settings()?.notify_commitments ?? true} disabled={!enabled()} onChange={(value) => patch({ notify_commitments: value })} />
+      </SettingRow>
+      <SettingRow label="État de l'appareil" desc="Stockage, température et batterie.">
+        <Toggle checked={settings()?.notify_system ?? true} disabled={!enabled()} onChange={(value) => patch({ notify_system: value })} />
+      </SettingRow>
+      <SettingRow label="Règles" desc="Alertes créées par tes règles personnelles.">
+        <Toggle checked={settings()?.notify_rules ?? true} disabled={!enabled()} onChange={(value) => patch({ notify_rules: value })} />
+      </SettingRow>
+
+      <div class="section-label">Mode travail</div>
+      <SettingRow label="Pendant le mode travail" desc="Choisis les notifications autorisées pendant une session de concentration.">
+        <select
+          class="select"
+          disabled={!enabled()}
+          value={settings()?.work_notification_policy ?? "urgent"}
+          onChange={(event) => patch({ work_notification_policy: event.currentTarget.value })}
+        >
+          <option value="urgent">Urgentes uniquement</option>
+          <option value="relevant">Urgentes, agenda et échéances</option>
+        </select>
       </SettingRow>
     </div>
   );
@@ -68,12 +143,9 @@ export function TabCompte(): JSX.Element {
       <div class="settings-h1">Compte</div>
       <div class="card">
         <div class="card-title">Identité locale</div>
-        <div class="muted" style={{ "line-height": "1.6" }}>
-          {status()?.email ?? "Aucune adresse renseignée"}
-          <br />
-          Syn ne demande <b>aucun compte cloud</b> : le mot de passe maître local est ton portail
-          de sécurité. Le jour où Syn devient payant, l'activation se fera par une clé de licence
-          utilisable hors-ligne — jamais un compte-pour-utiliser.
+        <div class="settings-card-value">{status()?.email ?? "Aucune adresse renseignée"}</div>
+        <div class="muted">
+          Cette adresse identifie ton espace sur cet appareil. Aucun compte en ligne n'est requis.
         </div>
       </div>
     </div>
@@ -91,7 +163,7 @@ export function TabPersonnalisation(): JSX.Element {
 
       <SettingRow
         label="Ton"
-        desc="Tutoiement ou vouvoiement — dans la parole de Syn et les libellés prévus de l'interface. Une règle (ex. « #Vouvoie-moi ») prime sur ce réglage."
+        desc="Choisis comment Syn s'adresse à toi."
       >
         <select
           class="select"
@@ -103,17 +175,20 @@ export function TabPersonnalisation(): JSX.Element {
         </select>
       </SettingRow>
 
-      <SettingRow label="Forme d'adresse" desc="Comment Syn t'appelle (« Monsieur », un prénom… ou rien).">
+      <SettingRow
+        label="Nom utilisé"
+        desc="Indique le prénom ou le titre que Syn doit employer."
+      >
         <input
           class="text-input"
           style={{ width: "180px" }}
-          placeholder="—"
+          placeholder="Aucun"
           value={settings()?.voice.address_form ?? ""}
           onChange={(e) => setAddress(e.currentTarget.value)}
         />
       </SettingRow>
 
-      <SettingRow label="Thème" desc="V1 : thème sombre (celui des maquettes).">
+      <SettingRow label="Apparence" desc="Choisis le thème de l'interface.">
         <select class="select" value="dark">
           <option value="dark">Sombre</option>
         </select>
@@ -127,11 +202,14 @@ export function TabAccessibilite(): JSX.Element {
     <div>
       <div class="settings-h1">Accessibilité</div>
 
-      <SettingRow label="Raccourci de la barre d'interaction" desc="Appelle Syn depuis n'importe où.">
+      <SettingRow
+        label="Raccourci de la barre d'interaction"
+        desc="Ouvre la barre depuis n'importe quelle application."
+      >
         <span class="pill-status">⌥ Espace</span>
       </SettingRow>
 
-      <SettingRow label="Entrée vocale (dictée)" desc="Transcription locale (whisper.cpp) — optionnelle, livrée tard dans la V1.">
+      <SettingRow label="Dictée" desc="Dicte tes demandes à Syn. Bientôt disponible.">
         <Toggle
           checked={false}
           disabled
@@ -139,7 +217,7 @@ export function TabAccessibilite(): JSX.Element {
         />
       </SettingRow>
 
-      <SettingRow label="Sortie vocale" desc="Lecture des briefs à voix haute (locale).">
+      <SettingRow label="Lecture à voix haute" desc="Lit les réponses et les briefs. Bientôt disponible.">
         <Toggle
           checked={false}
           disabled

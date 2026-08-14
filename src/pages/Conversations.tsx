@@ -186,7 +186,7 @@ export function Conversations(): JSX.Element {
             title={thinking() && sessionId() === s.id ? "Attends la fin de la réponse avant de supprimer ce fil" : undefined}
             onClick={() => { setDialogValue(""); setDialog({ kind: "delete", session: s }); }}
           >
-            <Icon name="circle-x" size={14} /> Supprimer
+            <Icon name="x" size={14} /> Supprimer
           </button>
         </div>
       </Show>
@@ -236,8 +236,6 @@ export function Conversations(): JSX.Element {
           <Show when={messages().length === 0 && !thinking()}>
             <div class="empty-note" style={{ "margin-top": "80px" }}>
               Pose une question sur tes documents, tes mails, ton agenda ou ta machine.
-              <br />
-              Chaque réponse cite ses sources — tout reste sur cette machine.
             </div>
           </Show>
           <For each={messages()}>
@@ -276,10 +274,10 @@ export function Conversations(): JSX.Element {
                 <For each={progress()}>
                   {(step) => (
                     <div class={`agent-progress-step ${step.status}`}>
-                      <Icon name={step.status === "done" ? "check" : step.status === "error" ? "circle-x" : "corner-down-right"} size={12} />
+                      <Icon name={step.status === "done" ? "check" : step.status === "error" ? "x" : "corner-down-right"} size={12} />
                       <span>
                         {step.title}
-                        <Show when={step.detail}><span class="sub"> — {step.detail}</span></Show>
+                        <Show when={step.detail}><span class="sub"> : {step.detail}</span></Show>
                       </span>
                     </div>
                   )}

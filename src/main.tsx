@@ -1,6 +1,6 @@
 /* Racine de l'app : loading → onboarding | verrouillé | app. */
 import { render } from "solid-js/web";
-import { createEffect, createSignal, onMount, Show, type JSX } from "solid-js";
+import { createEffect, createSignal, For, onMount, Show, type JSX } from "solid-js";
 import "./styles/global.css";
 import { Icon } from "./components/Icon";
 import { SynGlyph } from "./components/Logo";
@@ -16,7 +16,7 @@ import { MonAppareil } from "./pages/MonAppareil";
 import { Archives } from "./pages/Archives";
 import { Programmations } from "./pages/Programmations";
 import { ModeTravail, ModeEconomie } from "./pages/Modes";
-import { ipc } from "./lib/ipc";
+import { ipc, type SynNotification } from "./lib/ipc";
 import { label } from "./lib/voice";
 import {
   screen,
@@ -34,6 +34,7 @@ import {
   refreshAlerts,
   setSettingsOpen,
   setSettingsTab,
+  fmtDate,
 } from "./lib/state";
 
 function Locked(): JSX.Element {
@@ -115,46 +116,121 @@ function Locked(): JSX.Element {
   );
 }
 
+const NOTIFICATION_SEEN_KEY = "syn.notifications.seen";
+
+function notificationTitle(notification: SynNotification): string {
+  switch (notification.kind) {
+    case "brief": return "Résumé du jour";
+    case "daily_wrap": return "Bilan du jour";
+    case "event": return "Événement à venir";
+    case "commitment": return "Échéance à venir";
+    case "rule": return "Règle déclenchée";
+    case "system": return notification.reason || "État de l'appareil";
+    default: return notification.reason || "Notification de Syn";
+  }
+}
+
+function notificationBody(notification: SynNotification): string {
+  if (notification.kind === "brief") {
+    return "Ton agenda, tes tâches et tes rappels sont disponibles sur l'accueil.";
+  }
+  return notification.body || notification.reason;
+}
+
+function notificationDestination(notification: SynNotification): { page: "accueil" | "appareil" | "programmations" | "archives"; label: string } {
+  if (notification.kind === "system") return { page: "appareil", label: "Voir l'appareil" };
+  if (notification.kind === "rule") return { page: "programmations", label: "Voir la règle" };
+  if (notification.kind === "daily_wrap") return { page: "archives", label: "Voir dans Activité" };
+  return { page: "accueil", label: notification.kind === "brief" ? "Voir le résumé" : "Voir l'accueil" };
+}
+
+function storedSeenNotifications(): Set<string> {
+  try {
+    return new Set(JSON.parse(localStorage.getItem(NOTIFICATION_SEEN_KEY) ?? "[]"));
+  } catch {
+    return new Set();
+  }
+}
+
 function AlertsPopover(): JSX.Element {
   const [open, setOpen] = createSignal(false);
+  const [seen, setSeen] = createSignal(storedSeenNotifications());
+  const unreadCount = () => alerts().filter((alert) => !seen().has(alert.id)).length;
+
+  createEffect(() => {
+    if (!open()) return;
+    const next = new Set(seen());
+    alerts().forEach((alert) => next.add(alert.id));
+    setSeen(next);
+    localStorage.setItem(NOTIFICATION_SEEN_KEY, JSON.stringify([...next].slice(-500)));
+  });
+
+  const dismiss = async (id: string) => {
+    await ipc.dismissSurfacing(id);
+    await refreshAlerts();
+  };
+
   return (
     <>
-      <button class="topbar-btn" title="Notifications de Syn" onClick={() => setOpen(!open())}>
-        <Icon name={alerts().length > 0 ? "bell-dot" : "bell"} size={17} />
-        <Show when={alerts().length > 0}>
+      <button class="topbar-btn notification-button" title="Notifications" onClick={() => setOpen(!open())}>
+        <Icon name="bell" size={17} />
+        <Show when={unreadCount() > 0}>
           <span class="badge-dot" />
         </Show>
       </button>
       <Show when={open()}>
-        <div
-          style={{
-            position: "absolute",
-            top: "34px",
-            right: "0",
-            width: "340px",
-            "max-height": "420px",
-            "overflow-y": "auto",
-            background: "var(--bg-card)",
-            "border-radius": "12px",
-            "box-shadow": "var(--shadow-modal), inset 0 0 0 1px var(--border-subtle)",
-            padding: "12px",
-            "z-index": "50",
-          }}
-        >
+        <div class="notifications-popover">
+          <div class="notifications-header">
+            <b>Notifications</b>
+            <button
+              title="Régler les notifications"
+              onClick={() => {
+                setOpen(false);
+                setSettingsTab("notifications");
+                setSettingsOpen(true);
+              }}
+            >
+              <Icon name="settings" size={14} />
+            </button>
+          </div>
           <Show when={alerts().length === 0}>
-            <div class="muted" style={{ "text-align": "center", padding: "14px" }}>
-              Rien à signaler — Syn ne parle que quand il a une raison.
+            <div class="notifications-empty">
+              Aucune notification.
             </div>
           </Show>
-          {alerts().map((a) => (
-            <div style={{ padding: "8px 6px", "border-bottom": "1px solid var(--border-subtle)" }}>
-              <div style={{ "font-weight": "500", "margin-bottom": "3px" }}>{a.body}</div>
-              <div class="sub muted">Pourquoi : {a.reason}</div>
-            </div>
-          ))}
+          <For each={alerts()}>
+            {(notification) => {
+              const destination = notificationDestination(notification);
+              return (
+                <div class="notification-item">
+                  <button
+                    class="notification-content"
+                    onClick={() => {
+                      setPage(destination.page);
+                      setOpen(false);
+                    }}
+                  >
+                    <span class={`notification-icon ${notification.priority}`}>
+                      <Icon name={notification.kind === "system" ? "gauge" : notification.kind === "event" ? "calendar" : notification.kind === "commitment" ? "flag" : notification.kind === "rule" ? "hash" : "bell"} size={14} />
+                    </span>
+                    <span class="notification-copy">
+                      <span class="notification-title">{notificationTitle(notification)}</span>
+                      <span class="notification-body">{notificationBody(notification)}</span>
+                      <span class="notification-meta">
+                        {fmtDate(notification.surfaced_at)} · {destination.label}
+                      </span>
+                    </span>
+                  </button>
+                  <button class="notification-dismiss" title="Supprimer" onClick={() => dismiss(notification.id)}>
+                    <Icon name="x" size={12} />
+                  </button>
+                </div>
+              );
+            }}
+          </For>
           <Show when={alerts().length > 0}>
-            <button class="link-btn" style={{ padding: "8px 6px" }} onClick={clearAlerts}>
-              Tout effacer
+            <button class="notifications-clear" onClick={async () => { await clearAlerts(); setOpen(false); }}>
+              Effacer toutes les notifications
             </button>
           </Show>
         </div>

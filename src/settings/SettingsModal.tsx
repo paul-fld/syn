@@ -2,22 +2,23 @@
 import { For, Show, type JSX } from "solid-js";
 import { Icon } from "../components/Icon";
 import { settingsOpen, setSettingsOpen, settingsTab, setSettingsTab } from "../lib/state";
-import { TabGeneral, TabCompte, TabPersonnalisation, TabAccessibilite } from "./TabsBasic";
+import { TabGeneral, TabNotifications, TabCompte, TabPersonnalisation, TabAccessibilite } from "./TabsBasic";
 import { TabRegles } from "./TabRegles";
 import { TabDonnees, TabStockage, TabEnfant, TabSecurite, TabConfidentialite, TabAide } from "./TabsData";
 
 const TABS: { id: string; label: string; icon: string | null; v2?: boolean }[] = [
   { id: "general", label: "Général", icon: "settings" },
-  { id: "regles", label: "Règles", icon: null }, // glyphe « # » comme la maquette
+  { id: "notifications", label: "Notifications", icon: "bell" },
+  { id: "regles", label: "Règles", icon: "hash" },
   { id: "compte", label: "Compte", icon: "circle-user-round" },
   { id: "personnalisation", label: "Personnalisation", icon: "palette" },
-  { id: "accessibilite", label: "Accessibilité", icon: "contact-round" },
+  { id: "accessibilite", label: "Accessibilité", icon: "person-standing" },
   { id: "donnees", label: "Données", icon: "database" },
-  { id: "stockage", label: "Stockage", icon: "save" },
+  { id: "stockage", label: "Stockage", icon: "hard-drive" },
   { id: "enfant", label: "Appareil de mon enfant", icon: "baby", v2: true },
   { id: "securite", label: "Sécurité", icon: "key-round" },
   { id: "confidentialite", label: "Confidentialité", icon: "shield" },
-  { id: "aide", label: "Aide", icon: "info" },
+  { id: "aide", label: "Aide", icon: "life-buoy" },
 ];
 
 export function SettingsModal(): JSX.Element {
@@ -26,7 +27,7 @@ export function SettingsModal(): JSX.Element {
       <div class="modal-backdrop" onClick={(e) => e.target === e.currentTarget && setSettingsOpen(false)}>
         <div class="settings-modal fade-in">
           <button class="settings-close" onClick={() => setSettingsOpen(false)}>
-            <Icon name="circle-x" size={18} />
+            <Icon name="x" size={18} />
           </button>
 
           <div class="settings-side">
@@ -71,6 +72,9 @@ export function SettingsModal(): JSX.Element {
             </Show>
             <Show when={settingsTab() === "regles"}>
               <TabRegles />
+            </Show>
+            <Show when={settingsTab() === "notifications"}>
+              <TabNotifications />
             </Show>
             <Show when={settingsTab() === "compte"}>
               <TabCompte />

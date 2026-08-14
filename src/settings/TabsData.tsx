@@ -21,24 +21,24 @@ export function TabDonnees(): JSX.Element {
       <div class="settings-h1">Données</div>
       <div class="card">
         <div class="card-title">
-          <Icon name="database" size={15} /> Ce que Syn stocke
+          <Icon name="database" size={15} /> Données locales
         </div>
-        <div class="muted" style={{ "line-height": "1.7" }}>
-          {stats()?.items ?? "…"} éléments indexés · {stats()?.embeddings ?? "…"} fragments ·
-          base chiffrée de {stats() ? fmtBytes(stats()!.db_bytes) : "…"}
-          <br />
-          Emplacement : <span class="mono">{stats()?.data_dir}</span>
+        <div class="settings-card-value">
+          {stats()?.items ?? "…"} éléments, {stats()?.embeddings ?? "…"} fragments, {stats()
+            ? fmtBytes(stats()!.db_bytes)
+            : "…"}
+        </div>
+        <div class="muted settings-path">
+          <span class="mono">{stats()?.data_dir}</span>
         </div>
       </div>
 
       <div class="card">
         <div class="card-title">
-          <Icon name="download" size={15} /> Export complet
+          <Icon name="download" size={15} /> Exporter les données
         </div>
-        <div class="muted" style={{ "margin-bottom": "10px", "line-height": "1.6" }}>
-          Tes données t'appartiennent : la base (chiffrée) et le fichier de méta se copient tels
-          quels. Avec ton mot de passe maître ou ta phrase de récupération, elles se rouvrent sur
-          n'importe quelle machine avec Syn.
+        <div class="muted settings-card-copy">
+          Ouvre le dossier contenant la base chiffrée et ses métadonnées.
         </div>
         <button
           class="btn"
@@ -46,22 +46,22 @@ export function TabDonnees(): JSX.Element {
             await ipc.openSource(await ipc.dataDirPath()).catch(() => {});
           }}
         >
-          Ouvrir le dossier de données
+          Ouvrir le dossier
         </button>
       </div>
 
       <div class="card">
         <div class="card-title" style={{ color: "var(--danger)" }}>
-          <Icon name="ban" size={15} /> Purge complète
+          <Icon name="ban" size={15} /> Tout supprimer
         </div>
-        <div class="muted" style={{ "margin-bottom": "10px", "line-height": "1.6" }}>
-          Supprime définitivement la mémoire, l’index et les clés locales de Syn sur cet appareil.
+        <div class="muted settings-card-copy">
+          Efface définitivement les données, l'index et les clés de cet appareil.
         </div>
         <Show
           when={purgeArmed()}
           fallback={
             <button class="btn danger" onClick={() => setPurgeArmed(true)}>
-              Purger toutes mes données…
+              Supprimer mes données…
             </button>
           }
         >
@@ -109,17 +109,16 @@ export function TabStockage(): JSX.Element {
   return (
     <div>
       <div class="settings-h1">Stockage</div>
-      <SettingRow label="Index & mémoire" desc="Base SQLite chiffrée (SQLCipher AES-256). Reconstructible depuis les sources.">
+      <SettingRow label="Base locale" desc="Index chiffré, reconstruit à partir de tes sources.">
         <span class="pill-status">{stats() ? fmtBytes(stats()!.db_bytes) : "…"}</span>
       </SettingRow>
-      <SettingRow label="Accès aux fichiers" desc="Autorisation macOS et indexation automatique gérées dans Connecteurs.">
-        <span class="pill-status">{index()?.folders.length ?? 0} dossier(s)</span>
+      <SettingRow label="Fichiers indexés" desc="Gère les accès depuis la page Connecteurs.">
+        <span class="pill-status">{index()?.folders.length ?? 0} dossiers</span>
       </SettingRow>
-      <div class="section-label">Modèles locaux ({llm()?.runtime ?? "…"})</div>
+      <div class="section-label">Modèles locaux</div>
       <Show when={!llm()?.available}>
         <div class="rule-feedback">
-          Moteur d'inférence indisponible : {llm()?.detail}. Le retrieval fonctionne ; la
-          génération est signalée indisponible (mode dégradé).
+          Le moteur local est indisponible. Les réponses générées sont momentanément désactivées.
         </div>
       </Show>
       <For each={llm()?.installed_models ?? []}>
@@ -128,7 +127,7 @@ export function TabStockage(): JSX.Element {
             <Icon name="package" size={14} />
             <span class="grow">{m}</span>
             <Show when={m.startsWith(settings()?.chat_model.split(":")[0] ?? "")}>
-              <span class="pill-status ok">modèle actif</span>
+              <span class="pill-status ok">Actif</span>
             </Show>
           </div>
         )}
@@ -143,12 +142,10 @@ export function TabEnfant(): JSX.Element {
       <div class="settings-h1">Appareil de mon enfant</div>
       <div class="card" style={{ opacity: 0.75 }}>
         <div class="card-title">
-          <Icon name="baby" size={15} /> Bientôt
+          <Icon name="baby" size={15} /> Indisponible
         </div>
-        <div class="muted" style={{ "line-height": "1.7" }}>
-          Superviser l'appareil d'un enfant est presque un produit à part entière : cadre légal
-          spécifique (mineurs) et privilèges systèmes profonds. Ce module est repoussé à une
-          version ultérieure plutôt que d'être livré à moitié sûr.
+        <div class="muted">
+          Cette fonctionnalité sera proposée dans une prochaine version.
         </div>
       </div>
     </div>
@@ -170,8 +167,22 @@ export function TabSecurite(): JSX.Element {
           <Icon name="key-round" size={15} /> Mot de passe maître
         </div>
         <div style={{ display: "flex", gap: "8px", "flex-wrap": "wrap" }}>
-          <input class="text-input" style={{ flex: "1", "min-width": "160px" }} type="password" placeholder="Actuel" value={cur()} onInput={(e) => setCur(e.currentTarget.value)} />
-          <input class="text-input" style={{ flex: "1", "min-width": "160px" }} type="password" placeholder="Nouveau (8+ caractères)" value={neu()} onInput={(e) => setNeu(e.currentTarget.value)} />
+          <input
+            class="text-input"
+            style={{ flex: "1", "min-width": "160px" }}
+            type="password"
+            placeholder="Actuel"
+            value={cur()}
+            onInput={(e) => setCur(e.currentTarget.value)}
+          />
+          <input
+            class="text-input"
+            style={{ flex: "1", "min-width": "160px" }}
+            type="password"
+            placeholder="Nouveau (8 caractères minimum)"
+            value={neu()}
+            onInput={(e) => setNeu(e.currentTarget.value)}
+          />
           <button
             class="btn primary"
             onClick={async () => {
@@ -197,15 +208,21 @@ export function TabSecurite(): JSX.Element {
         <div class="card-title">
           <Icon name="file-lock-2" size={15} /> Phrase de récupération
         </div>
-        <div class="muted" style={{ "margin-bottom": "10px", "line-height": "1.6" }}>
-          Sans mot de passe ni phrase, les données sont <b>irrécupérables</b> — c'est le prix du
-          vrai chiffrement local. Régénérer invalide l'ancienne phrase.
+        <div class="muted settings-card-copy">
+          Cette phrase permet de retrouver l'accès à tes données. La régénérer désactive
+          l'ancienne.
         </div>
         <Show
           when={phrase()}
           fallback={
             <div style={{ display: "flex", gap: "8px" }}>
-              <input class="text-input" type="password" placeholder="Mot de passe maître" value={rpPw()} onInput={(e) => setRpPw(e.currentTarget.value)} />
+              <input
+                class="text-input"
+                type="password"
+                placeholder="Mot de passe maître"
+                value={rpPw()}
+                onInput={(e) => setRpPw(e.currentTarget.value)}
+              />
               <button
                 class="btn"
                 onClick={async () => {
@@ -232,7 +249,7 @@ export function TabSecurite(): JSX.Element {
 
       <SettingRow
         label="Trousseau du système"
-        desc="Garde la clé dans le trousseau macOS : déverrouillage par ta session / biométrie, sans retaper le mot de passe."
+        desc="Déverrouille Syn avec ta session macOS."
       >
         <Toggle
           checked={status()?.keychain ?? false}
@@ -252,8 +269,8 @@ export function TabConfidentialite(): JSX.Element {
       <div class="settings-h1">Confidentialité</div>
 
       <SettingRow
-        label="Escalade cloud"
-        desc="OFF par défaut. Si activée : uniquement la requête problématique part vers un modèle cloud, jamais la mémoire ; chaque usage est signalé. (Aucun fournisseur configuré dans ce build : l'egress reste fermé.)"
+        label="Traitement cloud"
+        desc="Indisponible pour le moment. Toutes les demandes restent locales."
       >
         <Toggle
           checked={false}
@@ -263,13 +280,13 @@ export function TabConfidentialite(): JSX.Element {
       </SettingRow>
 
       <SettingRow
-        label="Contenu des fichiers autorisés"
-        desc="Inclus dans l’autorisation unique aux fichiers. Le contenu reste local et chiffré ; les fichiers système et techniques sont exclus."
+        label="Contenu des fichiers"
+        desc="Syn peut lire les fichiers autorisés. Leur contenu reste local et chiffré."
       >
         <span class="pill-status ok">Inclus</span>
       </SettingRow>
 
-      <SettingRow label="Budget de rareté" desc="Plafond de surfaçages proactifs par jour. L'urgent passe toujours.">
+      <SettingRow label="Suggestions proactives" desc="Nombre maximal de suggestions par jour.">
         <select
           class="select"
           value={String(settings()?.rarity_budget ?? 5)}
@@ -281,7 +298,10 @@ export function TabConfidentialite(): JSX.Element {
         </select>
       </SettingRow>
 
-      <SettingRow label="Gardien — seuil disque" desc="Alerte quand l'espace libre passe sous ce seuil.">
+      <SettingRow
+        label="Alerte de stockage"
+        desc="Prévient lorsque l'espace libre passe sous ce seuil."
+      >
         <select
           class="select"
           value={String(settings()?.guardian_disk_pct ?? 5)}
@@ -293,14 +313,13 @@ export function TabConfidentialite(): JSX.Element {
         </select>
       </SettingRow>
 
-      <SettingRow label="Reconnaissance faciale" desc="Biométrie de tiers : repoussée à une version ultérieure (V2). Absente de ce build.">
-        <span class="pill-status">V2</span>
+      <SettingRow label="Reconnaissance faciale" desc="Prévue pour une prochaine version.">
+        <span class="pill-status">Bientôt</span>
       </SettingRow>
 
-      <div class="section-label">Accès aux données</div>
-      <div class="muted" style={{ "line-height": "1.6" }}>
-        Les accès significatifs aux connecteurs sont tracés — consultables dans <b>Activité →
-        Accès aux données</b>. Zéro télémétrie : rien ne quitte cette machine.
+      <div class="section-label">Historique des accès</div>
+      <div class="muted settings-section-copy">
+        Retrouve les accès à tes données dans Activité. Syn n'envoie aucune télémétrie.
       </div>
     </div>
   );
@@ -313,26 +332,32 @@ export function TabAide(): JSX.Element {
       <div class="settings-h1">Aide</div>
       <div class="card">
         <div class="card-title">Syn 0.1.0</div>
-        <div class="muted" style={{ "line-height": "1.8" }}>
-          Assistant de vie numérique <b>local-first</b> : mémoire + récupération + action, posées
-          sur ta vie numérique, que tu possèdes entièrement.
-          <br />
-          · Local par défaut — l'inférence, la mémoire et l'index restent sur cette machine.
-          <br />
-          · Plancher humain — aucune action irréversible, externe ou financière sans ta
-          confirmation.
-          <br />
-          · Proactivité rare et explicable — jamais « Syn a deviné ».
+        <div class="muted settings-card-copy no-action">
+          Assistant local pour retrouver tes informations et agir sur ton appareil. Tes données
+          restent sur ce Mac. Les actions sensibles demandent toujours ta confirmation.
         </div>
       </div>
       <div class="card">
         <div class="card-title">Diagnostic</div>
-        <div class="muted" style={{ "line-height": "1.8" }}>
-          Runtime : {llm()?.runtime} — {llm()?.available ? "disponible" : `indisponible (${llm()?.detail ?? "?"})`}
-          <br />
-          Modèle de conversation : {settings()?.chat_model} {llm()?.chat_model_ready ? "✓" : "✗ (à télécharger)"}
-          <br />
-          Modèle d'embedding : {settings()?.embed_model} {llm()?.embed_model_ready ? "✓" : "✗ (à télécharger)"}
+        <div class="diagnostic-line simple">
+          <span>Moteur local</span>
+          <span class="pill-status" classList={{ ok: llm()?.available }}>
+            {llm()?.available ? "Disponible" : "Indisponible"}
+          </span>
+        </div>
+        <div class="diagnostic-line">
+          <span>Conversation</span>
+          <span>{settings()?.chat_model}</span>
+          <span class="pill-status" classList={{ ok: llm()?.chat_model_ready }}>
+            {llm()?.chat_model_ready ? "Prêt" : "À télécharger"}
+          </span>
+        </div>
+        <div class="diagnostic-line">
+          <span>Recherche</span>
+          <span>{settings()?.embed_model}</span>
+          <span class="pill-status" classList={{ ok: llm()?.embed_model_ready }}>
+            {llm()?.embed_model_ready ? "Prêt" : "À télécharger"}
+          </span>
         </div>
       </div>
     </div>

@@ -115,22 +115,48 @@ char *syn_native_ocr_image_json(const char *raw_path) {
 }
 
 char *syn_native_frontmost_context_json(void) {
-    NSRunningApplication *front = NSWorkspace.sharedWorkspace.frontmostApplication;
-    NSString *app = front.localizedName ?: @"";
+    pid_t ownPID = NSProcessInfo.processInfo.processIdentifier;
+    NSString *app = @"";
     NSString *title = @"";
-    pid_t pid = front.processIdentifier;
+    pid_t targetPID = 0;
     CFArrayRef rawWindows = CGWindowListCopyWindowInfo(
         kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
         kCGNullWindowID
     );
     NSArray *windows = CFBridgingRelease(rawWindows);
+    // CGWindowList est ordonnée de l'avant vers l'arrière. On ignore toutes les
+    // fenêtres du processus Syn, car masquer une fenêtre ne change pas toujours
+    // immédiatement NSWorkspace.frontmostApplication.
     for (NSDictionary *window in windows) {
-        if ([window[(id)kCGWindowOwnerPID] intValue] != pid) continue;
+        pid_t pid = [window[(id)kCGWindowOwnerPID] intValue];
+        if (pid == ownPID) continue;
         if ([window[(id)kCGWindowLayer] intValue] != 0) continue;
+        if (![window[(id)kCGWindowIsOnscreen] boolValue]) continue;
+        CGRect bounds = CGRectZero;
+        CFDictionaryRef rawBounds = (__bridge CFDictionaryRef)window[(id)kCGWindowBounds];
+        if (!rawBounds || !CGRectMakeWithDictionaryRepresentation(rawBounds, &bounds)) continue;
+        if (bounds.size.width < 160 || bounds.size.height < 100) continue;
+        NSString *owner = window[(id)kCGWindowOwnerName] ?: @"";
+        if ([owner isEqualToString:@"Window Server"] || [owner isEqualToString:@"Dock"]) continue;
+        targetPID = pid;
+        NSRunningApplication *target = [NSRunningApplication runningApplicationWithProcessIdentifier:pid];
+        app = target.localizedName.length > 0 ? target.localizedName : owner;
         NSString *candidate = window[(id)kCGWindowName];
-        if (candidate.length > 0) { title = candidate; break; }
+        title = candidate.length > 0 ? candidate : @"";
+        break;
     }
-    return syn_copy_json(@{@"available": @YES, @"app": app, @"window": title});
+    if (targetPID == 0) {
+        // Sans autre fenêtre applicative, ce qui est visible est le Bureau/Finder.
+        app = @"Finder";
+        title = @"Bureau macOS";
+    }
+    return syn_copy_json(@{
+        @"available": @YES,
+        @"app": app,
+        @"window": title,
+        @"target_pid": @(targetPID),
+        @"selection": @"topmost_external_window"
+    });
 }
 
 char *syn_native_contacts_json(void) {

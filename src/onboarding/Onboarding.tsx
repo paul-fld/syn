@@ -4,7 +4,8 @@
 import { createResource, createSignal, For, onCleanup, onMount, Show, type JSX } from "solid-js";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { Icon } from "../components/Icon";
-import { SynGlyph } from "../components/Logo";
+import { Logo } from "../components/Logo";
+import onboardingBackground from "../assets/Background-image.png";
 import { ipc, on, type HardwareProfile } from "../lib/ipc";
 import { refreshStatus, status } from "../lib/state";
 
@@ -18,10 +19,12 @@ export function Onboarding(): JSX.Element {
 
   return (
     <div class="onboard-shell">
-      <div class="onboard-left">
+      <div
+        class="onboard-left"
+        style={{ "background-image": `url(${onboardingBackground})` }}
+      >
         <div class="onboard-logo">
-          <SynGlyph size={92} color="#ffffff" />
-          <span class="wordmark">syn</span>
+          <Logo size={92} />
         </div>
       </div>
       <div class="onboard-right">
@@ -80,14 +83,12 @@ function Step1(props: { next: () => void }): JSX.Element {
             <div class="onboard-title">Votre phrase de récupération</div>
             <div class="recovery-box">{phrase()}</div>
             <div class="onboard-note">
-              Conservez-la hors-ligne. Ce mot de passe dérive la clé qui chiffre toutes vos
-              données sur cette machine. Sans mot de passe ni phrase, elles sont
-              <b> irrécupérables</b> — personne, pas même Syn, ne peut les rouvrir. Aucun compte
-              cloud n'est requis.
+              Conservez cette phrase hors ligne. Elle permet de récupérer vos données si vous
+              oubliez votre mot de passe.
             </div>
             <div class="onboard-actions" style={{ "justify-content": "center" }}>
               <button class="btn primary" onClick={props.next}>
-                Je l'ai notée — continuer
+                Je l'ai notée
               </button>
             </div>
           </>
@@ -124,8 +125,7 @@ function Step1(props: { next: () => void }): JSX.Element {
           </button>
         </div>
         <div class="onboard-note">
-          Ce mot de passe maître reste local : il chiffre votre mémoire (AES-256). Pas de compte
-          cloud, zéro télémétrie.
+          Ce mot de passe protège les données enregistrées sur cet appareil.
         </div>
       </Show>
     </div>
@@ -266,7 +266,7 @@ function Step3(props: { next: () => void }): JSX.Element {
                 <span class="service">
                   <Icon name={s.icon} size={22} />
                 </span>
-                <span class="grow">{s.label}{s.id === nativeService ? " — intégré à cet appareil" : ""}</span>
+                <span class="grow">{s.label}{s.id === nativeService ? " (sur cet appareil)" : ""}</span>
                 <Show when={!connected().has(s.id)} fallback={<Icon name="check" size={18} />}>
                   <button class="add-btn" onClick={() => connect(s.id)}>
                     <Icon name="plus" size={18} />
@@ -291,8 +291,7 @@ function Step3(props: { next: () => void }): JSX.Element {
         </button>
       </div>
       <div class="onboard-note">
-        Consentement incrémental : chaque service ne demande un accès qu'au moment où une
-        fonctionnalité en a besoin. Apple = accès local macOS, pas un compte cloud.
+        Vous pourrez modifier chaque connexion plus tard.
       </div>
     </div>
   );
@@ -357,29 +356,28 @@ function Step4(): JSX.Element {
       <Show when={hw()} keyed>
         {(h) => (
           <div class="onboard-note" style={{ "text-align": "left", "margin-bottom": "12px" }}>
-            Machine détectée : {h.total_ram_gb} Go de RAM, {h.cpu_count} cœurs ({h.cpu_arch}) →
-            palier <b>{h.tier}</b>. Modèles conseillés : {h.chat_model} + {h.embed_model}.
+            Syn a choisi les modèles adaptés à cette machine ({h.total_ram_gb} Go de mémoire,
+            {h.cpu_count} cœurs).
           </div>
         )}
       </Show>
 
       <Show when={llm() && !llm()!.available}>
         <div class="rule-feedback" style={{ "margin-bottom": "12px" }}>
-          Le runtime local (Ollama) est injoignable : {llm()!.detail}. Installez/démarrez Ollama
-          puis revenez — tout le reste de Syn fonctionne déjà en mode dégradé.
+          Le moteur local Ollama est indisponible. Démarrez-le pour activer les réponses de Syn.
         </div>
       </Show>
 
       <Show when={llm()?.available}>
         <For each={[
           { model: hw()?.chat_model ?? "llama3.1:latest", label: "Modèle de conversation", missing: needsChat() },
-          { model: hw()?.embed_model ?? "nomic-embed-text", label: "Modèle de compréhension (embeddings)", missing: needsEmbed() },
+          { model: hw()?.embed_model ?? "nomic-embed-text", label: "Recherche locale", missing: needsEmbed() },
         ]}>
           {(m) => (
             <div class="row-line" style={{ "flex-wrap": "wrap" }}>
               <Icon name="cloud-download" size={14} />
               <span class="grow">
-                {m.label} <span class="sub">— {m.model}</span>
+                {m.label} <span class="sub">{m.model}</span>
               </span>
               <Show
                 when={m.missing}
@@ -394,7 +392,7 @@ function Step4(): JSX.Element {
                   }
                 >
                   <span class="sub" style={{ "min-width": "160px" }}>
-                    {pull()[m.model].pct >= 0 ? `${Math.round(pull()[m.model].pct)} % — ` : ""}
+                    {pull()[m.model].pct >= 0 ? `${Math.round(pull()[m.model].pct)} % ` : ""}
                     {pull()[m.model].status}
                   </span>
                 </Show>
@@ -418,8 +416,7 @@ function Step4(): JSX.Element {
       </button>
       <Show when={indexing()}>
         <div class="sub" style={{ "margin-top": "10px" }}>
-          Première indexation : {indexing()!.done}/{indexing()!.total} — reprenable, en fond, basse
-          priorité.
+          Analyse des fichiers : {indexing()!.done}/{indexing()!.total}
           <div class="progress-track">
             <div
               class="progress-fill"
@@ -430,15 +427,14 @@ function Step4(): JSX.Element {
       </Show>
 
       <div class="onboard-note" style={{ "text-align": "left" }}>
-        <b>Confidentialité :</b> tout reste sur cette machine — l'inférence, la mémoire, l'index,
-        chiffrés avec votre clé. Aucune connexion sortante hors des connecteurs que vous activez.
-        Zéro télémétrie. Une purge complète est disponible dans Réglages → Données.
+        Vos données restent chiffrées sur cet appareil. Vous pourrez les exporter ou les supprimer
+        depuis Réglages, puis Données.
       </div>
 
       <div class="onboard-actions">
         <span />
         <button class="btn primary" disabled={finishing()} onClick={finish}>
-          Terminer — ouvrir Syn
+          Ouvrir Syn
         </button>
       </div>
     </div>

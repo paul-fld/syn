@@ -269,15 +269,18 @@ pub async fn maybe_generate_startup_brief(db: &Db, bus: &Bus) -> Result<()> {
 
     settings.last_brief_date = today;
     crate::settings::save(db, &settings)?;
-    db.with(|c| {
-        c.execute(
-            "INSERT INTO proactive_log (id, kind, reason, body, priority, surfaced_at)
-             VALUES (?1, 'brief', 'Nouveau jour, première ouverture après l''heure-plancher', 'Brief de démarrage', 'info', ?2)",
-            params![crate::db::new_id(), now()],
-        )?;
-        Ok(())
-    })?;
     bus.emit(BusEvent::BriefReady);
+    let _ = super::arbitrate(
+        db,
+        bus,
+        super::Candidate {
+            trigger_id: None,
+            kind: "brief".into(),
+            reason: "Résumé du jour disponible".into(),
+            body: "Consulte ton agenda, tes tâches et tes rappels sur l'accueil.".into(),
+            priority: "info".into(),
+        },
+    )?;
     Ok(())
 }
 
@@ -353,17 +356,16 @@ pub fn maybe_generate_daily_wrap(db: &Db, bus: &Bus) -> Result<()> {
         .as_array()
         .map(|a| a.len())
         .unwrap_or(0);
-    let body = format!("Débrief : {done} tâche(s) terminée(s), {pending} en cours, {commitments} engagement(s) ouvert(s).");
+    let body = format!(
+        "{done} tâche(s) terminée(s), {pending} en cours et {commitments} échéance(s) ouverte(s)."
+    );
     let surfaced = super::arbitrate(
         db,
         bus,
         super::Candidate {
             trigger_id: None,
             kind: "daily_wrap".into(),
-            reason: format!(
-                "Heure du débrief quotidien ({} h)",
-                settings.daily_wrap_hour
-            ),
+            reason: "Bilan du jour disponible".into(),
             body,
             priority: "info".into(),
         },

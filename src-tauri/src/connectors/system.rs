@@ -129,7 +129,7 @@ pub fn diagnose(s: &SystemSnapshot) -> String {
     };
     if mem_pct > 85.0 {
         findings.push(format!(
-            "La mémoire est presque saturée ({:.1} sur {:.1} Go) — les ralentissements viennent souvent de là.",
+            "La mémoire est presque saturée ({:.1} sur {:.1} Go). Cela peut ralentir l'appareil.",
             s.mem_used_gb, s.mem_total_gb
         ));
     }
@@ -150,7 +150,7 @@ pub fn diagnose(s: &SystemSnapshot) -> String {
     for t in &s.temps {
         if t["celsius"].as_f64().unwrap_or(0.0) > 85.0 {
             findings.push(format!(
-                "La sonde {} relève {} °C — température élevée, probablement en conséquence de la charge CPU.",
+                "La sonde {} relève {} °C. Cette température est élevée.",
                 t["label"].as_str().unwrap_or("?"),
                 t["celsius"]
             ));
@@ -159,7 +159,7 @@ pub fn diagnose(s: &SystemSnapshot) -> String {
     if let Some(b) = &s.battery {
         if b["pct"].as_u64().unwrap_or(100) < 15 && !b["charging"].as_bool().unwrap_or(false) {
             findings.push(format!(
-                "Batterie faible ({} %) — le mode économie peut limiter Syn à l'essentiel.",
+                "Batterie faible ({} %). Le mode économie peut réduire l'activité de Syn.",
                 b["pct"]
             ));
         }

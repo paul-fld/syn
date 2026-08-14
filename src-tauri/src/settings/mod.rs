@@ -52,6 +52,17 @@ pub struct Settings {
     pub bar_shortcut: String,
     pub reduce_motion: bool,
     pub large_text: bool,
+    // Notifications
+    pub notifications_enabled: bool,
+    pub notifications_muted: bool,
+    pub notification_sound: bool,
+    pub notification_min_priority: String, // info | important | urgent
+    pub notify_briefs: bool,
+    pub notify_events: bool,
+    pub notify_commitments: bool,
+    pub notify_system: bool,
+    pub notify_rules: bool,
+    pub work_notification_policy: String, // urgent | relevant
     // Confidentialité
     pub cloud_escalation: bool,  // opt-in, OFF par défaut (invariant 2)
     pub sensitive_consent: bool, // gate de lecture des documents sensibles (Média §B8)
@@ -99,6 +110,16 @@ impl Default for Settings {
             bar_shortcut: "Alt+Space".into(),
             reduce_motion: false,
             large_text: false,
+            notifications_enabled: true,
+            notifications_muted: false,
+            notification_sound: true,
+            notification_min_priority: "info".into(),
+            notify_briefs: true,
+            notify_events: true,
+            notify_commitments: true,
+            notify_system: true,
+            notify_rules: true,
+            work_notification_policy: "urgent".into(),
             cloud_escalation: false,
             sensitive_consent: false,
             files_full_access_requested: false,

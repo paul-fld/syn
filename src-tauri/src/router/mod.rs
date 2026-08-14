@@ -448,11 +448,18 @@ fn screen_context_text(context: &Value) -> Option<String> {
     let app = context["app"].as_str().unwrap_or("").trim();
     let window = context["window"].as_str().unwrap_or("").trim();
     let text = context["text"].as_str().unwrap_or("").trim();
-    let mut out = format!("Capture ponctuelle de l’écran. Application visible : {app}.");
+    let mut out = if app.is_empty() {
+        "Capture ponctuelle de l’écran. L’application cible n’a pas pu être identifiée : ne suppose pas qu’il s’agit de Syn."
+            .to_string()
+    } else {
+        format!(
+            "Capture ponctuelle de l’écran. Application cible déterminée par macOS après exclusion des fenêtres de Syn : {app}. Cette identité est prioritaire sur les mots reconnus dans la capture : la présence du mot « Syn » dans le contenu ne signifie pas que l’application affichée est Syn."
+        )
+    };
     if !window.is_empty() {
         out.push_str(&format!(" Fenêtre : {window}."));
     }
-    out.push_str(" Les préfixes entre crochets indiquent la zone visuelle approximative.\n");
+    out.push_str(" Les préfixes entre crochets indiquent la zone visuelle approximative. Décris uniquement ce que ces observations attestent et présente toute interprétation comme une hypothèse.\n");
     out.extend(text.chars().take(16_000));
     Some(out)
 }
@@ -620,7 +627,9 @@ fn degraded_answer(ctx: &retrieval::ContextBundle, error: &str) -> String {
 
 #[cfg(test)]
 mod intent_tests {
-    use super::{cited_sources, explicit_action_intent, is_device_diagnostic_query};
+    use super::{
+        cited_sources, explicit_action_intent, is_device_diagnostic_query, screen_context_text,
+    };
     use crate::retrieval::Retrieved;
 
     fn source(title: &str) -> Retrieved {
@@ -686,5 +695,19 @@ mod intent_tests {
         assert!(!is_device_diagnostic_query(
             "Retrouve le document sur les capacités de mon ordinateur"
         ));
+    }
+
+    #[test]
+    fn le_contexte_ecran_ne_confond_pas_syn_et_lapplication_cible() {
+        let context = serde_json::json!({
+            "available": true,
+            "app": "Code",
+            "window": "main.rs — Visual Studio Code",
+            "text": "[haut gauche] Syn\n[milieu gauche] gh auth login"
+        });
+        let text = screen_context_text(&context).unwrap();
+        assert!(text.contains("fenêtres de Syn : Code"));
+        assert!(text.contains("présence du mot « Syn »"));
+        assert!(text.contains("Visual Studio Code"));
     }
 }

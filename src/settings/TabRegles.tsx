@@ -81,9 +81,9 @@ export function TabRegles(): JSX.Element {
             </Show>
             <Show when={f.status === "active"}>
               Règle enregistrée
-              {f.kind === "style" && " — appliquée au comportement de Syn."}
-              {f.kind === "standing" && " — programmée en tâche de fond (voir Mes programmations)."}
-              {f.kind === "action_modifier" && " — appliquée quand l'action concernée sera composée."}
+              {f.kind === "style" && " et appliquée au comportement de Syn."}
+              {f.kind === "standing" && " et ajoutée à Mes programmations."}
+              {f.kind === "action_modifier" && " et appliquée aux actions concernées."}
             </Show>
           </div>
         )}
@@ -99,7 +99,7 @@ export function TabRegles(): JSX.Element {
             <span class="grow" title={r.text}>
               {r.text}
               <Show when={r.status === "conflict"}>
-                <span style={{ color: "var(--warn)" }}> · en conflit</span>
+                <span style={{ color: "var(--warn)" }}> (en conflit)</span>
               </Show>
             </span>
             <button
@@ -120,7 +120,7 @@ export function TabRegles(): JSX.Element {
                 refreshSettings();
               }}
             >
-              <Icon name="circle-x" size={15} />
+              <Icon name="x" size={15} />
             </button>
           </div>
         )}

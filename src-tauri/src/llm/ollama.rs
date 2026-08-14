@@ -92,7 +92,7 @@ impl LlmClient for OllamaClient {
         let url = self.url("/api/chat")?;
         let resp = self.http.post(&url).json(&body).send().await.map_err(|e| {
             AppError::Llm(format!(
-                "Le moteur d'inférence local est indisponible ({e}). Le retrieval fonctionne, la génération est signalée indisponible."
+                "Le moteur local est indisponible ({e}). Les réponses générées sont momentanément désactivées."
             ))
         })?;
         if !resp.status().is_success() {

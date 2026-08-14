@@ -11,8 +11,8 @@ const CATALOG: Record<string, Entry> = {
   "ask.placeholder": { tu: "Demander à Syn", vous: "Demander à Syn" },
   "rules.title": { tu: "Tes règles", vous: "Vos règles" },
   "rules.prompt": {
-    tu: "Écris une nouvelle règle que tu veux que Syn intègre",
-    vous: "Écrivez une nouvelle règle que vous voulez que Syn intègre",
+    tu: "Ajoute une règle",
+    vous: "Ajoutez une règle",
   },
   "rules.placeholder": {
     tu: "Exemple : #Tu peux t'arrêter à partir de 19h00",
@@ -20,12 +20,12 @@ const CATALOG: Record<string, Entry> = {
   },
   "archives.title": { tu: "Ton activité", vous: "Votre activité" },
   "knowledge.sub": {
-    tu: "Gère ce que Syn a appris de ta vie numérique. Tout est local, chiffré, supprimable.",
-    vous: "Gérez ce que Syn a appris de votre vie numérique. Tout est local, chiffré, supprimable.",
+    tu: "Consulte et gère les informations accessibles à Syn.",
+    vous: "Consultez et gérez les informations accessibles à Syn.",
   },
   "brief.empty": {
-    tu: "Rien de particulier aujourd'hui. Syn te fera signe s'il voit quelque chose d'utile — jamais sans raison.",
-    vous: "Rien de particulier aujourd'hui. Syn vous fera signe s'il voit quelque chose d'utile — jamais sans raison.",
+    tu: "Rien à signaler aujourd'hui.",
+    vous: "Rien à signaler aujourd'hui.",
   },
   "lock.hint": { tu: "Entre ton mot de passe maître", vous: "Entrez votre mot de passe maître" },
 };

@@ -12,8 +12,7 @@ export function MonAppareil(): JSX.Element {
     <div class="page">
       <div class="page-title">Mon appareil</div>
       <div class="page-sub">
-        Les capteurs de Syn sur cette machine. Lecture seule ; toute action système passerait par
-        la porte de confirmation. Diagnostic utile sur les cas courants — pas un expert hardware.
+        Consulte l'utilisation du processeur, de la mémoire, du stockage et de la batterie.
       </div>
 
       <Show when={snap()} keyed>

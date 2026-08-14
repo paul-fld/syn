@@ -5,9 +5,9 @@ import { ipc, on, type AgentProgress, type PendingAction } from "../lib/ipc";
 import { refreshPending } from "../lib/state";
 
 const RISK_LABEL: Record<string, string> = {
-  floor: "Plancher — confirmation obligatoire",
-  reversible_external: "Réversible, impact externe",
-  reversible_local: "Réversible, local",
+  floor: "Confirmation obligatoire",
+  reversible_external: "Action externe annulable",
+  reversible_local: "Action locale annulable",
   read: "Lecture",
 };
 
@@ -64,7 +64,7 @@ export function ActionCard(props: { action: PendingAction }): JSX.Element {
       <Show when={busy() && progress().length > 0}>
         <div class="agent-progress-list">
           <For each={progress()}>
-            {(step) => <div class={`agent-progress-step ${step.status}`}>{step.title}<Show when={step.detail}><span class="sub"> — {step.detail}</span></Show></div>}
+            {(step) => <div class={`agent-progress-step ${step.status}`}>{step.title}<Show when={step.detail}><span class="sub"> : {step.detail}</span></Show></div>}
           </For>
         </div>
       </Show>

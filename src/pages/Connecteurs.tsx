@@ -23,6 +23,22 @@ const STATUS_LABEL: Record<string, { label: string; cls: string }> = {
   unavailable: { label: "Indisponible", cls: "err" },
 };
 
+const NATIVE_DESCRIPTION: Record<string, string> = {
+  mail: "Accède aux messages enregistrés dans Mail.",
+  contacts: "Retrouve les personnes enregistrées dans Contacts.",
+  calendar: "Consulte et modifie les événements du Calendrier.",
+  reminders: "Synchronisation des rappels bientôt disponible.",
+  photos: "Recherche dans Photos bientôt disponible.",
+  screen: "Analyse ponctuellement la fenêtre visible à ta demande.",
+};
+
+const EXTERNAL_DESCRIPTION: Record<string, string> = {
+  google: "Gmail, Google Agenda et Google Drive.",
+  microsoft: "Outlook, Calendrier et OneDrive.",
+  slack: "Messages et espaces de travail Slack.",
+  github: "Dépôts, problèmes et demandes de fusion GitHub.",
+};
+
 export function Connecteurs(): JSX.Element {
   const [connectors, { refetch }] = createResource(() => ipc.connectorStatus());
   const [native, { refetch: refetchNative }] = createResource(() => ipc.nativePermissions());
@@ -70,8 +86,7 @@ export function Connecteurs(): JSX.Element {
     <div class="page">
       <div class="page-title">Connecteurs</div>
       <div class="page-sub">
-        Chaque connecteur est une permission explicite, révocable, et tracée dans le journal
-        d'accès. Syn n'ouvre aucune connexion sortante en dehors de ceux que tu actives.
+        Gère les services et les données accessibles à Syn.
       </div>
 
       <Show when={message()}>
@@ -90,8 +105,8 @@ export function Connecteurs(): JSX.Element {
           </Show>
         </div>
         <div class="sub" style={{ "margin-bottom": "12px", "line-height": "1.5" }}>
-          Une seule autorisation permet à Syn de retrouver automatiquement les fichiers de ton compte.
-          Les fichiers système, caches, dépendances, applications et formats techniques sont ignorés.
+          Une autorisation suffit pour retrouver tes fichiers personnels. Syn ignore les fichiers
+          système, les applications et les caches.
         </div>
         <Show when={fileAccess()?.status !== "granted"} fallback={
           <div style={{ display: "flex", gap: "8px", "align-items": "center" }}>
@@ -122,14 +137,13 @@ export function Connecteurs(): JSX.Element {
         </Show>
         <Show when={(indexStatus()?.pending_embeddings ?? 0) > 0}>
           <div class="sub muted" style={{ "margin-top": "6px" }}>
-            {indexStatus()!.pending_embeddings} fragments en attente d'embedding (moteur local
-            indisponible — rattrapage automatique).
+            {indexStatus()!.pending_embeddings} passages seront analysés lorsque le moteur local sera disponible.
           </div>
         </Show>
         <Show when={(indexStatus()?.sensitive_skipped ?? 0) > 0}>
           <div class="sub muted" style={{ "margin-top": "6px" }}>
-            {indexStatus()!.sensitive_skipped} document(s) sensibles non lus (santé, finance, ID) —
-            autorise la lecture dans Réglages → Confidentialité.
+            {indexStatus()!.sensitive_skipped} document(s) sensibles ignorés. Modifie ce choix dans
+            Réglages, puis Confidentialité.
           </div>
         </Show>
       </div>
@@ -142,7 +156,7 @@ export function Connecteurs(): JSX.Element {
           <span class="pill-status ok">Intégré</span>
         </div>
         <div class="sub" style={{ "margin-bottom": "8px" }}>
-          Aucun compte système à connecter : tu accordes ou révoques chaque autorisation séparément.
+          Ces services utilisent les autorisations de macOS. Aucun compte supplémentaire n'est nécessaire.
         </div>
         <For each={(native()?.services ?? []).filter((service) => service.id !== "files")}>
           {(permission: NativePermission) => (
@@ -150,7 +164,7 @@ export function Connecteurs(): JSX.Element {
               <Icon name={permission.id === "mail" ? "apple-mail" : permission.id === "calendar" ? "calendrier" : permission.id === "files" ? "folder" : permission.id === "screen" ? "app-window-mac" : permission.id === "contacts" ? "contact-round" : permission.id === "photos" ? "image" : "check"} size={15} />
               <span class="grow">
                 <b>{permission.label}</b>
-                <span class="sub"> — {permission.detail}</span>
+                <span class="sub"> {NATIVE_DESCRIPTION[permission.id] ?? permission.detail}</span>
               </span>
               <span class={`pill-status ${permission.status === "granted" || permission.status === "limited" ? "ok" : permission.status === "denied" || permission.status === "restricted" ? "err" : ""}`}>
                 {!permission.operational ? "Intégration à finaliser" : permission.status === "granted" ? "Autorisé" : permission.status === "limited" ? "Accès limité" : permission.status === "needs_selection" ? "À sélectionner" : permission.status === "denied" ? "Refusé" : permission.status === "restricted" ? "Restreint" : permission.status === "unavailable" ? "Indisponible" : "À autoriser"}
@@ -183,7 +197,7 @@ export function Connecteurs(): JSX.Element {
             <span class="grow">
               <b style={{ "text-transform": "capitalize" }}>{c.id}</b>
               <Show when={c.detail}>
-                <span class="sub"> — {c.detail}</span>
+                <span class="sub"> {EXTERNAL_DESCRIPTION[c.id] ?? c.detail}</span>
               </Show>
             </span>
             <span class={`pill-status ${STATUS_LABEL[c.status]?.cls ?? ""}`}>

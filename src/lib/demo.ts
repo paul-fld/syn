@@ -19,6 +19,16 @@ const SETTINGS = {
   bar_shortcut: "Alt+Space",
   reduce_motion: false,
   large_text: false,
+  notifications_enabled: true,
+  notifications_muted: false,
+  notification_sound: true,
+  notification_min_priority: "info",
+  notify_briefs: true,
+  notify_events: true,
+  notify_commitments: true,
+  notify_system: true,
+  notify_rules: true,
+  work_notification_policy: "urgent",
   cloud_escalation: false,
     sensitive_consent: true,
     files_full_access_requested: false,
@@ -174,7 +184,7 @@ export async function demoInvoke(cmd: string, _args?: any): Promise<any> {
       return { greeting: "Bonsoir Monsieur,", done_tasks: [], pending_tasks: [], open_commitments: [], actions_executed_today: 2, generated_at: 0 };
     case "query":
       return {
-        text: "Votre devis se trouve dans Documents/Projets — je l'ai retrouvé grâce à son contenu [source:1].",
+        text: "Votre devis se trouve dans Documents/Projets. Je l'ai retrouvé grâce à son contenu [source:1].",
         sources: [{ item_id: "k1", source: "files", source_ref: "/Users/paul/Documents/Projets/Devis_X.pdf", title: "Devis_X.pdf", path: null, snippet: "", score: 0.92 }],
         pending_actions: [],
         session_id: "demo",

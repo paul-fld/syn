@@ -32,7 +32,9 @@ export function Icon(props: {
     if (!BRAND.has(props.name)) {
       raw = raw
         .replace(/stroke="#000000"/g, 'stroke="currentColor"')
-        .replace(/fill="#000000"/g, 'fill="currentColor"');
+        .replace(/fill="#000000"/g, 'fill="currentColor"')
+        .replace(/stroke="white"/g, 'stroke="currentColor"')
+        .replace(/fill="white"/g, 'fill="currentColor"');
     }
     raw = raw
       .replace(/(height)="24"/, `$1="${size}"`)

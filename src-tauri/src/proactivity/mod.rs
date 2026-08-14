@@ -19,12 +19,47 @@ pub struct Candidate {
     pub priority: String, // urgent | important | info
 }
 
+fn priority_level(priority: &str) -> u8 {
+    match priority {
+        "urgent" => 3,
+        "important" => 2,
+        _ => 1,
+    }
+}
+
+fn kind_enabled(settings: &crate::settings::Settings, kind: &str) -> bool {
+    match kind {
+        "brief" | "daily_wrap" => settings.notify_briefs,
+        "event" => settings.notify_events,
+        "commitment" => settings.notify_commitments,
+        "system" => settings.notify_system,
+        "rule" => settings.notify_rules,
+        _ => true,
+    }
+}
+
+fn allowed_in_work_mode(settings: &crate::settings::Settings, candidate: &Candidate) -> bool {
+    if !settings.work_mode || candidate.priority == "urgent" {
+        return true;
+    }
+    settings.work_notification_policy == "relevant"
+        && matches!(candidate.kind.as_str(), "event" | "commitment" | "rule")
+}
+
+fn notification_allowed(settings: &crate::settings::Settings, candidate: &Candidate) -> bool {
+    settings.notifications_enabled
+        && !settings.notifications_muted
+        && kind_enabled(settings, &candidate.kind)
+        && priority_level(&candidate.priority)
+            >= priority_level(&settings.notification_min_priority)
+        && allowed_in_work_mode(settings, candidate)
+}
+
 /// L'arbitre : point unique de décision (budget + priorité + fenêtres calmes + anti-répétition).
 pub fn arbitrate(db: &Db, bus: &Bus, candidate: Candidate) -> Result<bool> {
     let settings = crate::settings::load(db)?;
 
-    // Fenêtres calmes : mode travail → seul l'urgent passe.
-    if settings.work_mode && candidate.priority != "urgent" {
+    if !notification_allowed(&settings, &candidate) {
         return Ok(false);
     }
     // Heures raisonnables.
@@ -114,14 +149,12 @@ pub async fn evaluate_tick(db: &Db, bus: &Bus) -> Result<()> {
                 Candidate {
                     trigger_id: None,
                     kind: "system".into(),
-                    reason: format!(
-                        "Espace libre sous {} % sur {}",
-                        settings.guardian_disk_pct,
-                        d["mount"].as_str().unwrap_or("?")
-                    ),
+                    reason: "Espace de stockage faible".into(),
                     body: format!(
-                        "Le disque {} n'a plus que {:.0} Go libres sur {:.0}. L'indexation sera mise en pause si nécessaire.",
-                        d["mount"].as_str().unwrap_or("?"), free, total
+                        "Il reste {:.0} Go libres sur {:.0} Go pour le disque {}.",
+                        free,
+                        total,
+                        d["mount"].as_str().unwrap_or("?")
                     ),
                     priority: "urgent".into(),
                 },
@@ -147,11 +180,7 @@ pub async fn evaluate_tick(db: &Db, bus: &Bus) -> Result<()> {
                 Candidate {
                     trigger_id: None,
                     kind: "system".into(),
-                    reason: format!(
-                        "Température {} au-dessus de {} °C",
-                        t["label"].as_str().unwrap_or("?"),
-                        settings.guardian_temp_c
-                    ),
+                    reason: "Température élevée".into(),
                     body: format!(
                         "{} relève {} °C.{}",
                         t["label"].as_str().unwrap_or("?"),
@@ -175,8 +204,8 @@ pub async fn evaluate_tick(db: &Db, bus: &Bus) -> Result<()> {
                 Candidate {
                     trigger_id: None,
                     kind: "system".into(),
-                    reason: format!("Batterie à {} %, sur batterie", b["pct"]),
-                    body: "Batterie faible : le mode économie peut mettre l'indexation en pause et limiter Syn à l'essentiel.".into(),
+                    reason: "Batterie faible".into(),
+                    body: format!("Il reste {} %. Active le mode économie pour réduire l'activité de Syn.", b["pct"]),
                     priority: "important".into(),
                 },
             );
@@ -203,7 +232,7 @@ pub async fn evaluate_tick(db: &Db, bus: &Bus) -> Result<()> {
             Candidate {
                 trigger_id: None,
                 kind: "commitment".into(),
-                reason: "Engagement arrivant à échéance dans moins de 24 h".into(),
+                reason: "Échéance à venir".into(),
                 body: text,
                 priority: "important".into(),
             },
@@ -233,7 +262,7 @@ pub async fn evaluate_tick(db: &Db, bus: &Bus) -> Result<()> {
             Candidate {
                 trigger_id: None,
                 kind: "event".into(),
-                reason: format!("Événement au calendrier dans {mins} min"),
+                reason: "Événement à venir".into(),
                 body: format!(
                     "« {} » commence dans {} min.",
                     ev["title"].as_str().unwrap_or("?"),
@@ -333,4 +362,52 @@ pub fn list_surfacings(db: &Db, limit: usize) -> Result<Vec<Value>> {
         }
         Ok(out)
     })
+}
+
+#[cfg(test)]
+mod notification_tests {
+    use super::*;
+
+    fn candidate(kind: &str, priority: &str) -> Candidate {
+        Candidate {
+            trigger_id: None,
+            kind: kind.into(),
+            reason: "Test".into(),
+            body: "Test".into(),
+            priority: priority.into(),
+        }
+    }
+
+    #[test]
+    fn la_sourdine_bloque_toutes_les_notifications() {
+        let mut settings = crate::settings::Settings::default();
+        settings.notifications_muted = true;
+        assert!(!notification_allowed(&settings, &candidate("system", "urgent")));
+    }
+
+    #[test]
+    fn le_filtre_de_priorite_est_applique() {
+        let mut settings = crate::settings::Settings::default();
+        settings.notification_min_priority = "important".into();
+        assert!(!notification_allowed(&settings, &candidate("brief", "info")));
+        assert!(notification_allowed(&settings, &candidate("event", "important")));
+    }
+
+    #[test]
+    fn le_mode_travail_garde_lurgent_par_defaut() {
+        let mut settings = crate::settings::Settings::default();
+        settings.work_mode = true;
+        assert!(!notification_allowed(&settings, &candidate("event", "important")));
+        assert!(notification_allowed(&settings, &candidate("system", "urgent")));
+    }
+
+    #[test]
+    fn le_mode_travail_peut_garder_agenda_et_echeances() {
+        let mut settings = crate::settings::Settings::default();
+        settings.work_mode = true;
+        settings.work_notification_policy = "relevant".into();
+        assert!(notification_allowed(&settings, &candidate("event", "important")));
+        assert!(notification_allowed(&settings, &candidate("commitment", "important")));
+        assert!(!notification_allowed(&settings, &candidate("brief", "info")));
+    }
 }

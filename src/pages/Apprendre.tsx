@@ -42,8 +42,7 @@ export function Apprendre(): JSX.Element {
     <div class="page">
       <div class="page-title">Apprendre à Syn</div>
       <div class="page-sub">
-        Tout ce que Syn apprend ici vient de toi, par un canal de confiance. C'est mémorisé
-        localement, chiffré, et utilisé pour mieux te répondre — jamais transmis.
+        Ajoute les informations personnelles que Syn doit retenir. Elles restent chiffrées sur cet appareil.
       </div>
 
       <div class="card">
@@ -65,7 +64,7 @@ export function Apprendre(): JSX.Element {
         </div>
         <Show when={factSaved()}>
           <div class="sub" style={{ color: "var(--ok)", "margin-top": "8px" }}>
-            Mémorisé — retrouvable dans Connaissances.
+            Ajouté à tes connaissances.
           </div>
         </Show>
       </div>
@@ -74,10 +73,10 @@ export function Apprendre(): JSX.Element {
         <div class="card">
           <div class="card-title">
             <Icon name="circle-fading-plus" size={15} />
-            {(unknowns() ?? []).length} nom(s) repéré(s) — qui est-ce ?
+            {(unknowns() ?? []).length} nom(s) à identifier
           </div>
           <div class="page-sub" style={{ "margin-bottom": "10px" }}>
-            Syn a rencontré ces personnes dans tes contenus. Dis-lui qui c'est (une fois), ou ignore.
+            Indique leur relation avec toi ou ignore-les.
           </div>
           <For each={unknowns() ?? []}>
             {(u: any) => {
@@ -86,7 +85,7 @@ export function Apprendre(): JSX.Element {
                 <div class="row-line">
                   <span class="grow">
                     <b>{u.name}</b>
-                    <span class="sub"> — {u.context}</span>
+                    <span class="sub"> ({u.context})</span>
                   </span>
                   <input
                     class="text-input"
@@ -112,7 +111,7 @@ export function Apprendre(): JSX.Element {
                       refetchUnknowns();
                     }}
                   >
-                    <Icon name="circle-x" size={15} />
+                    <Icon name="x" size={15} />
                   </button>
                 </div>
               );
@@ -145,7 +144,7 @@ export function Apprendre(): JSX.Element {
             <span class="grow">
               <b>{p.name}</b>
               <Show when={p.relationship}>
-                <span class="sub"> — {p.relationship}</span>
+                <span class="sub"> ({p.relationship})</span>
               </Show>
             </span>
             <Show when={p.birthday}>

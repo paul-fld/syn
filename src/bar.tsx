@@ -123,7 +123,7 @@ function Bar(): JSX.Element {
             <details class="agent-progress compact" open>
               <summary>{progress()[progress().length - 1]?.title ?? "Démarrage du traitement local…"}</summary>
               <div class="agent-progress-list">
-                <For each={progress()}>{(step) => <div class={`agent-progress-step ${step.status}`}>{step.title}<Show when={step.detail}><span class="sub"> — {step.detail}</span></Show></div>}</For>
+                <For each={progress()}>{(step) => <div class={`agent-progress-step ${step.status}`}>{step.title}<Show when={step.detail}><span class="sub"> : {step.detail}</span></Show></div>}</For>
               </div>
             </details>
           </Show>
@@ -135,7 +135,7 @@ function Bar(): JSX.Element {
         </button>
         <input
           ref={inputEl}
-          placeholder={captureError() ? "Capture impossible — survole l’icône" : screenContext() ? "Contexte d’écran joint — que veux-tu faire ?" : "Demander à Syn"}
+          placeholder={captureError() ? "Capture impossible. Survole l’icône." : screenContext() ? "Contexte d’écran joint. Que veux-tu faire ?" : "Demander à Syn"}
           value={text()}
           disabled={thinking()}
           onInput={(e) => setText(e.currentTarget.value)}
@@ -145,7 +145,7 @@ function Bar(): JSX.Element {
           }}
         />
         <button
-          title={captureError() || (screenContext() ? `Contexte joint : ${screenContext()!.app}${screenContext()!.window ? ` — ${screenContext()!.window}` : ""}` : "Joindre le contexte visible à l’écran")}
+          title={captureError() || (screenContext() ? `Contexte joint : ${screenContext()!.app}${screenContext()!.window ? ` (${screenContext()!.window})` : ""}` : "Joindre le contexte visible à l’écran")}
           classList={{ active: !!screenContext(), error: !!captureError(), capturing: capturing() }}
           aria-pressed={!!screenContext()}
           disabled={capturing() || thinking()}

@@ -1,6 +1,6 @@
 // Store global de l'app (SolidJS) : statut, réglages, événements backend.
 import { createSignal } from "solid-js";
-import { ipc, on, type AppStatus, type Settings, type PendingAction, type ScreenContext } from "./ipc";
+import { ipc, on, type AppStatus, type Settings, type PendingAction, type ScreenContext, type SynNotification } from "./ipc";
 
 export type Screen = "loading" | "onboarding" | "locked" | "app";
 export type PageId =
@@ -23,7 +23,7 @@ export const [settingsOpen, setSettingsOpen] = createSignal(false);
 export const [settingsTab, setSettingsTab] = createSignal("general");
 export const [sidebarCollapsed, setSidebarCollapsed] = createSignal(false);
 export const [pendingActions, setPendingActions] = createSignal<PendingAction[]>([]);
-export const [alerts, setAlerts] = createSignal<any[]>([]);
+export const [alerts, setAlerts] = createSignal<SynNotification[]>([]);
 export const [briefVersion, setBriefVersion] = createSignal(0);
 export const [sessionsVersion, setSessionsVersion] = createSignal(0);
 // Requête envoyée depuis la barre d'interaction → ouvre Conversations.
@@ -81,7 +81,12 @@ export async function wireEvents() {
   await on("action_resolved", () => refreshPending());
   await on("brief_ready", () => setBriefVersion((v) => v + 1));
   await on("proactive_alert", (p) => {
-    setAlerts((a) => [{ ...p, ts: Date.now() }, ...a].slice(0, 20));
+    const alert = p?.payload ?? p;
+    if (!alert?.id) return;
+    setAlerts((current) => [
+      { ...alert, body: alert.body ?? null, surfaced_at: Math.floor(Date.now() / 1000), dismissed: false },
+      ...current.filter((item) => item.id !== alert.id),
+    ].slice(0, 20));
   });
   await on("bar_query", (text) => {
     if (typeof text === "string" && text.trim()) {

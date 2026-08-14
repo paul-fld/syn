@@ -17,19 +17,18 @@ export function Programmations(): JSX.Element {
     <div class="page">
       <div class="page-title">Mes programmations</div>
       <div class="page-sub">
-        Ce que Syn fait de lui-même — toujours rare, toujours explicable, sous budget ({settings()?.rarity_budget ?? 5}
-        {" "}surfaçages/jour max). Chaque ligne montre sa raison d'exister.
+        Gère les résumés quotidiens, les alertes de l'appareil et tes règles automatiques.
       </div>
 
       <div class="card">
         <div class="card-title">
-          <Icon name="bell" size={15} /> Briefs quotidiens
+          <Icon name="bell" size={15} /> Résumés quotidiens
         </div>
         <div class="row-line">
           <Icon name="alarm-clock" size={14} />
           <span class="grow">
-            Brief de démarrage
-            <span class="sub"> — au premier réveil du jour, après {settings()?.brief_floor_hour ?? 7}h</span>
+            Résumé du jour
+            <span class="sub"> après {settings()?.brief_floor_hour ?? 7}h</span>
           </span>
           <Toggle
             checked={settings()?.startup_brief_enabled ?? true}
@@ -39,8 +38,8 @@ export function Programmations(): JSX.Element {
         <div class="row-line">
           <Icon name="bed-double" size={14} />
           <span class="grow">
-            Débrief de fin de journée
-            <span class="sub"> — vers {settings()?.daily_wrap_hour ?? 18}h : bouclé, glissé, promesses</span>
+            Bilan du soir
+            <span class="sub"> à partir de {settings()?.daily_wrap_hour ?? 18}h</span>
           </span>
           <Toggle
             checked={settings()?.daily_wrap_enabled ?? true}
@@ -51,17 +50,16 @@ export function Programmations(): JSX.Element {
           <Icon name="gauge" size={14} />
           <span class="grow">
             Gardien système
-            <span class="sub"> — disque &lt; {settings()?.guardian_disk_pct}% libre, température &gt; {settings()?.guardian_temp_c}°C</span>
+            <span class="sub"> stockage et température</span>
           </span>
           <span class="pill-status ok">Actif</span>
         </div>
       </div>
 
-      <div class="section-label">Tâches de fond issues de tes règles</div>
+      <div class="section-label">Règles automatiques</div>
       <Show when={(triggers() ?? []).filter((t: any) => t.source === "rule").length === 0}>
         <div class="empty-note">
-          Aucune. Ajoute une règle comme « #Surveille régulièrement les performances de mon
-          ordinateur » dans Réglages → Règles.
+          Aucune règle automatique.
         </div>
       </Show>
       <For each={(triggers() ?? []).filter((t: any) => t.source === "rule")}>

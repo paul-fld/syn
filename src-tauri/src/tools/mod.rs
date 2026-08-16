@@ -80,6 +80,16 @@ pub fn catalog() -> Vec<ToolSpec> {
             SideEffect::WriteLocal,
         ),
         spec(
+            "files.create_folder_and_move",
+            "Crée un dossier de destination manquant puis y déplace un fichier précis. Action locale réversible, toujours proposée explicitement avant exécution.",
+            json!({
+                "source": {"type": "string", "description": "chemin exact du fichier à déplacer"},
+                "destination": {"type": "string", "description": "chemin exact du dossier à créer"}
+            }),
+            &["source", "destination"],
+            SideEffect::WriteLocal,
+        ),
+        spec(
             "mail.search",
             "Recherche dans les mails ingérés.",
             json!({"query": {"type": "string"}}),
@@ -99,7 +109,7 @@ pub fn catalog() -> Vec<ToolSpec> {
         ),
         spec(
             "mail.send",
-            "Envoie un mail. Action vers une personne réelle : TOUJOURS confirmée par l'utilisateur (plancher).",
+            "Envoie un mail via Apple Mail (compte par défaut de l'utilisateur). Action vers une personne réelle : TOUJOURS confirmée par l'utilisateur (plancher).",
             json!({
                 "to": {"type": "string"},
                 "subject": {"type": "string"},
@@ -168,6 +178,13 @@ pub fn catalog() -> Vec<ToolSpec> {
             SideEffect::Read,
         ),
         spec(
+            "people.resolve_email",
+            "Résout un nom de destinataire vers une adresse email connue. À appeler AVANT mail.send quand l'utilisateur donne un nom plutôt qu'une adresse. Si aucun résultat ou plusieurs résultats sont renvoyés, demande une précision ; n'invente jamais d'adresse.",
+            json!({"name": {"type": "string", "description": "nom donné par l'utilisateur"}}),
+            &["name"],
+            SideEffect::Read,
+        ),
+        spec(
             "photos.search",
             "Recherche de photos par métadonnées EXIF (date, lieu GPS) et nom. Renvoie des candidates à confirmer.",
             json!({
@@ -206,9 +223,10 @@ pub fn preview_for(tool: &str, args: &Value) -> String {
     };
     match tool {
         "mail.send" => format!(
-            "Envoyer un mail à {} — objet : « {} »",
+            "Envoyer un mail à {} — objet : « {} »\n{}",
             s("to"),
-            s("subject")
+            s("subject"),
+            s("body").chars().take(500).collect::<String>()
         ),
         "mail.draft" => format!(
             "Créer un brouillon pour {} — objet : « {} »",
@@ -232,6 +250,11 @@ pub fn preview_for(tool: &str, args: &Value) -> String {
         "tasks.complete" => "Marquer une tâche comme faite".into(),
         "files.apply_reorganize_plan" => "Exécuter le plan de rangement validé".into(),
         "files.move" => format!("Déplacer « {} » dans « {} »", s("source"), s("destination")),
+        "files.create_folder_and_move" => format!(
+            "Créer « {} » puis y déplacer « {} »",
+            s("destination"),
+            s("source")
+        ),
         "memory.remember" => format!("Mémoriser : « {} »", s("fact")),
         _ => format!("{tool} {args}"),
     }
@@ -260,20 +283,43 @@ pub async fn execute(ctx: &ToolCtx, tool: &str, args: &Value) -> Result<ToolResu
     match tool {
         "memory.query" | "files.search" | "mail.search" => {
             let query = args["query"].as_str().unwrap_or("");
-            let mut results = retrieval::search(&ctx.db, &ctx.llm, query, 10).await?;
-            if tool == "files.search" {
-                results.retain(|r| r.source == "files");
+            let results = if tool == "files.search" {
+                retrieval::search_source(&ctx.db, &ctx.llm, query, 10, "files").await?
             } else if tool == "mail.search" {
-                results.retain(|r| r.source == "mail");
-            }
+                retrieval::search_source(&ctx.db, &ctx.llm, query, 10, "mail").await?
+            } else {
+                retrieval::search(&ctx.db, &ctx.llm, query, 10).await?
+            };
             crate::security::log_access(
                 &ctx.db,
                 tool.split('.').next().unwrap_or("memory"),
                 "search",
                 Some(query),
             );
+            // Transparence : sans état de l'index, « aucun résultat » est
+            // indiscernable de « pas encore indexé » — et le modèle conclut à tort.
+            let (files_count, last_ingest): (i64, Option<i64>) = ctx.db.with(|c| {
+                Ok(c.query_row(
+                    "SELECT COUNT(*), MAX(ingested_at) FROM items WHERE source='files' AND status='active'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap_or((0, None)))
+            })?;
+            let indexing_recent = last_ingest.map(|t| now() - t < 180).unwrap_or(false);
             Ok(ToolResult {
-                result: json!({ "results": results }),
+                result: json!({
+                    "results": results,
+                    "index_status": {
+                        "fichiers_indexes": files_count,
+                        "indexation_en_cours_probable": indexing_recent,
+                        "note": if results.is_empty() && (indexing_recent || files_count == 0) {
+                            "L'index est vide ou encore en construction : dis-le à l'utilisateur au lieu de conclure que le document n'existe pas."
+                        } else if results.is_empty() {
+                            "Aucun résultat : reformule avec d'autres termes (synonymes, singulier/pluriel) avant de conclure."
+                        } else { "" }
+                    }
+                }),
                 undo: None,
             })
         }
@@ -311,6 +357,7 @@ pub async fn execute(ctx: &ToolCtx, tool: &str, args: &Value) -> Result<ToolResu
                     .map_err(|_| AppError::Invalid("plan de rangement invalide".into()))
             })?;
             let (report, undo) = reorganize::execute_plan(&plan)?;
+            let display_report = reorganize::execution_report(&plan, &undo, &report);
             ctx.db.with(|c| {
                 c.execute(
                     "UPDATE reorganize_plans SET status='executed' WHERE id=?1",
@@ -319,7 +366,15 @@ pub async fn execute(ctx: &ToolCtx, tool: &str, args: &Value) -> Result<ToolResu
                 Ok(())
             })?;
             Ok(ToolResult {
-                result: json!({ "report": report }),
+                result: json!({
+                    "report": report,
+                    "display_report": display_report,
+                    "plan": plan,
+                    "execution": {
+                        "moves": undo["moves"].clone(),
+                        "created_dirs": undo["created_dirs"].clone()
+                    }
+                }),
                 undo: Some(undo),
             })
         }
@@ -333,6 +388,21 @@ pub async fn execute(ctx: &ToolCtx, tool: &str, args: &Value) -> Result<ToolResu
                 .ok_or_else(|| AppError::Invalid("destination requise".into()))?;
             let (report, undo) = reorganize::move_location(&ctx.db, source, destination)?;
             crate::security::log_access(&ctx.db, "files", "move", Some(source));
+            Ok(ToolResult {
+                result: json!({"report": report}),
+                undo: Some(undo),
+            })
+        }
+
+        "files.create_folder_and_move" => {
+            let source = args["source"]
+                .as_str()
+                .ok_or_else(|| AppError::Invalid("source requise".into()))?;
+            let destination = args["destination"]
+                .as_str()
+                .ok_or_else(|| AppError::Invalid("destination requise".into()))?;
+            let (report, undo) = reorganize::create_folder_and_move(&ctx.db, source, destination)?;
+            crate::security::log_access(&ctx.db, "files", "create_folder_and_move", Some(source));
             Ok(ToolResult {
                 result: json!({"report": report}),
                 undo: Some(undo),
@@ -355,18 +425,62 @@ pub async fn execute(ctx: &ToolCtx, tool: &str, args: &Value) -> Result<ToolResu
                 )?;
                 Ok(())
             })?;
+            // Vrai brouillon dans Apple Mail quand il est disponible : l'utilisateur
+            // le retrouve dans Mail ▸ Brouillons, prêt à relire et envoyer.
+            let mut where_saved = "mémoire de Syn";
+            if cfg!(target_os = "macos") && crate::connectors::mail::native_available() {
+                let script = apple_mail_script(to, subject, body, false);
+                if tokio::task::spawn_blocking(move || run_osascript(&script))
+                    .await
+                    .map_err(|e| AppError::Other(e.to_string()))?
+                    .is_ok()
+                {
+                    where_saved = "Apple Mail (dossier Brouillons)";
+                }
+            }
             Ok(ToolResult {
-                result: json!({"status": "brouillon créé", "draft_id": id, "to": to, "subject": subject}),
+                result: json!({"status": "brouillon créé", "draft_id": id, "to": to, "subject": subject, "saved_in": where_saved}),
                 undo: Some(json!({"kind": "delete_item", "id": id})),
             })
         }
 
         "mail.send" => {
-            // L'envoi exige un transport configuré (API/SMTP — doc Connecteurs §1.2).
-            // Ce build n'embarque pas de transport : échec propre et honnête, après plancher.
-            Err(AppError::Invalid(
-                "L'envoi de mail n'est pas encore configuré (aucun compte d'envoi connecté). Le brouillon reste disponible.".into(),
-            ))
+            // Envoi réel via Apple Mail (compte par défaut de l'utilisateur).
+            // Toujours derrière le plancher : on n'arrive ici qu'après confirmation.
+            if args["_syn_preflight_v1"].as_bool() != Some(true) {
+                return Err(AppError::Security(
+                    "Cette demande d'envoi est ancienne ou n'a pas validé le destinataire et le contenu. Recompose le mail avant de l'envoyer.".into(),
+                ));
+            }
+            let (to, subject, body) = (
+                args["to"].as_str().unwrap_or("").trim().to_string(),
+                args["subject"].as_str().unwrap_or("").to_string(),
+                args["body"].as_str().unwrap_or("").to_string(),
+            );
+            if !(to.contains('@') && to.contains('.')) {
+                return Err(AppError::Invalid(format!(
+                    "Destinataire invalide : « {to} »."
+                )));
+            }
+            if subject.trim().is_empty() || body.trim().is_empty() {
+                return Err(AppError::Invalid(
+                    "Un objet et un contenu non vides sont requis avant l'envoi.".into(),
+                ));
+            }
+            if !cfg!(target_os = "macos") || !crate::connectors::mail::native_available() {
+                return Err(AppError::Invalid(
+                    "L'envoi passe par Apple Mail, indisponible sur cette machine. Le brouillon reste possible.".into(),
+                ));
+            }
+            let script = apple_mail_script(&to, &subject, &body, true);
+            tokio::task::spawn_blocking(move || run_osascript(&script))
+                .await
+                .map_err(|e| AppError::Other(e.to_string()))??;
+            crate::security::log_access(&ctx.db, "mail", "send", Some(&to));
+            Ok(ToolResult {
+                result: json!({"status": "envoyé", "via": "Apple Mail", "to": to, "subject": subject}),
+                undo: None,
+            })
         }
 
         "calendar.list" => {
@@ -439,8 +553,20 @@ pub async fn execute(ctx: &ToolCtx, tool: &str, args: &Value) -> Result<ToolResu
                 args["priority"].as_str(),
                 "conversation",
             )?;
+            // Miroir Rappels : la tâche existe aussi dans l'app Rappels du Mac.
+            let mut native = false;
+            if let Some(native_id) = crate::connectors::reminders::create_native(title, due) {
+                let _ = ctx.db.with(|c| {
+                    c.execute(
+                        "UPDATE tasks SET external_ref=?2 WHERE id=?1",
+                        rusqlite::params![id, native_id],
+                    )?;
+                    Ok(())
+                });
+                native = true;
+            }
             Ok(ToolResult {
-                result: json!({"status": "tâche créée", "id": id, "title": title}),
+                result: json!({"status": "tâche créée", "id": id, "title": title, "rappel_macos": native}),
                 undo: Some(json!({"kind": "delete_task", "id": id})),
             })
         }
@@ -449,6 +575,14 @@ pub async fn execute(ctx: &ToolCtx, tool: &str, args: &Value) -> Result<ToolResu
             let id = args["id"]
                 .as_str()
                 .ok_or(AppError::Invalid("id requis".into()))?;
+            let external: Option<String> = ctx.db.with(|c| {
+                Ok(c.query_row(
+                    "SELECT external_ref FROM tasks WHERE id=?1",
+                    rusqlite::params![id],
+                    |r| r.get(0),
+                )
+                .unwrap_or(None))
+            })?;
             ctx.db.with(|c| {
                 c.execute(
                     "UPDATE tasks SET status='done' WHERE id=?1",
@@ -456,6 +590,9 @@ pub async fn execute(ctx: &ToolCtx, tool: &str, args: &Value) -> Result<ToolResu
                 )?;
                 Ok(())
             })?;
+            if let Some(ext) = external {
+                crate::connectors::reminders::complete_native(&ext);
+            }
             Ok(ToolResult {
                 result: json!({"status": "tâche terminée"}),
                 undo: Some(json!({"kind": "reopen_task", "id": id})),
@@ -499,6 +636,13 @@ pub async fn execute(ctx: &ToolCtx, tool: &str, args: &Value) -> Result<ToolResu
                 result: context,
                 undo: None,
             })
+        }
+
+        "people.resolve_email" => {
+            let name = args["name"].as_str().unwrap_or("").trim();
+            let result = people_conn::resolve_email(&ctx.db, name)?;
+            crate::security::log_access(&ctx.db, "people", "resolve_email", Some(name));
+            Ok(ToolResult { result, undo: None })
         }
 
         "photos.search" => {
@@ -551,6 +695,47 @@ pub async fn execute(ctx: &ToolCtx, tool: &str, args: &Value) -> Result<ToolResu
         }
 
         _ => Err(AppError::Invalid(format!("outil inconnu : {tool}"))),
+    }
+}
+
+/// Échappement pour un littéral de chaîne AppleScript.
+fn applescript_str(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\r', "")
+        .replace('\n', "\\n")
+}
+
+/// Script Apple Mail : composition d'un message sortant, envoyé (`send`) ou
+/// enregistré en brouillon (`save`). Le premier usage déclenche la demande
+/// d'autorisation Automation de macOS (une seule fois).
+fn apple_mail_script(to: &str, subject: &str, body: &str, send: bool) -> String {
+    format!(
+        "tell application \"Mail\"\n\
+         set m to make new outgoing message with properties {{subject:\"{}\", content:\"{}\", visible:false}}\n\
+         tell m to make new to recipient at end of to recipients with properties {{address:\"{}\"}}\n\
+         {} m\n\
+         end tell",
+        applescript_str(subject),
+        applescript_str(body),
+        applescript_str(to),
+        if send { "send" } else { "save" }
+    )
+}
+
+fn run_osascript(script: &str) -> Result<String> {
+    let out = std::process::Command::new("/usr/bin/osascript")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .map_err(|e| AppError::Other(format!("osascript : {e}")))?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        Err(AppError::Other(format!(
+            "Apple Mail a refusé l'opération : {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )))
     }
 }
 

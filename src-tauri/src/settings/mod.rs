@@ -121,7 +121,10 @@ impl Default for Settings {
             notify_rules: true,
             work_notification_policy: "urgent".into(),
             cloud_escalation: false,
-            sensitive_consent: false,
+            // Décision produit (14/08/2026) : Syn lit tout par défaut — la
+            // frustration d'autoriser fichier par fichier bloquait l'usage.
+            // Le toggle Réglages ▸ Confidentialité reste le levier d'opt-out.
+            sensitive_consent: true,
             files_full_access_requested: false,
             rarity_budget: 5,
             guardian_disk_pct: 5,

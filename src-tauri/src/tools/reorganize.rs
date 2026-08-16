@@ -608,6 +608,55 @@ pub fn move_location(db: &Db, source: &str, destination: &str) -> Result<(String
     Ok((report, undo))
 }
 
+/// Variante atomique utilisée par une proposition de Syn : crée un unique
+/// sous-dossier manquant dans un parent existant et autorisé, puis déplace le
+/// fichier. En cas d'échec du déplacement, le dossier créé est retiré.
+pub fn create_folder_and_move(db: &Db, source: &str, destination: &str) -> Result<(String, Value)> {
+    let destination = PathBuf::from(destination);
+    if destination.exists() {
+        return move_location(db, source, &destination.to_string_lossy());
+    }
+    let parent = destination
+        .parent()
+        .ok_or_else(|| AppError::Invalid("parent de destination introuvable".into()))?;
+    if parent.is_symlink() || !parent.is_dir() {
+        return Err(AppError::Invalid(
+            "Le dossier parent de la destination doit exister.".into(),
+        ));
+    }
+    let parent = parent.canonicalize()?;
+    if !crate::connectors::files::is_path_in_active_scope(db, &parent)? {
+        return Err(AppError::Security(
+            "La destination proposée est hors du périmètre autorisé à Syn.".into(),
+        ));
+    }
+    let home =
+        dirs::home_dir().ok_or_else(|| AppError::Other("dossier personnel introuvable".into()))?;
+    if is_protected_target(&parent, &home) {
+        return Err(AppError::Security(
+            "Syn refuse de créer un dossier dans cette zone protégée ou trop large.".into(),
+        ));
+    }
+    let name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::trim)
+        .filter(|name| !name.is_empty() && *name != "." && *name != "..")
+        .ok_or_else(|| AppError::Invalid("nom du dossier proposé invalide".into()))?;
+    let destination = parent.join(name);
+    std::fs::create_dir(&destination)?;
+    match move_location(db, source, &destination.to_string_lossy()) {
+        Ok((report, mut undo)) => {
+            undo["created_dirs"] = json!([destination.to_string_lossy()]);
+            Ok((report, undo))
+        }
+        Err(error) => {
+            let _ = std::fs::remove_dir(&destination);
+            Err(error)
+        }
+    }
+}
+
 fn deterministic_category(
     lower_name: &str,
     ext: &str,
@@ -807,6 +856,65 @@ pub fn execute_plan(plan: &Plan) -> Result<(String, Value)> {
     Ok((report, undo))
 }
 
+/// Compte rendu lisible conservé dans la conversation après l'exécution.
+/// Le plan exhaustif reste dans le journal d'action ; ici on regroupe les
+/// déplacements par dossier pour que l'utilisateur retrouve immédiatement
+/// la logique du nouveau rangement sans parcourir une centaine de chemins.
+pub fn execution_report(plan: &Plan, undo: &Value, report: &str) -> String {
+    let mut groups: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    let root = Path::new(&plan.target_dir);
+    for movement in undo["moves"].as_array().into_iter().flatten() {
+        let Some(from) = movement["from"].as_str() else {
+            continue;
+        };
+        let Some(to) = movement["to"].as_str() else {
+            continue;
+        };
+        let destination = Path::new(to);
+        let folder = destination
+            .parent()
+            .and_then(|parent| parent.strip_prefix(root).ok())
+            .filter(|relative| !relative.as_os_str().is_empty())
+            .map(|relative| relative.display().to_string())
+            .unwrap_or_else(|| "Racine du dossier".into());
+        let name = Path::new(from)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| from.to_string());
+        groups.entry(folder).or_default().push(name);
+    }
+
+    let mut text = format!("Rangement terminé et vérifié. {report}\n\nOrganisation appliquée :");
+    for (folder, files) in groups {
+        let visible = files.iter().take(6).cloned().collect::<Vec<_>>().join(", ");
+        let remainder = files.len().saturating_sub(6);
+        text.push_str(&format!(
+            "\n- **{folder}** — {} élément(s) : {visible}",
+            files.len()
+        ));
+        if remainder > 0 {
+            text.push_str(&format!("… et {remainder} autre(s)"));
+        }
+    }
+    if !plan.ambiguous.is_empty() {
+        text.push_str(&format!(
+            "\n- **À décider** — {} élément(s) ambigu(s) n’ont pas été déplacés.",
+            plan.ambiguous.len()
+        ));
+    }
+    if !plan.untouched.is_empty() {
+        text.push_str(&format!(
+            "\n- **Laissés en place** — {} élément(s) protégés ou non classables.",
+            plan.untouched.len()
+        ));
+    }
+    text.push_str(
+        "\n\nLe plan détaillé et l’option Annuler restent disponibles dans Archives → Actions.",
+    );
+    text
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -837,6 +945,37 @@ mod tests {
         assert!(report.contains("1 fichier(s) déplacés"));
         assert_eq!(undo["moves"].as_array().unwrap().len(), 1);
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn le_compte_rendu_explique_le_nouveau_rangement() {
+        let plan = Plan {
+            target_dir: "/Users/alice/Desktop".into(),
+            moves: vec![PlannedMove {
+                from: "/Users/alice/Desktop/photo.png".into(),
+                to: "/Users/alice/Desktop/Images/photo.png".into(),
+                reason: "image".into(),
+                confidence: 1.0,
+            }],
+            ambiguous: vec![],
+            quarantine: vec![],
+            untouched: vec![UntouchedItem {
+                path: "/Users/alice/Desktop/Projet".into(),
+                reason: "projet protégé".into(),
+            }],
+            summary: "test".into(),
+        };
+        let undo = json!({
+            "moves": [{
+                "from": "/Users/alice/Desktop/photo.png",
+                "to": "/Users/alice/Desktop/Images/photo.png"
+            }],
+            "created_dirs": ["/Users/alice/Desktop/Images"]
+        });
+        let report = execution_report(&plan, &undo, "1 fichier déplacé.");
+        assert!(report.contains("**Images** — 1 élément(s) : photo.png"));
+        assert!(report.contains("1 élément(s) protégés ou non classables"));
+        assert!(report.contains("Archives → Actions"));
     }
 
     #[test]
@@ -901,6 +1040,45 @@ mod tests {
         assert!(report.contains("USA"));
         crate::actions::apply_undo(&db, &undo).unwrap();
         assert!(source.join("photo.jpg").exists());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn cree_le_dossier_propose_deplace_le_fichier_et_permet_lannulation() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("syn-proactive-move-{}", uuid::Uuid::new_v4()));
+        let documents = root.join("Documents");
+        let destination = documents.join("Archives RH");
+        let source = root.join("rapport.pdf");
+        std::fs::create_dir_all(&documents).unwrap();
+        std::fs::write(&source, b"rapport").unwrap();
+        let db = Db::open(&root.join("syn-test.db"), &"1".repeat(64)).unwrap();
+        db.with(|connection| {
+            connection.execute(
+                "INSERT INTO folders (path, added_at, status) VALUES (?1, 0, 'active')",
+                [root.to_string_lossy().to_string()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let (_, undo) = create_folder_and_move(
+            &db,
+            &source.to_string_lossy(),
+            &destination.to_string_lossy(),
+        )
+        .unwrap();
+        assert!(destination.join("rapport.pdf").exists());
+        assert!(!source.exists());
+        assert_eq!(
+            undo["created_dirs"][0].as_str(),
+            Some(destination.to_string_lossy().as_ref())
+        );
+
+        crate::actions::apply_undo(&db, &undo).unwrap();
+        assert!(source.exists());
+        assert!(!destination.exists());
         std::fs::remove_dir_all(root).ok();
     }
 }

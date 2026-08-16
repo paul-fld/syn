@@ -34,10 +34,21 @@ pub fn args_derived_from_untrusted(args_text: &str, user_text: &str, untrusted_c
         let t = token.trim_matches(|ch: char| {
             !ch.is_alphanumeric() && ch != '@' && ch != '.' && ch != '/' && ch != ':'
         });
-        if t.contains('@') && t.contains('.')
-            || t.starts_with("http://")
-            || t.starts_with("https://")
-        {
+        // Cibles reconnues : emails, URLs — et chemins/fichiers (audit §2 :
+        // un chemin cible venu d'un document doit lever la suspicion, cf. §3.4).
+        let is_email = t.contains('@') && t.contains('.');
+        let is_url = t.starts_with("http://") || t.starts_with("https://");
+        let is_path = t.len() > 3 && (t.starts_with('/') || t.starts_with("~/"));
+        let is_filename = t.len() > 5
+            && !is_email
+            && t.rsplit_once('.')
+                .map(|(name, ext)| {
+                    !name.is_empty()
+                        && (2..=5).contains(&ext.len())
+                        && ext.chars().all(|c| c.is_ascii_alphanumeric())
+                })
+                .unwrap_or(false);
+        if is_email || is_url || is_path || is_filename {
             targets.push(t.to_lowercase());
         }
     }

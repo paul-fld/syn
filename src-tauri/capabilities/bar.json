@@ -1,17 +1,15 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
-  "identifier": "default",
-  "description": "Capacités des fenêtres Syn (principale + barre d'interaction)",
-  "windows": ["main", "bar"],
+  "identifier": "bar",
+  "description": "Barre flottante de Syn, périmètre métier minimal",
+  "windows": ["bar"],
   "permissions": [
     "core:default",
-    "core:window:allow-start-dragging",
     "core:window:allow-set-position",
     "core:window:allow-set-focus",
     "core:window:allow-show",
     "core:window:allow-hide",
     "core:window:allow-set-size",
-    "dialog:default",
-    "opener:default"
+    "bar-commands"
   ]
 }

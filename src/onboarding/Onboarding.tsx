@@ -5,7 +5,7 @@ import { createResource, createSignal, For, onCleanup, onMount, Show, type JSX }
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { Icon } from "../components/Icon";
 import { Logo } from "../components/Logo";
-import onboardingBackground from "../assets/Background-image.png";
+import onboardingBackground from "../assets/Background-image-ui.png";
 import { ipc, on, type HardwareProfile } from "../lib/ipc";
 import { refreshStatus, status } from "../lib/state";
 
@@ -154,7 +154,7 @@ function Step2(props: { next: () => void }): JSX.Element {
   return (
     <div class="onboard-panel fade-in">
       <div class="onboard-title">
-        Ajoutez vos contact et identifiez
+        Ajoutez vos contacts et identifiez
         <br />
         vos proches
       </div>
@@ -235,7 +235,7 @@ const SERVICES = [
   { id: "microsoft", label: "Microsoft", icon: "microsoft" },
   { id: "google", label: "Google", icon: "google" },
   { id: "slack", label: "Slack", icon: "slack" },
-  { id: "github", label: "Github", icon: "github" },
+  { id: "github", label: "GitHub", icon: "github" },
 ];
 
 function Step3(props: { next: () => void }): JSX.Element {
@@ -314,11 +314,17 @@ function Step4(): JSX.Element {
       embed_model: profile.embed_model,
     });
     refetchLlm();
-    const un1 = await on("model_pull_progress", (p) => {
+    // Le bus sérialise en {event, payload} : sans déballage, la progression
+    // affichait « undefined/undefined » et une barre NaN% (audit §3).
+    const un1 = await on("model_pull_progress", (raw) => {
+      const p = raw?.payload ?? raw;
+      if (!p?.model) return;
       setPull((cur) => ({ ...cur, [p.model]: { pct: p.pct, status: p.status } }));
       if (p.pct >= 100) refetchLlm();
     });
-    const un2 = await on("ingestion_status", (p) => {
+    const un2 = await on("ingestion_status", (raw) => {
+      const p = raw?.payload ?? raw;
+      if (typeof p?.done !== "number") return;
       setIndexing({ done: p.done, total: p.total });
     });
     onCleanup(() => {
@@ -356,7 +362,7 @@ function Step4(): JSX.Element {
       <Show when={hw()} keyed>
         {(h) => (
           <div class="onboard-note" style={{ "text-align": "left", "margin-bottom": "12px" }}>
-            Syn a choisi les modèles adaptés à cette machine ({h.total_ram_gb} Go de mémoire,
+            Syn a choisi les modèles adaptés à cette machine ({h.total_ram_gb} Go de mémoire,{" "}
             {h.cpu_count} cœurs).
           </div>
         )}

@@ -83,14 +83,17 @@ pub fn spawn_background_loops(app: &AppHandle) {
     tauri::async_runtime::spawn(async move {
         let mut last_instant = std::time::Instant::now();
         let mut last_wall = chrono::Utc::now().timestamp();
+        let mut tick: u64 = 0;
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            tick += 1;
             let state = handle.state::<AppState>();
 
             // Détection de réveil : l'horloge murale a sauté plus que le monotone.
             let wall_delta = chrono::Utc::now().timestamp() - last_wall;
             let mono_delta = last_instant.elapsed().as_secs() as i64;
-            if wall_delta - mono_delta > 120 {
+            let woke = wall_delta - mono_delta > 120;
+            if woke {
                 state.bus.emit(BusEvent::WakeFromSleep);
             }
             last_instant = std::time::Instant::now();
@@ -103,6 +106,30 @@ pub fn spawn_background_loops(app: &AppHandle) {
             }
             // Mode dégradé → nominal : rattraper les embeddings en attente.
             let _ = crate::ingestion::backfill_embeddings(&core.db, &core.llm, 64).await;
+            // Miroir agenda (15 min, et au réveil) : nourrit la proactivité.
+            if tick % 15 == 1 || woke {
+                let db = core.db.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    crate::connectors::calendar::sync_native_to_db(&db)
+                })
+                .await;
+            }
+            // Messages et Rappels (30 min) : sens supplémentaires, best-effort.
+            if tick % 30 == 2 {
+                let db = core.db.clone();
+                let llm = core.llm.clone();
+                let bus = core.bus.clone();
+                let embed = crate::settings::load(&core.db)
+                    .map(|s| s.embed_model)
+                    .unwrap_or_default();
+                tauri::async_runtime::spawn(async move {
+                    let _ = crate::connectors::messages::sync(&db, &llm, &bus, &embed).await;
+                    let _ = tokio::task::spawn_blocking(move || {
+                        crate::connectors::reminders::sync_native_to_db(&db)
+                    })
+                    .await;
+                });
+            }
         }
     });
 }
@@ -113,7 +140,14 @@ pub fn forward_bus(app: &AppHandle) {
     let mut rx = state.bus.subscribe();
     let handle = app.clone();
     tauri::async_runtime::spawn(async move {
-        while let Ok(ev) = rx.recv().await {
+        loop {
+            // Un débordement du canal (Lagged) coupait définitivement le relais
+            // d'événements vers l'UI (audit §3) : on saute les perdus et on continue.
+            let ev = match rx.recv().await {
+                Ok(ev) => ev,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
             let name = match &ev {
                 BusEvent::ItemIngested { .. } => "item_ingested",
                 BusEvent::IngestionStatus { .. } => "ingestion_status",

@@ -35,6 +35,7 @@ import {
   setSettingsOpen,
   setSettingsTab,
   fmtDate,
+  loadError,
 } from "./lib/state";
 
 function Locked(): JSX.Element {
@@ -317,6 +318,14 @@ function App(): JSX.Element {
       <Show when={screen() === "loading"}>
         <div class="lock-shell">
           <SynGlyph size={54} />
+          <Show when={loadError()}>
+            <div class="empty-note" style={{ "margin-top": "14px", "max-width": "360px", "text-align": "center" }}>
+              Syn n'a pas pu démarrer : {loadError()}
+            </div>
+            <button class="btn" style={{ "margin-top": "10px" }} onClick={() => refreshStatus()}>
+              Réessayer
+            </button>
+          </Show>
         </div>
       </Show>
       <Show when={screen() === "onboarding"}>

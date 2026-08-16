@@ -1,5 +1,5 @@
 // Sidebar (maquette App desktop) : Accueil … Déconnexion.
-import { createResource, For, type JSX } from "solid-js";
+import { For, type JSX } from "solid-js";
 import { Icon } from "./Icon";
 import { Logo } from "./Logo";
 import {
@@ -26,15 +26,10 @@ const MAIN_ITEMS: { id: PageId; label: string; icon: string }[] = [
 
 const MODE_ITEMS: { id: PageId; label: string; icon: string }[] = [
   { id: "travail", label: "Mode travail", icon: "briefcase" },
-  { id: "economie", label: "Mode économie", icon: "leaf" },
+  { id: "economie", label: "Mode économie", icon: "Leaf--Streamline-Lucide" },
 ];
 
 export function Sidebar(): JSX.Element {
-  const [system] = createResource(() => ipc.systemSnapshot().catch(() => null));
-  const batteryIcon = () => {
-    const pct = Number(system()?.snapshot?.battery?.pct ?? 100);
-    return pct < 30 ? "battery-low" : pct < 70 ? "battery-medium" : "battery-full";
-  };
   const logout = async () => {
     await ipc.lock();
     setScreen("locked");
@@ -59,7 +54,7 @@ export function Sidebar(): JSX.Element {
             classList={{ active: page() === item.id }}
             onClick={() => setPage(item.id)}
           >
-            <Icon name={item.id === "economie" ? batteryIcon() : item.icon} size={15} />
+            <Icon name={item.icon} size={15} />
             {item.label}
           </button>
         )}

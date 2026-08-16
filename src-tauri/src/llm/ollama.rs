@@ -25,6 +25,9 @@ impl OllamaClient {
             embed_model: embed_model.to_string(),
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(300))
+                // Ne jamais laisser un serveur loopback autorisé rediriger
+                // silencieusement la requête vers un hôte externe.
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .expect("client http"),
             egress,

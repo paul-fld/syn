@@ -91,6 +91,7 @@ const SENSITIVE_HINTS: &[&str] = &[
     "avis-imposition",
 ];
 const MAX_FILE_SIZE: u64 = 200 * 1024 * 1024;
+const EXTRACTION_VERSION: &[u8] = b"files-v3-ocr-project-domain";
 const TECHNICAL_FILE_NAMES: &[&str] = &[
     ".ds_store",
     "thumbs.db",
@@ -111,6 +112,13 @@ const TECHNICAL_EXTENSIONS: &[&str] = &[
     "tmp",
     "cache",
 ];
+const INDEXABLE_EXTENSIONS: &[&str] = &[
+    "txt", "md", "markdown", "csv", "log", "json", "yaml", "yml", "toml", "tex", "rtf", "pdf",
+    "doc", "docx", "odt", "ppt", "pptx", "key", "xls", "xlsx", "ods", "numbers", "pages", "jpg",
+    "jpeg", "png", "heic", "tiff", "gif", "webp", "bmp", "mp4", "mov", "avi", "mkv", "mp3", "wav",
+    "m4a", "flac", "py", "js", "ts", "tsx", "jsx", "rs", "go", "java", "kt", "c", "cpp", "h",
+    "swift", "m", "mm", "rb", "php", "sh", "vue", "svelte", "css", "scss", "html", "sql",
+];
 
 pub fn is_excluded_dir(name: &str) -> bool {
     let lower = name.to_lowercase();
@@ -125,6 +133,13 @@ pub fn is_excluded_dir(name: &str) -> bool {
 
 pub fn is_project_root(dir: &Path) -> bool {
     PROJECT_MARKERS.iter().any(|m| dir.join(m).exists())
+}
+
+/// Vrai pour un fichier situé dans un projet de développement. Sert à éviter
+/// qu'un README contenant les mots d'un scénario de test soit présenté comme
+/// un document personnel (par exemple une quittance).
+pub fn is_project_content(path: &Path) -> bool {
+    path.ancestors().skip(1).take(12).any(is_project_root)
 }
 
 pub fn looks_sensitive(path: &Path) -> bool {
@@ -146,6 +161,100 @@ pub fn is_technical_file(path: &Path) -> bool {
     TECHNICAL_FILE_NAMES.contains(&name.as_str()) || TECHNICAL_EXTENSIONS.contains(&ext.as_str())
 }
 
+fn is_indexable_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| INDEXABLE_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+fn document_index_priority(path: &Path) -> u8 {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "pdf" | "doc" | "docx" | "odt" | "rtf" | "txt" | "md" | "markdown" | "csv" | "xls"
+        | "xlsx" | "ods" | "ppt" | "pptx" | "key" | "pages" | "numbers" => 0,
+        "jpg" | "jpeg" | "png" | "heic" | "tiff" | "gif" | "webp" | "bmp" => 1,
+        _ => 2,
+    }
+}
+
+/// Recherche immédiate sur les noms et chemins du périmètre autorisé. Elle
+/// complète l'index de contenu pendant sa construction : l'utilisateur ne doit
+/// jamais attendre la fin d'un scan de plusieurs dizaines de milliers de
+/// fichiers pour retrouver un document dont le nom ou le dossier est parlant.
+pub fn live_metadata_search(
+    roots: &[String],
+    keywords: &[String],
+    limit: usize,
+) -> Vec<crate::retrieval::Retrieved> {
+    if keywords.is_empty() {
+        return vec![];
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1800);
+    let mut results = Vec::new();
+    let mut visited = 0usize;
+    for root in roots {
+        for entry in walkdir::WalkDir::new(root)
+            .max_depth(20)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|entry| {
+                if entry.depth() == 0 || !entry.file_type().is_dir() {
+                    return true;
+                }
+                let name = entry.file_name().to_string_lossy();
+                !is_excluded_dir(&name) && !is_project_root(entry.path())
+            })
+            .flatten()
+        {
+            visited += 1;
+            if visited > 250_000 || std::time::Instant::now() >= deadline {
+                break;
+            }
+            if !entry.file_type().is_file()
+                || is_technical_file(entry.path())
+                || entry
+                    .metadata()
+                    .is_ok_and(|metadata| metadata.len() > MAX_FILE_SIZE)
+            {
+                continue;
+            }
+            let path = entry.path().to_string_lossy().to_string();
+            let folded = crate::db::fold(&path);
+            let hits = keywords
+                .iter()
+                .filter(|keyword| folded.contains(keyword.as_str()))
+                .count();
+            if hits == 0 {
+                continue;
+            }
+            let coverage = hits as f32 / keywords.len().max(1) as f32;
+            let title = entry.file_name().to_string_lossy().to_string();
+            results.push(crate::retrieval::Retrieved {
+                item_id: format!("live:{}", blake3::hash(path.as_bytes()).to_hex()),
+                source: "files".into(),
+                source_ref: path.clone(),
+                title,
+                path: Some(path),
+                snippet: "Correspondance directe dans le nom ou le chemin du fichier.".into(),
+                score: 1.60 + 0.80 * coverage - 0.10 * document_index_priority(entry.path()) as f32,
+            });
+        }
+    }
+    results.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.source_ref.cmp(&b.source_ref))
+    });
+    results.truncate(limit.max(1));
+    results
+}
+
 #[derive(Debug)]
 pub enum IndexJob {
     FullScan(Option<PathBuf>),
@@ -162,6 +271,7 @@ pub struct IndexStatus {
     pub items_count: i64,
     pub pending_embeddings: i64,
     pub sensitive_skipped: i64,
+    pub unreadable_files: i64,
     pub folders: Vec<FolderStatus>,
 }
 
@@ -327,23 +437,11 @@ impl Indexer {
             .store((files.len() + projects.len()) as u64, Ordering::SeqCst);
         self.done.store(0, Ordering::SeqCst);
 
+        // Les documents personnels sont utiles immédiatement. Les images,
+        // médias et projets de développement passent ensuite.
+        files.sort_by_key(|path| document_index_priority(path));
+
         // 2. Traitement incrémental, throttlé, reprenable (checkpoint = upsert par fichier).
-        for project in projects {
-            if self.stopping.load(Ordering::SeqCst) {
-                break;
-            }
-            if !is_path_in_active_scope(db, &project)? {
-                continue;
-            }
-            self.set_current(&project);
-            if let Err(e) = index_project(db, llm, bus, embed_model, &project).await {
-                bus.emit(BusEvent::FilesError {
-                    path: project.to_string_lossy().into(),
-                    reason: e.to_string(),
-                });
-            }
-            self.tick(bus).await;
-        }
         for file in files {
             if self.stopping.load(Ordering::SeqCst) {
                 break;
@@ -360,6 +458,22 @@ impl Indexer {
             }
             self.tick(bus).await;
         }
+        for project in projects {
+            if self.stopping.load(Ordering::SeqCst) {
+                break;
+            }
+            if !is_path_in_active_scope(db, &project)? {
+                continue;
+            }
+            self.set_current(&project);
+            if let Err(e) = index_project(db, llm, bus, embed_model, &project).await {
+                bus.emit(BusEvent::FilesError {
+                    path: project.to_string_lossy().into(),
+                    reason: e.to_string(),
+                });
+            }
+            self.tick(bus).await;
+        }
 
         for folder in &folders {
             db.with(|c| {
@@ -369,6 +483,12 @@ impl Indexer {
                 )?;
                 Ok(())
             })?;
+        }
+        // Le watcher peut manquer une suppression survenue pendant que Syn
+        // était fermé. Après un scan complet terminé, retirer de la recherche
+        // les chemins qui n'existent réellement plus sur le disque.
+        if !self.stopping.load(Ordering::SeqCst) {
+            reconcile_missing_files(db, &folders)?;
         }
         *self.current.lock().unwrap() = None;
         Ok(())
@@ -442,7 +562,7 @@ impl Indexer {
     }
 
     pub fn status(&self, db: &Db) -> Result<IndexStatus> {
-        let (items_count, pending, sensitive) = db.with(|c| {
+        let (items_count, pending, sensitive, unreadable) = db.with(|c| {
             let items: i64 = c.query_row(
                 "SELECT COUNT(*) FROM items WHERE source='files' AND status='active'",
                 [],
@@ -455,7 +575,13 @@ impl Indexer {
                 [],
                 |r| r.get(0),
             )?;
-            Ok((items, pending, sensitive))
+            let unreadable: i64 = c.query_row(
+                "SELECT COUNT(*) FROM items WHERE source='files' AND status='active'
+                 AND type='document' AND body IS NULL",
+                [],
+                |r| r.get(0),
+            )?;
+            Ok((items, pending, sensitive, unreadable))
         })?;
         let folders = db.with(|c| {
             let mut stmt = c.prepare(
@@ -481,9 +607,33 @@ impl Indexer {
             items_count,
             pending_embeddings: pending,
             sensitive_skipped: sensitive,
+            unreadable_files: unreadable,
             folders,
         })
     }
+}
+
+fn reconcile_missing_files(db: &Db, folders: &[String]) -> Result<usize> {
+    let indexed: Vec<String> = db.with(|c| {
+        let mut stmt =
+            c.prepare("SELECT source_ref FROM items WHERE source='files' AND status='active'")?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    })?;
+    let mut removed = 0;
+    for source_ref in indexed {
+        let path = Path::new(&source_ref);
+        let in_scanned_scope = folders.iter().any(|folder| path.starts_with(folder));
+        if in_scanned_scope && !path.exists() {
+            memory::mark_removed(db, "files", &source_ref)?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
 }
 
 pub fn folder_paths(db: &Db) -> Result<Vec<String>> {
@@ -581,8 +731,11 @@ fn walk_collect(
         return;
     }
     if depth > 0 && is_project_root(dir) {
-        // Le projet est l'unité (Média §B5) : jamais éclaté.
+        // Le projet reste l'unité de présentation/déplacement, mais ses sources
+        // utiles sont aussi indexées comme enfants pour permettre une vraie
+        // recherche de code et détecter l'activité récente.
         projects.push(dir.to_path_buf());
+        collect_project_files(dir, files, stopping);
         return;
     }
     let entries = match std::fs::read_dir(dir) {
@@ -604,7 +757,7 @@ fn walk_collect(
             if !is_excluded_dir(&name) {
                 walk_collect(&path, files, projects, depth + 1, stopping);
             }
-        } else if !name.starts_with('.') && !is_technical_file(&path) {
+        } else if !name.starts_with('.') && !is_technical_file(&path) && is_indexable_file(&path) {
             if let Ok(meta) = entry.metadata() {
                 if meta.len() <= MAX_FILE_SIZE {
                     files.push(path);
@@ -614,10 +767,88 @@ fn walk_collect(
     }
 }
 
+fn collect_project_files(dir: &Path, files: &mut Vec<PathBuf>, stopping: &AtomicBool) {
+    const MAX_PROJECT_FILES: usize = 500;
+    let mut added = 0;
+    for entry in walkdir::WalkDir::new(dir)
+        .max_depth(10)
+        .into_iter()
+        .filter_entry(|entry| {
+            entry.depth() == 0
+                || !entry.file_type().is_dir()
+                || !is_excluded_dir(&entry.file_name().to_string_lossy())
+        })
+        .flatten()
+    {
+        if stopping.load(Ordering::SeqCst) || added >= MAX_PROJECT_FILES {
+            break;
+        }
+        let path = entry.path();
+        if entry.file_type().is_file()
+            && is_searchable_project_file(path)
+            && entry
+                .metadata()
+                .is_ok_and(|meta| meta.len() <= MAX_FILE_SIZE)
+        {
+            files.push(path.to_path_buf());
+            added += 1;
+        }
+    }
+}
+
+fn is_searchable_project_file(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    if name.starts_with('.') || is_technical_file(path) {
+        return false;
+    }
+    matches!(
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .as_str(),
+        "md" | "txt"
+            | "toml"
+            | "yaml"
+            | "yml"
+            | "json"
+            | "rs"
+            | "swift"
+            | "m"
+            | "mm"
+            | "c"
+            | "h"
+            | "cpp"
+            | "go"
+            | "java"
+            | "kt"
+            | "py"
+            | "rb"
+            | "php"
+            | "js"
+            | "jsx"
+            | "ts"
+            | "tsx"
+            | "vue"
+            | "svelte"
+            | "css"
+            | "scss"
+            | "html"
+            | "sql"
+            | "sh"
+    )
+}
+
 fn file_hash(path: &Path, meta: &std::fs::Metadata) -> String {
     // Le contenu participe toujours au hash. Une date/une taille identique ne doit
     // pas masquer une modification réelle d'un gros document.
     let mut hasher = blake3::Hasher::new();
+    // Une évolution de l'extracteur (OCR, nouveaux formats…) doit retraiter
+    // même un fichier dont les octets n'ont pas changé.
+    hasher.update(EXTRACTION_VERSION);
     hasher.update(&meta.len().to_le_bytes());
     if let Ok(modified) = meta.modified() {
         if let Ok(d) = modified.duration_since(std::time::UNIX_EPOCH) {
@@ -716,15 +947,20 @@ async fn index_file(
             })
     };
 
+    let in_code_project = is_project_content(path);
     let item = Item {
         id: String::new(),
         source: "files".into(),
         source_ref: source_ref.clone(),
-        r#type: match extracted.kind {
-            "photo" => "photo",
-            "code" => "code",
-            "sensible_non_lu" => "sensible_non_lu",
-            _ => "document",
+        r#type: if in_code_project {
+            "code"
+        } else {
+            match extracted.kind {
+                "photo" => "photo",
+                "code" => "code",
+                "sensible_non_lu" => "sensible_non_lu",
+                _ => "document",
+            }
         }
         .into(),
         title,
@@ -744,8 +980,9 @@ async fn index_file(
     Ok(())
 }
 
-/// Le code est indexé au niveau PROJET (Files §3, Média §B5) : un seul item
-/// (README + arborescence), jamais éclaté fichier par fichier.
+/// Le projet fournit l'entité racine (README + arborescence + activité). Les
+/// sources sont indexées séparément pour la recherche, sans changer l'unité de
+/// déplacement utilisée par les outils de rangement.
 async fn index_project(
     db: &Db,
     llm: &Arc<dyn LlmClient>,
@@ -806,11 +1043,24 @@ async fn index_project(
         }
     }
 
-    let meta = std::fs::metadata(dir).ok();
-    let mtime = meta
-        .and_then(|m| m.modified().ok())
-        .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64);
+    let mtime = walkdir::WalkDir::new(dir)
+        .max_depth(10)
+        .into_iter()
+        .filter_entry(|entry| {
+            entry.depth() == 0
+                || !entry.file_type().is_dir()
+                || !is_excluded_dir(&entry.file_name().to_string_lossy())
+        })
+        .flatten()
+        .take(2_000)
+        .filter_map(|entry| entry.metadata().ok()?.modified().ok())
+        .filter_map(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs() as i64)
+        .max();
+    body.push_str(&format!(
+        "\nDernière activité : {}\n",
+        mtime.unwrap_or_default()
+    ));
     let hash = blake3::hash(body.as_bytes()).to_hex().to_string();
     if memory::item_hash(db, "files", &source_ref)?.as_deref() == Some(hash.as_str()) {
         return Ok(());
@@ -869,5 +1119,41 @@ mod tests {
         assert!(is_technical_file(Path::new("/Music/Library.musicdb")));
         assert!(is_technical_file(Path::new("/App/cache.sqlite-wal")));
         assert!(!is_technical_file(Path::new("/Documents/rapport.pdf")));
+    }
+
+    #[test]
+    fn les_sources_utiles_des_projets_restent_recherchables() {
+        assert!(is_searchable_project_file(Path::new("/Projet/src/main.rs")));
+        assert!(is_searchable_project_file(Path::new("/Projet/README.md")));
+        assert!(is_searchable_project_file(Path::new("/Projet/App.vue")));
+        assert!(!is_searchable_project_file(Path::new("/Projet/Cargo.lock")));
+        assert!(!is_searchable_project_file(Path::new("/Projet/image.png")));
+    }
+
+    #[test]
+    fn reconnait_un_fichier_comme_contenu_de_projet() {
+        let root = std::env::temp_dir().join(format!("syn-project-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[package]").unwrap();
+        assert!(is_project_content(&root.join("README.md")));
+        assert!(is_project_content(&root.join("src/main.rs")));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn la_recherche_directe_retrouve_un_fichier_pas_encore_indexe() {
+        let root = std::env::temp_dir().join(format!("syn-live-{}", uuid::Uuid::new_v4()));
+        let folder = root.join("Archives administratives");
+        std::fs::create_dir_all(&folder).unwrap();
+        let expected = folder.join("Attestation_assurance_2025.pdf");
+        std::fs::write(&expected, b"pdf de test").unwrap();
+        let results = live_metadata_search(
+            &[root.to_string_lossy().to_string()],
+            &["attestation".into(), "assurance".into()],
+            8,
+        );
+        assert_eq!(results.len(), 1, "{results:#?}");
+        assert_eq!(results[0].source_ref, expected.to_string_lossy());
+        let _ = std::fs::remove_dir_all(root);
     }
 }

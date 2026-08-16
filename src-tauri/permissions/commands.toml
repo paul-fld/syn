@@ -1,0 +1,28 @@
+[[permission]]
+identifier = "main-commands"
+description = "Commandes métier complètes réservées à la fenêtre principale de Syn."
+commands.allow = [
+  "app_status", "setup_master", "unlock", "unlock_with_keychain", "unlock_with_recovery",
+  "lock", "change_master_password", "regenerate_recovery", "set_keychain", "query",
+  "list_sessions", "get_conversation", "rename_session", "delete_session", "list_projects",
+  "create_project", "move_session_to_project", "get_startup_brief", "get_daily_wrap",
+  "list_pending_actions", "list_actions", "confirm_action", "reject_action", "undo_action",
+  "connector_status", "native_permissions", "request_native_permission", "open_native_settings",
+  "connector_connect", "connector_disconnect", "screen_context", "get_settings", "set_settings",
+  "hardware_info", "llm_status", "model_pull", "files_add_folder", "files_request_full_access",
+  "files_activate_full_access", "files_remove_folder", "files_reindex", "files_index_status",
+  "files_search", "search_memory", "knowledge_stats", "knowledge_file_groups", "list_knowledge",
+  "forget_item", "get_person_context", "people_list", "people_os_preview", "people_add",
+  "unknowns_pending", "unknown_label", "unknown_ignore", "add_fact", "rules_add", "rules_edit",
+  "rules_delete", "rules_list", "rules_set_priority", "list_surfacings", "dismiss_surfacing",
+  "list_triggers", "trigger_toggle", "system_snapshot", "access_log_list", "calendar_today",
+  "tasks_quick_add", "storage_stats", "data_dir_path", "purge_all_data", "onboarding_complete",
+  "open_source", "show_main_window", "hide_bar", "speak_text", "stop_speaking"
+]
+
+[[permission]]
+identifier = "bar-commands"
+description = "Sous-ensemble minimal utilisé par la barre flottante."
+commands.allow = [
+  "query", "screen_context", "confirm_action", "reject_action", "show_main_window", "hide_bar"
+]

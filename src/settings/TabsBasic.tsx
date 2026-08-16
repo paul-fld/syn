@@ -217,11 +217,10 @@ export function TabAccessibilite(): JSX.Element {
         />
       </SettingRow>
 
-      <SettingRow label="Lecture à voix haute" desc="Lit les réponses et les briefs. Bientôt disponible.">
+      <SettingRow label="Lecture à voix haute" desc="Lit les réponses de Syn avec la voix du système.">
         <Toggle
-          checked={false}
-          disabled
-          onChange={() => {}}
+          checked={settings()?.voice_output_enabled ?? false}
+          onChange={(v) => patch({ voice_output_enabled: v })}
         />
       </SettingRow>
 

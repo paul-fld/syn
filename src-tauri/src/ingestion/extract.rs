@@ -49,7 +49,7 @@ pub fn extract(path: &Path) -> Extracted {
             mime: mime_of(&ext),
         },
         "jpg" | "jpeg" | "png" | "heic" | "tiff" | "gif" | "webp" => Extracted {
-            text: extract_exif(path),
+            text: extract_image_text(path),
             kind: "photo",
             mime: format!("image/{ext}"),
         },
@@ -61,8 +61,9 @@ pub fn extract(path: &Path) -> Extracted {
                 mime: mime_of(&ext),
             }
         }
-        "py" | "js" | "ts" | "tsx" | "jsx" | "rs" | "go" | "java" | "c" | "cpp" | "h" | "swift"
-        | "rb" | "php" | "sh" => Extracted {
+        "py" | "js" | "ts" | "tsx" | "jsx" | "rs" | "go" | "java" | "kt" | "c" | "cpp" | "h"
+        | "swift" | "m" | "mm" | "rb" | "php" | "sh" | "vue" | "svelte" | "css" | "scss"
+        | "html" | "sql" => Extracted {
             text: read_text(path),
             kind: "code",
             mime: "text/plain".into(),
@@ -110,10 +111,38 @@ fn extract_pdf(path: &Path) -> Option<String> {
     // pdf-extract peut paniquer sur des PDF malformés → confinement.
     let p = path.to_path_buf();
     let result = std::panic::catch_unwind(move || pdf_extract::extract_text(&p));
-    match result {
+    let embedded = match result {
         Ok(Ok(text)) => cap(text),
         _ => None, // corrompu / protégé par mot de passe → métadonnées seules
+    };
+    embedded.or_else(|| ocr_pdf_first_page(path))
+}
+
+/// OCR local de secours pour les quittances/factures scannées. `sips` rend la
+/// première page avec les frameworks macOS, puis Vision lit l'image ; aucun
+/// octet ne sort de l'appareil et le PNG temporaire est toujours supprimé.
+fn ocr_pdf_first_page(path: &Path) -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let rendered =
+            std::env::temp_dir().join(format!("syn-pdf-ocr-{}.png", uuid::Uuid::new_v4()));
+        let output = std::process::Command::new("/usr/bin/sips")
+            .args(["-s", "format", "png"])
+            .arg(path)
+            .arg("--out")
+            .arg(&rendered)
+            .output()
+            .ok()?;
+        let text = if output.status.success() {
+            native_ocr_text(&rendered)
+        } else {
+            None
+        };
+        let _ = std::fs::remove_file(rendered);
+        return text;
     }
+    #[allow(unreachable_code)]
+    None
 }
 
 /// Extrait le texte des nœuds <w:t> / <a:t> d'un XML OOXML.
@@ -248,4 +277,57 @@ fn extract_exif(path: &Path) -> Option<String> {
     } else {
         Some(parts.join(" · "))
     }
+}
+
+fn extract_image_text(path: &Path) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(exif) = extract_exif(path) {
+        parts.push(exif);
+    }
+    // OCR ciblé pour éviter d'analyser toute une photothèque. Les images qui
+    // ressemblent à des scans/captures/documents gagnent une recherche plein
+    // texte ; les photos ordinaires restent indexées par métadonnées.
+    let folded = crate::db::fold(&path.to_string_lossy());
+    let looks_like_document = [
+        "scan",
+        "capture",
+        "screenshot",
+        "document",
+        "quittance",
+        "facture",
+        "recu",
+        "receipt",
+        "cours",
+        "note",
+    ]
+    .iter()
+    .any(|hint| folded.contains(hint));
+    if looks_like_document {
+        if let Some(text) = native_ocr_text(path) {
+            parts.push(text);
+        }
+    }
+    cap(parts.join("\n"))
+}
+
+fn native_ocr_text(path: &Path) -> Option<String> {
+    let mut observations = crate::connectors::native::ocr_image(path).ok()?;
+    observations.sort_by(|a, b| {
+        b["y"]
+            .as_f64()
+            .unwrap_or(0.0)
+            .total_cmp(&a["y"].as_f64().unwrap_or(0.0))
+            .then(
+                a["x"]
+                    .as_f64()
+                    .unwrap_or(0.0)
+                    .total_cmp(&b["x"].as_f64().unwrap_or(0.0)),
+            )
+    });
+    let text = observations
+        .iter()
+        .filter_map(|item| item["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    cap(text)
 }

@@ -104,7 +104,7 @@ function Bar(): JSX.Element {
   return (
     <div class="bar-shell" classList={{ expanded: expanded() }}>
       <Show when={expanded()}>
-        <div class="bar-thread">
+        <div class="bar-thread" aria-live="polite" aria-busy={thinking()}>
           <For each={messages()}>
             {(m) => <div class="bar-message" classList={{ user: m.role === "user" }}>{m.content}</div>}
           </For>
@@ -120,8 +120,11 @@ function Bar(): JSX.Element {
             )}
           </For>
           <Show when={thinking()}>
-            <details class="agent-progress compact" open>
-              <summary>{progress()[progress().length - 1]?.title ?? "Démarrage du traitement local…"}</summary>
+            <details class="agent-progress compact is-working" open>
+              <summary>
+                <span class="dot" />
+                <span class="agent-progress-title">{progress()[progress().length - 1]?.title ?? "Syn analyse la demande…"}</span>
+              </summary>
               <div class="agent-progress-list">
                 <For each={progress()}>{(step) => <div class={`agent-progress-step ${step.status}`}>{step.title}<Show when={step.detail}><span class="sub"> : {step.detail}</span></Show></div>}</For>
               </div>
@@ -130,10 +133,23 @@ function Bar(): JSX.Element {
         </div>
       </Show>
       <div class="bar-pill">
-        <button class="bar-logo" title="Ouvrir Syn" onClick={() => ipc.showMainWindow()}>
+        <button
+          class="bar-logo"
+          title="Ouvrir Syn"
+          aria-label="Ouvrir Syn"
+          onClick={async () => {
+            // Continuité barre → app : la saisie en cours suit l'utilisateur
+            // dans la fenêtre principale (le canal bar_query était orphelin).
+            const pending = text().trim();
+            if (pending) await emitTo("main", "bar_query", pending).catch(() => {});
+            await ipc.showMainWindow();
+            if (pending) ipc.hideBar();
+          }}
+        >
           <SynGlyph size={26} color="#c9c9cf" />
         </button>
         <input
+          aria-label="Demander à Syn"
           ref={inputEl}
           placeholder={captureError() ? "Capture impossible. Survole l’icône." : screenContext() ? "Contexte d’écran joint. Que veux-tu faire ?" : "Demander à Syn"}
           value={text()}
@@ -145,6 +161,7 @@ function Bar(): JSX.Element {
           }}
         />
         <button
+          aria-label="Joindre le contexte visible à l’écran"
           title={captureError() || (screenContext() ? `Contexte joint : ${screenContext()!.app}${screenContext()!.window ? ` (${screenContext()!.window})` : ""}` : "Joindre le contexte visible à l’écran")}
           classList={{ active: !!screenContext(), error: !!captureError(), capturing: capturing() }}
           aria-pressed={!!screenContext()}
@@ -164,7 +181,7 @@ function Bar(): JSX.Element {
           }}>
           <Icon name={screenContext() ? "check" : "box-select"} size={19} />
         </button>
-        <button title="Réduire" onClick={() => resize(!expanded())}>
+        <button title={expanded() ? "Réduire" : "Développer"} aria-label={expanded() ? "Réduire la barre" : "Développer la barre"} onClick={() => resize(!expanded())}>
           <Icon name={expanded() ? "chevron-down" : "chevron-up"} size={19} />
         </button>
       </div>

@@ -33,7 +33,9 @@ pub fn app_status(state: State<'_, AppState>) -> Value {
         "onboarding_done": onboarding_done,
         "email": email,
         "keychain": keychain,
-        "keychain_available": state.keystore.keychain_load().is_some(),
+        // On ne LIT jamais la clé du trousseau ici : app_status est appelé en
+        // boucle, écran verrouillé compris (audit §2). Le drapeau opt-in suffit.
+        "keychain_available": keychain,
     })
 }
 
@@ -83,9 +85,30 @@ pub fn change_master_password(
     state: State<'_, AppState>,
     current: String,
     new_password: String,
-) -> Result<()> {
-    let key = state.keystore.unlock_password(&current)?;
-    state.keystore.change_password(&key, &new_password)
+) -> Result<Value> {
+    // Rotation complète (audit §2) : changer le mot de passe sans re-chiffrer
+    // la base laissait l'ancienne clé valable à vie. Ici : nouvelle clé K',
+    // rekey SQLCipher, nouvelles enveloppes, nouvelle phrase de récupération.
+    let old_key = state.keystore.unlock_password(&current)?;
+    let core = state.core()?;
+    let new_key = crate::security::keys::KeyStore::generate_key_hex();
+    core.db.rekey(&new_key)?;
+    let phrase = match state.keystore.rotate(&new_key, &new_password) {
+        Ok(p) => p,
+        Err(e) => {
+            // La base est déjà re-chiffrée : on tente de revenir à l'ancienne
+            // clé pour ne jamais laisser meta et base désynchronisés.
+            let _ = core.db.rekey(&old_key);
+            return Err(e);
+        }
+    };
+    if let Ok(mut k) = core.key_hex.lock() {
+        *k = new_key.clone();
+    }
+    if state.keystore.meta().map(|m| m.keychain).unwrap_or(false) {
+        let _ = state.keystore.keychain_store(&new_key);
+    }
+    Ok(json!({ "recovery_phrase": phrase }))
 }
 
 #[tauri::command]
@@ -374,12 +397,11 @@ pub async fn confirm_action(state: State<'_, AppState>, action_id: String) -> Re
                 ),
                 outcome.undo.as_ref(),
             )?;
-            core.bus.emit(BusEvent::ActionResolved {
-                action_id,
-                status: "executed".into(),
-            });
             if let Some(sid) = &action.session_id {
-                let human_result = outcome.result["report"].as_str().unwrap_or(&result_text);
+                let human_result = outcome.result["display_report"]
+                    .as_str()
+                    .or_else(|| outcome.result["report"].as_str())
+                    .unwrap_or(&result_text);
                 crate::memory::persist_turn(&core.db, sid, "assistant", human_result)?;
                 core.bus.emit(BusEvent::AgentProgress {
                     session_id: sid.clone(),
@@ -391,6 +413,12 @@ pub async fn confirm_action(state: State<'_, AppState>, action_id: String) -> Re
                     status: "done".into(),
                 });
             }
+            // Émis après persistance : l'interface peut recharger le fil sans
+            // course et afficher immédiatement le compte rendu de l'action.
+            core.bus.emit(BusEvent::ActionResolved {
+                action_id,
+                status: "executed".into(),
+            });
             Ok(outcome.result)
         }
         Err(e) => {
@@ -459,7 +487,7 @@ pub fn native_permissions(state: State<'_, AppState>) -> Result<Value> {
                 {"id":"mail", "label":"Apple Mail", "status": if mail::native_available() {"granted"} else {"needs_permission"}, "detail":"Lecture locale des messages synchronisés", "settings":"all_files", "operational":true},
                 {"id":"contacts", "label":"Contacts", "status": connectors::native::permission_status("contacts"), "detail":"API Contacts native", "settings":"contacts", "operational":true},
                 {"id":"calendar", "label":"Calendrier", "status": connectors::native::permission_status("calendar"), "detail":"EventKit natif en lecture et écriture", "settings":"calendars", "operational":true},
-                {"id":"reminders", "label":"Rappels", "status": connectors::native::permission_status("reminders"), "detail":"Autorisation prête ; synchronisation des tâches à finaliser", "settings":"reminders", "operational":false},
+                {"id":"reminders", "label":"Rappels", "status": connectors::native::permission_status("reminders"), "detail":"Synchronisé avec les tâches de Syn (les rappels ouverts apparaissent dans les briefs)", "settings":"reminders", "operational":true},
                 {"id":"photos", "label":"Photos", "status": connectors::native::permission_status("photos"), "detail":"Autorisation prête ; recherche PhotoKit à finaliser", "settings":"photos", "operational":false},
                 {"id":"screen", "label":"Contexte d’écran", "status": connectors::native::permission_status("screen"), "detail":"Capture ponctuelle locale, OCR et disposition visuelle ; l’image est supprimée aussitôt", "settings":"screen_recording", "operational":true}
             ]
@@ -685,7 +713,7 @@ pub fn set_settings(
         let _ = core.indexer.tx.send(files::IndexJob::FullScan(None));
     }
     core.indexer.paused.store(
-        new_settings.indexing_paused || new_settings.eco_mode,
+        new_settings.indexing_paused,
         std::sync::atomic::Ordering::SeqCst,
     );
     if rebuild_llm {
@@ -1349,18 +1377,68 @@ pub fn open_source(
     state: State<'_, AppState>,
     source_ref: String,
 ) -> Result<()> {
-    let _ = state.core()?;
-    if std::path::Path::new(&source_ref).exists() {
-        use tauri_plugin_opener::OpenerExt;
-        app.opener()
-            .open_path(source_ref, None::<String>)
-            .map_err(|e| AppError::Other(e.to_string()))?;
-        Ok(())
-    } else {
-        Err(AppError::NotFound(
+    let core = state.core()?;
+    let path = std::path::Path::new(&source_ref);
+    if !path.exists() {
+        return Err(AppError::NotFound(
             "cette source n'est pas un fichier ouvrable".into(),
-        ))
+        ));
     }
+    // Garde de périmètre (audit §2) : on n'ouvre que ce que Syn connaît —
+    // un chemin indexé ou couvert par un dossier suivi. source_ref provient
+    // de l'UI, donc indirectement du contenu indexé.
+    let known: bool = core.db.with(|c| {
+        Ok(c.query_row(
+            "SELECT 1 FROM items WHERE source_ref=?1 OR path=?1 LIMIT 1",
+            rusqlite::params![source_ref],
+            |_| Ok(true),
+        )
+        .unwrap_or(false))
+    })?;
+    if !known && !files::is_path_in_active_scope(&core.db, path)? {
+        return Err(AppError::Security(
+            "ce chemin est hors du périmètre suivi par Syn".into(),
+        ));
+    }
+    use tauri_plugin_opener::OpenerExt;
+    app.opener()
+        .open_path(source_ref, None::<String>)
+        .map_err(|e| AppError::Other(e.to_string()))?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn speak_text(state: State<'_, AppState>, text: String) -> Result<()> {
+    let core = state.core()?;
+    let settings = crate::settings::load(&core.db)?;
+    if !settings.voice_output_enabled {
+        return Err(AppError::Invalid(
+            "La lecture à voix haute est désactivée dans Réglages ▸ Général.".into(),
+        ));
+    }
+    if !cfg!(target_os = "macos") {
+        return Err(AppError::Invalid(
+            "Lecture vocale indisponible sur cet OS.".into(),
+        ));
+    }
+    // Une seule lecture à la fois : on coupe la précédente.
+    let _ = std::process::Command::new("/usr/bin/pkill")
+        .args(["-x", "say"])
+        .status();
+    let capped: String = text.chars().take(4000).collect();
+    std::process::Command::new("/usr/bin/say")
+        .arg(capped)
+        .spawn()
+        .map_err(|e| AppError::Other(format!("synthèse vocale : {e}")))?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn stop_speaking() -> Result<()> {
+    let _ = std::process::Command::new("/usr/bin/pkill")
+        .args(["-x", "say"])
+        .status();
+    Ok(())
 }
 
 #[tauri::command]

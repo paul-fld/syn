@@ -27,7 +27,7 @@ thiserror = "1"
 anyhow = "1"
 
 # Stockage chiffré au repos (invariant 4) — SQLCipher AES-256
-rusqlite = { version = "0.31", features = ["bundled-sqlcipher-vendored-openssl", "backup"] }
+rusqlite = { version = "0.31", features = ["bundled-sqlcipher-vendored-openssl", "backup", "functions"] }
 
 # Sécurité : dérivation de clé + enveloppement (mot de passe maître / phrase de récupération)
 argon2 = "0.5"

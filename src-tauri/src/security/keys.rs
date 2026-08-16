@@ -215,7 +215,7 @@ const WORDLIST: &[&str] = &[
     "puits",
     "pumas",
     "quartz",
-    "quiétude",
+    "quietude",
     "rafale",
     "rameau",
     "ravin",
@@ -247,7 +247,7 @@ const WORDLIST: &[&str] = &[
     "syrinx",
     "talus",
     "tamaris",
-    "tanière",
+    "taniere",
     "tempete",
     "terrier",
     "thym",
@@ -320,7 +320,15 @@ impl KeyStore {
 
     fn save_meta(&self, meta: &Meta) -> Result<()> {
         std::fs::create_dir_all(&self.dir)?;
-        std::fs::write(self.meta_path(), serde_json::to_string_pretty(meta)?)?;
+        let path = self.meta_path();
+        std::fs::write(&path, serde_json::to_string_pretty(meta)?)?;
+        // Le fichier contient l'email et les enveloppes de clé : lecture
+        // réservée au propriétaire (audit §2 — 0644 par défaut).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
         Ok(())
     }
 
@@ -366,9 +374,23 @@ impl KeyStore {
             .collect::<Vec<_>>()
             .join(" ")
             .to_lowercase();
-        let key = unwrap(&meta.rp, normalized.as_bytes())
-            .map_err(|_| AppError::Security("Phrase de récupération incorrecte.".into()))?;
-        Ok(hex::encode(key))
+        // Tolérance aux accents : la liste contient « quiétude » et « tanière »,
+        // qu'un utilisateur retape souvent sans accents (audit §2). On essaie la
+        // saisie telle quelle, puis avec les accents restaurés.
+        let candidates = [
+            normalized.clone(),
+            normalized
+                .replace("quietude", "quiétude")
+                .replace("taniere", "tanière"),
+        ];
+        for candidate in &candidates {
+            if let Ok(key) = unwrap(&meta.rp, candidate.as_bytes()) {
+                return Ok(hex::encode(key));
+            }
+        }
+        Err(AppError::Security(
+            "Phrase de récupération incorrecte.".into(),
+        ))
     }
 
     /// Ré-enveloppe K avec un nouveau mot de passe (K obtenue d'un déverrouillage valide).
@@ -382,6 +404,34 @@ impl KeyStore {
         let mut meta = self.meta()?;
         meta.pw = wrap(&key, new_password.as_bytes())?;
         self.save_meta(&meta)
+    }
+
+    /// Génère une nouvelle clé maîtresse (rotation).
+    pub fn generate_key_hex() -> String {
+        let mut key = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut key);
+        hex::encode(key)
+    }
+
+    /// Rotation complète après changement de mot de passe : la base a déjà été
+    /// re-chiffrée avec `new_key_hex` ; on ré-enveloppe cette nouvelle clé sous
+    /// le nouveau mot de passe ET une nouvelle phrase de récupération (l'ancienne
+    /// phrase protégeait l'ancienne clé — la conserver serait un faux sentiment
+    /// de sécurité). Retourne la nouvelle phrase, à afficher une seule fois.
+    pub fn rotate(&self, new_key_hex: &str, new_password: &str) -> Result<String> {
+        if new_password.len() < 8 {
+            return Err(AppError::Invalid(
+                "Le mot de passe maître doit faire au moins 8 caractères.".into(),
+            ));
+        }
+        let key =
+            hex::decode(new_key_hex).map_err(|_| AppError::Security("clé invalide".into()))?;
+        let phrase = generate_phrase();
+        let mut meta = self.meta()?;
+        meta.pw = wrap(&key, new_password.as_bytes())?;
+        meta.rp = wrap(&key, phrase.as_bytes())?;
+        self.save_meta(&meta)?;
+        Ok(phrase)
     }
 
     pub fn regenerate_phrase(&self, key_hex: &str) -> Result<String> {

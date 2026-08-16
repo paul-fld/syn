@@ -187,8 +187,11 @@ export function TabSecurite(): JSX.Element {
             class="btn primary"
             onClick={async () => {
               try {
-                await ipc.changeMasterPassword(cur(), neu());
-                setPwMsg("Mot de passe changé.");
+                const r = await ipc.changeMasterPassword(cur(), neu());
+                setPhrase(r.recovery_phrase);
+                setPwMsg(
+                  "Mot de passe changé et données re-chiffrées. Une NOUVELLE phrase de récupération a été générée : note-la ci-dessous, l'ancienne ne fonctionne plus."
+                );
                 setCur("");
                 setNeu("");
               } catch (e: any) {
@@ -280,10 +283,13 @@ export function TabConfidentialite(): JSX.Element {
       </SettingRow>
 
       <SettingRow
-        label="Contenu des fichiers"
-        desc="Syn peut lire les fichiers autorisés. Leur contenu reste local et chiffré."
+        label="Documents sensibles"
+        desc="Lire aussi les documents à caractère sensible (santé, banque, identité…). Désactiver retire leur contenu de l'index."
       >
-        <span class="pill-status ok">Inclus</span>
+        <Toggle
+          checked={settings()?.sensitive_consent ?? true}
+          onChange={(v) => patch({ sensitive_consent: v })}
+        />
       </SettingRow>
 
       <SettingRow label="Suggestions proactives" desc="Nombre maximal de suggestions par jour.">

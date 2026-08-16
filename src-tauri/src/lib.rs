@@ -150,6 +150,8 @@ pub fn run() {
             ipc::open_source,
             ipc::show_main_window,
             ipc::hide_bar,
+            ipc::speak_text,
+            ipc::stop_speaking,
         ])
         .run(tauri::generate_context!())
         .expect("erreur au lancement de Syn");

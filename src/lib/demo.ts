@@ -149,6 +149,7 @@ export async function demoInvoke(cmd: string, _args?: any): Promise<any> {
         items_count: 1240,
         pending_embeddings: 0,
         sensitive_skipped: 4,
+        unreadable_files: 2,
         folders: [
           { path: "/Users/paul/Documents", last_indexed: Date.now() / 1000 - 3600 },
           { path: "/Users/paul/Desktop", last_indexed: Date.now() / 1000 - 7200 },

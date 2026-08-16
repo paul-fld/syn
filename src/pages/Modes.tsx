@@ -70,7 +70,7 @@ export function ModeEconomie(): JSX.Element {
       <div class="card">
         <SettingRow
           label="Activer le mode économie"
-          desc="Met l'indexation en pause et réduit l'activité de fond de Syn."
+          desc="Réduit la proactivité et les tâches non essentielles ; la surveillance des fichiers reste active."
         >
           <Toggle checked={settings()?.eco_mode ?? false} onChange={(v) => patch({ eco_mode: v })} />
         </SettingRow>

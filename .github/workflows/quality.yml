@@ -1,0 +1,33 @@
+name: Quality
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+      - name: Install frontend dependencies
+        run: npm ci
+      - name: Typecheck and build frontend
+        run: npm run check
+      - name: Audit frontend dependencies
+        run: npm audit --audit-level=high
+      - name: Check Rust formatting
+        working-directory: src-tauri
+        run: cargo fmt --all -- --check
+      - name: Test backend
+        working-directory: src-tauri
+        run: cargo test --all-targets
+      - name: Lint backend
+        working-directory: src-tauri
+        run: cargo clippy --all-targets -- -D warnings

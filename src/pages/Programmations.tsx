@@ -39,8 +39,17 @@ export function Programmations(): JSX.Element {
           <Icon name="bed-double" size={14} />
           <span class="grow">
             Bilan du soir
-            <span class="sub"> à partir de {settings()?.daily_wrap_hour ?? 18}h</span>
+            <span class="sub"> à partir de</span>
           </span>
+          <select
+            class="select"
+            value={String(settings()?.daily_wrap_hour ?? 18)}
+            onChange={(e) => patch({ daily_wrap_hour: Number(e.currentTarget.value) })}
+          >
+            {[17, 18, 19, 20, 21].map((h) => (
+              <option value={String(h)}>{h}h00</option>
+            ))}
+          </select>
           <Toggle
             checked={settings()?.daily_wrap_enabled ?? true}
             onChange={(v) => patch({ daily_wrap_enabled: v })}
@@ -50,7 +59,10 @@ export function Programmations(): JSX.Element {
           <Icon name="gauge" size={14} />
           <span class="grow">
             Gardien système
-            <span class="sub"> stockage et température</span>
+            <span class="sub">
+              {" "}alerte sous {settings()?.guardian_disk_pct ?? 5} % d'espace libre — seuil réglable
+              dans Réglages ▸ Confidentialité
+            </span>
           </span>
           <span class="pill-status ok">Actif</span>
         </div>

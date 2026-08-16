@@ -15,8 +15,8 @@ export default defineConfig({
     target: "safari15",
     rollupOptions: {
       input: {
-        main: resolve(__dirname, "index.html"),
-        bar: resolve(__dirname, "bar.html"),
+        main: resolve(import.meta.dirname, "index.html"),
+        bar: resolve(import.meta.dirname, "bar.html"),
       },
     },
   },

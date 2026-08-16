@@ -107,6 +107,108 @@ pub fn context(db: &Db, name: &str) -> Result<Value> {
     })
 }
 
+/// Résolution explicite d'un destinataire. Renvoie toutes les correspondances
+/// afin que le modèle demande une précision en cas d'homonymie ou d'adresses
+/// multiples, au lieu de choisir ou de fabriquer une adresse.
+pub fn resolve_email(db: &Db, name: &str) -> Result<Value> {
+    let folded = crate::db::fold(name.trim());
+    if folded.is_empty() {
+        return Ok(
+            json!({"resolved": false, "matches": [], "note": "Nom du destinataire manquant."}),
+        );
+    }
+    let matches = db.with(|c| {
+        let mut stmt = c.prepare(
+            "SELECT id, name, COALESCE(comm_channels,''), COALESCE(aliases,''), COALESCE(relationship,'')
+             FROM people
+             WHERE syn_fold(name) LIKE '%'||?1||'%'
+                OR syn_fold(COALESCE(aliases,'')) LIKE '%'||?1||'%'
+                OR syn_fold(COALESCE(relationship,'')) = ?1
+             ORDER BY CASE WHEN syn_fold(name)=?1 THEN 0 ELSE 1 END, name LIMIT 10",
+        )?;
+        let rows = stmt.query_map(params![folded], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut out = vec![];
+        for row in rows {
+            let (id, person_name, channels) = row?;
+            let parsed: Value = serde_json::from_str(&channels).unwrap_or(Value::Null);
+            for email in parsed["emails"].as_array().cloned().unwrap_or_default() {
+                if let Some(email) = email.as_str().filter(|e| e.contains('@') && e.contains('.')) {
+                    out.push(json!({"person_id": id, "name": person_name, "email": email}));
+                }
+            }
+        }
+        Ok(out)
+    })?;
+    let resolved = matches.len() == 1;
+    Ok(json!({
+        "resolved": resolved,
+        "matches": matches,
+        "note": if resolved {
+            "Une adresse unique a été trouvée. Utilise exactement celle-ci."
+        } else {
+            "Aucune adresse unique : demande à l'utilisateur de préciser le destinataire ou l'adresse."
+        }
+    }))
+}
+
+/// Vérifie qu'une adresse produite par le modèle appartient réellement à une
+/// personne nommée par l'utilisateur au cours de la conversation.
+pub fn email_is_known_for_mentioned_person(
+    db: &Db,
+    email: &str,
+    trusted_user_text: &str,
+) -> Result<bool> {
+    let wanted = email.trim().to_lowercase();
+    let user = crate::db::fold(trusted_user_text);
+    db.with(|c| {
+        let mut stmt = c.prepare(
+            "SELECT name, COALESCE(aliases,''), COALESCE(relationship,''), COALESCE(comm_channels,'') FROM people",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (name, aliases, relationship, channels) = row?;
+            let parsed: Value = serde_json::from_str(&channels).unwrap_or(Value::Null);
+            let owns_email = parsed["emails"]
+                .as_array()
+                .is_some_and(|emails| emails.iter().any(|v| {
+                    v.as_str().is_some_and(|candidate| candidate.eq_ignore_ascii_case(&wanted))
+                }));
+            if !owns_email {
+                continue;
+            }
+            let name_is_mentioned = [name, relationship]
+                .iter()
+                .map(|s| crate::db::fold(s))
+                .any(|s| s.chars().count() >= 3 && user.contains(&s));
+            let alias_is_mentioned = serde_json::from_str::<Value>(&aliases)
+                .ok()
+                .and_then(|v| v.as_array().cloned())
+                .unwrap_or_default()
+                .iter()
+                .filter_map(Value::as_str)
+                .map(crate::db::fold)
+                .any(|s| s.chars().count() >= 3 && user.contains(&s));
+            if name_is_mentioned || alias_is_mentioned {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    })
+}
+
 pub fn pending_unknowns(db: &Db) -> Result<Vec<Value>> {
     db.with(|c| {
         let mut stmt = c.prepare(

@@ -220,3 +220,57 @@ int32_t syn_native_calendar_delete(const char *raw_identifier) {
     NSError *error = nil;
     return [store removeEvent:event span:EKSpanThisEvent commit:YES error:&error] && error == nil ? 1 : 0;
 }
+
+char *syn_native_reminders_json(void) {
+    if (syn_native_permission_status("reminders") != 1) return NULL;
+    EKEventStore *store = [[EKEventStore alloc] init];
+    NSPredicate *predicate = [store predicateForIncompleteRemindersWithDueDateStarting:nil ending:nil calendars:nil];
+    dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
+    __block NSArray<EKReminder *> *fetched = nil;
+    [store fetchRemindersMatchingPredicate:predicate completion:^(NSArray<EKReminder *> *reminders) {
+        fetched = reminders;
+        dispatch_semaphore_signal(semaphore);
+    }];
+    if (dispatch_semaphore_wait(semaphore, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC)) != 0) return NULL;
+    NSMutableArray *items = [NSMutableArray array];
+    for (EKReminder *reminder in fetched) {
+        NSDate *due = reminder.dueDateComponents ? [NSCalendar.currentCalendar dateFromComponents:reminder.dueDateComponents] : nil;
+        [items addObject:@{
+            @"id": reminder.calendarItemIdentifier ?: @"",
+            @"title": reminder.title ?: @"",
+            @"due": due ? @([due timeIntervalSince1970]) : [NSNull null],
+            @"list": reminder.calendar.title ?: @""
+        }];
+    }
+    return syn_copy_json(items);
+}
+
+char *syn_native_reminder_create(const char *raw_title, double due) {
+    if (syn_native_permission_status("reminders") != 1) return NULL;
+    EKEventStore *store = [[EKEventStore alloc] init];
+    EKReminder *reminder = [EKReminder reminderWithEventStore:store];
+    reminder.title = [NSString stringWithUTF8String:raw_title ?: ""];
+    reminder.calendar = store.defaultCalendarForNewReminders;
+    if (due > 0) {
+        NSDate *date = [NSDate dateWithTimeIntervalSince1970:due];
+        reminder.dueDateComponents = [NSCalendar.currentCalendar
+            components:(NSCalendarUnitYear | NSCalendarUnitMonth | NSCalendarUnitDay | NSCalendarUnitHour | NSCalendarUnitMinute)
+              fromDate:date];
+        [reminder addAlarm:[EKAlarm alarmWithAbsoluteDate:date]];
+    }
+    NSError *error = nil;
+    if (![store saveReminder:reminder commit:YES error:&error] || error) return NULL;
+    return syn_copy_json(@{@"id": reminder.calendarItemIdentifier ?: @"", @"title": reminder.title ?: @""});
+}
+
+int32_t syn_native_reminder_complete(const char *raw_identifier) {
+    if (syn_native_permission_status("reminders") != 1) return 0;
+    EKEventStore *store = [[EKEventStore alloc] init];
+    NSString *identifier = [NSString stringWithUTF8String:raw_identifier ?: ""];
+    EKCalendarItem *item = [store calendarItemWithIdentifier:identifier];
+    if (![item isKindOfClass:[EKReminder class]]) return 0;
+    EKReminder *reminder = (EKReminder *)item;
+    reminder.completed = YES;
+    NSError *error = nil;
+    return [store saveReminder:reminder commit:YES error:&error] && error == nil ? 1 : 0;
+}

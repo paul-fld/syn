@@ -25,10 +25,11 @@ export function AskBar(props: {
   };
   return (
     <div class="askbar">
-      <button title="Pièces jointes non disponibles dans cette version" disabled>
+      <button title="Pièces jointes non disponibles dans cette version" aria-label="Pièces jointes non disponibles" disabled>
         <Icon name="plus" size={16} />
       </button>
       <input
+        aria-label="Demander à Syn"
         placeholder={captureError() ? "Capture impossible. Survole l’icône pour en savoir plus." : screenContext() ? "Contexte d’écran joint. Que veux-tu faire ?" : label("ask.placeholder", settings()?.voice)}
         value={text()}
         disabled={props.disabled}
@@ -37,6 +38,7 @@ export function AskBar(props: {
         ref={(el) => props.autofocus && setTimeout(() => el.focus(), 50)}
       />
       <button
+        aria-label="Joindre le contexte visible à l’écran"
         title={captureError() || (screenContext() ? `Contexte joint : ${screenContext()!.app}${screenContext()!.window ? ` (${screenContext()!.window})` : ""}` : "Joindre le contexte visible à l’écran")}
         classList={{ active: !!screenContext(), error: !!captureError(), capturing: capturing() }}
         aria-pressed={!!screenContext()}
@@ -55,10 +57,10 @@ export function AskBar(props: {
       }}>
         <Icon name={screenContext() ? "check" : "box-select"} size={15} />
       </button>
-      <button title="Dictée non disponible dans cette version" disabled>
+      <button title="Dictée non disponible dans cette version" aria-label="Dictée non disponible" disabled>
         <Icon name="mic" size={15} />
       </button>
-      <button title="Envoyer" onClick={submit}>
+      <button title="Envoyer" aria-label="Envoyer la demande" disabled={props.disabled || !text().trim()} onClick={submit}>
         <Icon name="audio-lines" size={15} />
       </button>
     </div>

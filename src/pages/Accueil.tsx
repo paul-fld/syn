@@ -21,11 +21,19 @@ function splitLines(text: string): [string, string] {
   // Coupe visuelle douce comme la maquette (1re ligne forte, suite grisée).
   if (text.length < 46) return [text, ""];
   const cut = text.lastIndexOf(" ", 46);
+  if (cut <= 0) return [text, ""]; // pas d'espace : ne jamais dupliquer le texte
   return [text.slice(0, cut), text.slice(cut + 1)];
 }
 
 export function Accueil(): JSX.Element {
   const [brief] = createResource(briefVersion, () => ipc.getStartupBrief());
+  // Bilan du soir : calculé côté backend depuis toujours, jamais affiché (audit §3).
+  const eveningHour = () => settings()?.daily_wrap_hour ?? 18;
+  const isEvening = () => new Date().getHours() >= eveningHour();
+  const [wrap] = createResource(
+    () => (isEvening() && settings()?.daily_wrap_enabled !== false ? briefVersion() + 1 : null),
+    () => ipc.getDailyWrap().catch(() => null)
+  );
 
   const ask = (text: string, screenContext?: ScreenContext | null) => {
     setBarQuery({ text, screenContext });
@@ -79,7 +87,7 @@ export function Accueil(): JSX.Element {
                             </Show>
                           </span>
                           <span class="row-actions">
-                            <Show when={item.kind === "mail"}>
+                            <Show when={item.source_ref}>
                               <button title="Ouvrir la source" onClick={() => openRef(item.source_ref)}>
                                 <Icon name="external-link" size={13} />
                               </button>
@@ -109,6 +117,44 @@ export function Accueil(): JSX.Element {
                 </div>
               </Show>
             </>
+          )}
+        </Show>
+
+        <Show when={wrap()} keyed>
+          {(w: any) => (
+            <div class="brief-list fade-in" style={{ "margin-top": "26px" }}>
+              <div class="section-label">Bilan du soir</div>
+              <Show when={(w.done_tasks ?? []).length > 0}>
+                <div class="brief-row">
+                  <span class="lead"><Icon name="corner-down-right" size={14} /></span>
+                  <span class="service"><Icon name="check" size={16} /></span>
+                  <span class="text">
+                    <b>{w.done_tasks.length === 1 ? "1 tâche terminée aujourd'hui" : `${w.done_tasks.length} tâches terminées aujourd'hui`}</b>
+                    <br /><span class="muted">{w.done_tasks.slice(0, 3).join(" · ")}</span>
+                  </span>
+                </div>
+              </Show>
+              <Show when={(w.pending_tasks ?? []).length > 0}>
+                <div class="brief-row">
+                  <span class="lead"><Icon name="corner-down-right" size={14} /></span>
+                  <span class="service"><Icon name="clock" size={16} /></span>
+                  <span class="text">
+                    <b>{w.pending_tasks.length === 1 ? "1 tâche encore ouverte" : `${w.pending_tasks.length} tâches encore ouvertes`}</b>
+                    <br /><span class="muted">{w.pending_tasks.slice(0, 3).join(" · ")}</span>
+                  </span>
+                </div>
+              </Show>
+              <Show when={(w.open_commitments ?? []).length > 0}>
+                <div class="brief-row">
+                  <span class="lead"><Icon name="corner-down-right" size={14} /></span>
+                  <span class="service"><Icon name="flag" size={16} /></span>
+                  <span class="text">
+                    <b>Engagements en cours</b>
+                    <br /><span class="muted">{w.open_commitments.slice(0, 3).join(" · ")}</span>
+                  </span>
+                </div>
+              </Show>
+            </div>
           )}
         </Show>
       </div>

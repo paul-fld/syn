@@ -238,6 +238,7 @@ export interface IndexStatus {
   items_count: number;
   pending_embeddings: number;
   sensitive_skipped: number;
+  unreadable_files: number;
   folders: { path: string; last_indexed: number | null }[];
 }
 
@@ -269,7 +270,7 @@ export const ipc = {
   unlockWithRecovery: (phrase: string) => invoke<void>("unlock_with_recovery", { phrase }),
   lock: () => invoke<void>("lock"),
   changeMasterPassword: (current: string, newPassword: string) =>
-    invoke<void>("change_master_password", { current, newPassword }),
+    invoke<{ recovery_phrase: string }>("change_master_password", { current, newPassword }),
   regenerateRecovery: (password: string) => invoke<string>("regenerate_recovery", { password }),
   setKeychain: (enabled: boolean) => invoke<void>("set_keychain", { enabled }),
 
@@ -385,6 +386,8 @@ export const ipc = {
   openSource: (sourceRef: string) => invoke<void>("open_source", { sourceRef }),
   showMainWindow: () => invoke<void>("show_main_window"),
   hideBar: () => invoke<void>("hide_bar"),
+  speakText: (text: string) => invoke<void>("speak_text", { text }),
+  stopSpeaking: () => invoke<void>("stop_speaking"),
 };
 
 export function on(event: string, cb: (payload: any) => void): Promise<UnlistenFn> {

@@ -24,7 +24,7 @@ export function Connaissances(): JSX.Element {
     ({ section, filter }) => {
       if (section === "mail") return ipc.listKnowledge("mail", filter || null, 200);
       if (section === "facts") return ipc.listKnowledge("conversation", filter || null, 200);
-      if (section === "files" && filter) return ipc.listKnowledge("files", filter, 200);
+      if (section === "files") return ipc.listKnowledge("files", filter || null, 200);
       return Promise.resolve([]);
     },
   );
@@ -72,7 +72,7 @@ export function Connaissances(): JSX.Element {
       <div class="page-sub">{label("knowledge.sub", settings()?.voice)}</div>
 
       <div class="knowledge-stats">
-        <div class="chip"><Icon name="folder" size={13} /> {count("files")} fichiers utiles</div>
+        <div class="chip"><Icon name="folder" size={13} /> {count("files")} {count("files") === 1 ? "fichier utile" : "fichiers utiles"}</div>
         <div class="chip"><Icon name="brain" size={13} /> {stats()?.embeddings ?? 0} passages indexés</div>
         <div class="chip"><Icon name="contact-round" size={13} /> {stats()?.people ?? 0} {stats()?.people === 1 ? "personne" : "personnes"}</div>
         <div class="chip"><Icon name="book" size={13} /> {stats()?.facts ?? 0} {stats()?.facts === 1 ? "fait appris" : "faits appris"}</div>

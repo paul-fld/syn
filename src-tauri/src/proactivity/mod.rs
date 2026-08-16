@@ -205,7 +205,10 @@ pub async fn evaluate_tick(db: &Db, bus: &Bus) -> Result<()> {
                     trigger_id: None,
                     kind: "system".into(),
                     reason: "Batterie faible".into(),
-                    body: format!("Il reste {} %. Active le mode économie pour réduire l'activité de Syn.", b["pct"]),
+                    body: format!(
+                        "Il reste {} %. Active le mode économie pour réduire l'activité de Syn.",
+                        b["pct"]
+                    ),
                     priority: "important".into(),
                 },
             );
@@ -380,34 +383,66 @@ mod notification_tests {
 
     #[test]
     fn la_sourdine_bloque_toutes_les_notifications() {
-        let mut settings = crate::settings::Settings::default();
-        settings.notifications_muted = true;
-        assert!(!notification_allowed(&settings, &candidate("system", "urgent")));
+        let settings = crate::settings::Settings {
+            notifications_muted: true,
+            ..Default::default()
+        };
+        assert!(!notification_allowed(
+            &settings,
+            &candidate("system", "urgent")
+        ));
     }
 
     #[test]
     fn le_filtre_de_priorite_est_applique() {
-        let mut settings = crate::settings::Settings::default();
-        settings.notification_min_priority = "important".into();
-        assert!(!notification_allowed(&settings, &candidate("brief", "info")));
-        assert!(notification_allowed(&settings, &candidate("event", "important")));
+        let settings = crate::settings::Settings {
+            notification_min_priority: "important".into(),
+            ..Default::default()
+        };
+        assert!(!notification_allowed(
+            &settings,
+            &candidate("brief", "info")
+        ));
+        assert!(notification_allowed(
+            &settings,
+            &candidate("event", "important")
+        ));
     }
 
     #[test]
     fn le_mode_travail_garde_lurgent_par_defaut() {
-        let mut settings = crate::settings::Settings::default();
-        settings.work_mode = true;
-        assert!(!notification_allowed(&settings, &candidate("event", "important")));
-        assert!(notification_allowed(&settings, &candidate("system", "urgent")));
+        let settings = crate::settings::Settings {
+            work_mode: true,
+            ..Default::default()
+        };
+        assert!(!notification_allowed(
+            &settings,
+            &candidate("event", "important")
+        ));
+        assert!(notification_allowed(
+            &settings,
+            &candidate("system", "urgent")
+        ));
     }
 
     #[test]
     fn le_mode_travail_peut_garder_agenda_et_echeances() {
-        let mut settings = crate::settings::Settings::default();
-        settings.work_mode = true;
-        settings.work_notification_policy = "relevant".into();
-        assert!(notification_allowed(&settings, &candidate("event", "important")));
-        assert!(notification_allowed(&settings, &candidate("commitment", "important")));
-        assert!(!notification_allowed(&settings, &candidate("brief", "info")));
+        let settings = crate::settings::Settings {
+            work_mode: true,
+            work_notification_policy: "relevant".into(),
+            ..Default::default()
+        };
+        assert!(notification_allowed(
+            &settings,
+            &candidate("event", "important")
+        ));
+        assert!(notification_allowed(
+            &settings,
+            &candidate("commitment", "important")
+        ));
+        assert!(!notification_allowed(
+            &settings,
+            &candidate("brief", "info")
+        ));
     }
 }

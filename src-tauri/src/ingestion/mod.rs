@@ -70,21 +70,24 @@ pub async fn ingest_item(
     let (id, changed) = memory::upsert_item(db, &item)?;
 
     if changed {
-        if let Some(text) = content {
-            let chunks = chunk(text);
-            if !chunks.is_empty() {
-                let vectors = match llm.embed(&chunks).await {
-                    Ok(vs) => vs
-                        .into_iter()
-                        .map(|v| Some(vec_to_blob(&v)))
-                        .collect::<Vec<_>>(),
-                    Err(_) => chunks.iter().map(|_| None).collect(), // embedding en attente
-                };
-                let rows: Vec<(String, Option<Vec<u8>>)> =
-                    chunks.into_iter().zip(vectors.into_iter()).collect();
-                memory::replace_embeddings(db, &id, embed_model, &rows)?;
+        let chunks = content.map(chunk).unwrap_or_default();
+        let vectors = if chunks.is_empty() {
+            Vec::new()
+        } else {
+            match llm.embed(&chunks).await {
+                Ok(vs) => vs
+                    .into_iter()
+                    .map(|v| Some(vec_to_blob(&v)))
+                    .collect::<Vec<_>>(),
+                Err(_) => chunks.iter().map(|_| None).collect(), // embedding en attente
             }
-        }
+        };
+        let rows: Vec<(String, Option<Vec<u8>>)> =
+            chunks.into_iter().zip(vectors.into_iter()).collect();
+        // Important même quand `content` devient vide/non extractible : cette
+        // opération supprime les anciens vecteurs et empêche un contenu périmé
+        // de continuer à ressortir dans la recherche.
+        memory::replace_embeddings(db, &id, embed_model, &rows)?;
         bus.emit(BusEvent::ItemIngested {
             item_id: id.clone(),
             source,
@@ -96,11 +99,13 @@ pub async fn ingest_item(
 
 /// Rattrape les embeddings manquants (mode dégradé → nominal), par lots.
 pub async fn backfill_embeddings(db: &Db, llm: &Arc<dyn LlmClient>, limit: usize) -> Result<usize> {
+    let embed_model = crate::settings::load(db)?.embed_model;
     let pending: Vec<(String, String, i64, String)> = db.with(|c| {
         let mut stmt = c.prepare(
-            "SELECT item_id, model, chunk_index, text FROM embeddings WHERE vector IS NULL LIMIT ?1",
+            "SELECT item_id, model, chunk_index, text FROM embeddings
+             WHERE vector IS NULL AND model=?2 LIMIT ?1",
         )?;
-        let rows = stmt.query_map([limit as i64], |r| {
+        let rows = stmt.query_map(rusqlite::params![limit as i64, embed_model], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
         })?;
         let mut out = vec![];
@@ -126,50 +131,4 @@ pub async fn backfill_embeddings(db: &Db, llm: &Arc<dyn LlmClient>, limit: usize
         Ok(())
     })?;
     Ok(n)
-}
-
-/// Extraction d'entités légère et déterministe : noms probables → file d'inconnus.
-/// (L'extraction LLM plus riche passe par la boucle, à la demande.)
-pub fn extract_entities(db: &Db, item_id: &str, source_ref: &str, text: &str) {
-    // Détection d'engagements simples : « je t'envoie X vendredi », « à faire : … »
-    let lower = text.to_lowercase();
-    for marker in [
-        "je t'envoie",
-        "je te transmets",
-        "je m'occupe de",
-        "à faire :",
-        "todo:",
-    ] {
-        if let Some(pos) = lower.find(marker) {
-            let end = (pos + 140).min(text.len());
-            let snippet: String = text[pos..end]
-                .lines()
-                .next()
-                .unwrap_or("")
-                .chars()
-                .take(140)
-                .collect();
-            if snippet.len() > marker.len() + 3 {
-                let _ = db.with(|c| {
-                    let exists: bool = c
-                        .query_row(
-                            "SELECT 1 FROM commitments WHERE source_ref=?1 AND text=?2",
-                            rusqlite::params![source_ref, snippet],
-                            |_| Ok(true),
-                        )
-                        .unwrap_or(false);
-                    if !exists {
-                        c.execute(
-                            "INSERT INTO commitments (id, text, direction, status, source_ref)
-                             VALUES (?1, ?2, 'owed_by_me', 'open', ?3)",
-                            rusqlite::params![crate::db::new_id(), snippet, source_ref],
-                        )?;
-                    }
-                    Ok(())
-                });
-            }
-            break;
-        }
-    }
-    let _ = item_id;
 }

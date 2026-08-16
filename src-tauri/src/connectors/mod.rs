@@ -4,9 +4,11 @@
 pub mod calendar;
 pub mod files;
 pub mod mail;
+pub mod messages;
 pub mod native;
 pub mod oauth;
 pub mod people;
+pub mod reminders;
 pub mod screen;
 pub mod system;
 
@@ -39,6 +41,7 @@ pub fn list(db: &Db) -> Result<Vec<ConnectorInfo>> {
     ];
     if cfg!(target_os = "macos") {
         known.insert(1, ("apple", "apple", "connected"));
+        known.insert(2, ("messages", "messages", "disconnected"));
     }
     db.with(|c| {
         let mut out = vec![];
@@ -58,7 +61,10 @@ pub fn list(db: &Db) -> Result<Vec<ConnectorInfo>> {
             }
             if matches!(id, "google" | "microsoft" | "slack" | "github") {
                 status = if oauth::has_token(id) {
-                    "connected".into()
+                    // OAuth seul ne constitue pas un connecteur métier : tant
+                    // que lecture/synchronisation/actions ne sont pas câblées,
+                    // l'interface ne doit pas promettre « Connecté ».
+                    "authorized_only".into()
                 } else if oauth::is_configured(id) {
                     "disconnected".into()
                 } else {
@@ -72,6 +78,9 @@ pub fn list(db: &Db) -> Result<Vec<ConnectorInfo>> {
                 "github" => Some(oauth::configuration_detail("github")),
                 "apple" => Some(
                     "Intégré à ce Mac. Chaque service reste soumis à son autorisation macOS propre.".to_string(),
+                ),
+                "messages" => Some(
+                    "Lecture locale de l'historique Messages (iMessage/SMS). Nécessite l'Accès complet au disque.".to_string(),
                 ),
                 _ => None,
             };

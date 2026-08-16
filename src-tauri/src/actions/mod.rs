@@ -39,7 +39,12 @@ pub fn classify(tool: &str, args: &Value) -> RiskClass {
         | "files.reorganize" /* dry-run : produit un PLAN, ne déplace rien */ => RiskClass::Read,
 
         // Réversible local (preview + undo > demander à chaque fois)
-        "mail.draft" | "tasks.create" | "tasks.complete" | "memory.remember" | "files.move" => {
+        "mail.draft"
+        | "tasks.create"
+        | "tasks.complete"
+        | "memory.remember"
+        | "files.move"
+        | "files.create_folder_and_move" => {
             RiskClass::ReversibleLocal
         }
 
@@ -247,6 +252,28 @@ pub fn list_actions(db: &Db, status: Option<&str>, limit: usize) -> Result<Vec<P
         let mut out = vec![];
         for r in rows {
             out.push(r?);
+        }
+        drop(stmt);
+        // Compatibilité avec les plans créés avant que leur aperçu complet ne
+        // soit embarqué dans l'action : Archives et la carte de confirmation
+        // peuvent ainsi afficher aussi les rangements déjà effectués.
+        for action in &mut out {
+            if action.tool != "files.apply_reorganize_plan" || !action.input["plan"].is_null() {
+                continue;
+            }
+            let Some(plan_id) = action.input["plan_id"].as_str() else {
+                continue;
+            };
+            let plan: Option<String> = c
+                .query_row(
+                    "SELECT plan FROM reorganize_plans WHERE id=?1",
+                    params![plan_id],
+                    |row| row.get(0),
+                )
+                .ok();
+            if let Some(plan) = plan.and_then(|raw| serde_json::from_str(&raw).ok()) {
+                action.input["plan"] = plan;
+            }
         }
         Ok(out)
     })

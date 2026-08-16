@@ -345,6 +345,18 @@
       "description": "Permission identifier",
       "oneOf": [
         {
+          "description": "Sous-ensemble minimal utilisé par la barre flottante.",
+          "type": "string",
+          "const": "bar-commands",
+          "markdownDescription": "Sous-ensemble minimal utilisé par la barre flottante."
+        },
+        {
+          "description": "Commandes métier complètes réservées à la fenêtre principale de Syn.",
+          "type": "string",
+          "const": "main-commands",
+          "markdownDescription": "Commandes métier complètes réservées à la fenêtre principale de Syn."
+        },
+        {
           "description": "This permission set configures if your\napplication can enable or disable auto\nstarting the application on boot.\n\n#### Granted Permissions\n\nIt allows all to check, enable and\ndisable the automatic start on boot.\n\n\n#### This default permission set includes:\n\n- `allow-enable`\n- `allow-disable`\n- `allow-is-enabled`",
           "type": "string",
           "const": "autostart:default",

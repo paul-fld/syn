@@ -20,6 +20,7 @@ const STATUS_LABEL: Record<string, { label: string; cls: string }> = {
   needs_reauth: { label: "À ré-autoriser", cls: "warn" },
   needs_permission: { label: "Permission requise", cls: "warn" },
   needs_configuration: { label: "Configuration requise", cls: "warn" },
+  authorized_only: { label: "Autorisé · intégration inactive", cls: "warn" },
   unavailable: { label: "Indisponible", cls: "err" },
 };
 
@@ -27,7 +28,7 @@ const NATIVE_DESCRIPTION: Record<string, string> = {
   mail: "Accède aux messages enregistrés dans Mail.",
   contacts: "Retrouve les personnes enregistrées dans Contacts.",
   calendar: "Consulte et modifie les événements du Calendrier.",
-  reminders: "Synchronisation des rappels bientôt disponible.",
+  reminders: "Synchronise les rappels ouverts avec les tâches et les briefs de Syn.",
   photos: "Recherche dans Photos bientôt disponible.",
   screen: "Analyse ponctuellement la fenêtre visible à ta demande.",
 };
@@ -64,9 +65,14 @@ export function Connecteurs(): JSX.Element {
       void refetch();
     }, 3000);
     onCleanup(() => clearInterval(t));
-    on("sync_progress", (p) => {
-      if (p?.payload?.message || p?.message) setMessage(p.message ?? p?.payload?.message);
-    });
+    // L'écouteur doit être désabonné au démontage : il s'accumulait à chaque
+    // visite de la page (audit §3).
+    let unlisten: (() => void) | null = null;
+    on("sync_progress", (raw) => {
+      const p = raw?.payload ?? raw;
+      if (p?.message) setMessage(p.message);
+    }).then((un) => (unlisten = un));
+    onCleanup(() => unlisten?.());
   });
 
   const connect = async (id: string) => {
@@ -110,8 +116,8 @@ export function Connecteurs(): JSX.Element {
         </div>
         <Show when={fileAccess()?.status !== "granted"} fallback={
           <div style={{ display: "flex", gap: "8px", "align-items": "center" }}>
-            <button class="btn" onClick={() => ipc.filesReindex()}>Réindexer maintenant</button>
-            <span class="sub">Surveillance automatique active</span>
+            <Icon name="check" size={14} />
+            <span class="sub">Index local maintenu automatiquement — aucune réindexation manuelle nécessaire</span>
           </div>
         }>
           <button class="btn primary" onClick={async () => {
@@ -146,6 +152,11 @@ export function Connecteurs(): JSX.Element {
             Réglages, puis Confidentialité.
           </div>
         </Show>
+        <Show when={(indexStatus()?.unreadable_files ?? 0) > 0}>
+          <div class="sub muted" style={{ "margin-top": "6px" }}>
+            {indexStatus()!.unreadable_files} document(s) n'ont pas de texte extractible ; ils restent recherchables par nom et chemin.
+          </div>
+        </Show>
       </div>
 
       <div class="section-label">Services intégrés à cet appareil</div>
@@ -161,7 +172,7 @@ export function Connecteurs(): JSX.Element {
         <For each={(native()?.services ?? []).filter((service) => service.id !== "files")}>
           {(permission: NativePermission) => (
             <div class="row-line native-permission-row">
-              <Icon name={permission.id === "mail" ? "apple-mail" : permission.id === "calendar" ? "calendrier" : permission.id === "files" ? "folder" : permission.id === "screen" ? "app-window-mac" : permission.id === "contacts" ? "contact-round" : permission.id === "photos" ? "image" : "check"} size={15} />
+              <Icon name={permission.id === "mail" ? "apple-mail" : permission.id === "calendar" ? "calendrier" : permission.id === "files" ? "folder" : permission.id === "screen" ? "app-window-mac" : permission.id === "contacts" ? "contact-round" : permission.id === "photos" ? "camera" : "check"} size={15} />
               <span class="grow">
                 <b>{permission.label}</b>
                 <span class="sub"> {NATIVE_DESCRIPTION[permission.id] ?? permission.detail}</span>
@@ -185,6 +196,20 @@ export function Connecteurs(): JSX.Element {
             </div>
           )}
         </For>
+        <Show when={(connectors() ?? []).some((c) => c.id === "messages")}>
+          <div class="row-line native-permission-row">
+            <Icon name="message" size={15} />
+            <span class="grow">
+              <b>Messages</b>
+              <span class="sub"> Historique iMessage/SMS lu localement, rattaché à tes proches.</span>
+            </span>
+            <span class={`pill-status ${(connectors() ?? []).find((c) => c.id === "messages")?.status === "connected" ? "ok" : ""}`}>
+              {(connectors() ?? []).find((c) => c.id === "messages")?.status === "connected"
+                ? "Synchronisé"
+                : "Via l'accès complet au disque"}
+            </span>
+          </div>
+        </Show>
       </div>
 
       <div class="section-label">Services externes</div>
@@ -204,7 +229,7 @@ export function Connecteurs(): JSX.Element {
               {STATUS_LABEL[c.status]?.label ?? c.status}
             </span>
             <Show
-              when={c.status === "connected"}
+              when={c.status === "connected" || c.status === "authorized_only"}
               fallback={
                 <button class="btn" disabled={c.status === "needs_configuration" || c.status === "syncing"} onClick={() => connect(c.id)}>
                   {c.status === "needs_configuration" ? "Non disponible" : "Connecter"}

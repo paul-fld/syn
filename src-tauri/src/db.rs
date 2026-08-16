@@ -13,7 +13,46 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0003_conversation_projects",
         include_str!("../../migrations/0003_conversation_projects.sql"),
     ),
+    (
+        "0004_search_and_senses",
+        include_str!("../../migrations/0004_search_and_senses.sql"),
+    ),
+    (
+        "0005_full_text_search",
+        include_str!("../../migrations/0005_full_text_search.sql"),
+    ),
 ];
+
+/// Normalisation de recherche : minuscules + suppression des diacritiques
+/// français. Exposée à SQLite sous le nom `syn_fold` pour des LIKE
+/// insensibles aux accents et à la casse.
+pub fn fold(s: &str) -> String {
+    s.chars()
+        .flat_map(|c| {
+            let lower = c.to_lowercase().next().unwrap_or(c);
+            let mapped = match lower {
+                'à' | 'â' | 'ä' | 'á' | 'ã' => 'a',
+                'é' | 'è' | 'ê' | 'ë' => 'e',
+                'î' | 'ï' | 'í' | 'ì' => 'i',
+                'ô' | 'ö' | 'ó' | 'ò' | 'õ' => 'o',
+                'ù' | 'û' | 'ü' | 'ú' => 'u',
+                'ç' => 'c',
+                'ÿ' | 'ý' => 'y',
+                'ñ' => 'n',
+                'œ' => 'o', // approximation : "œuvre" → "oeuvre" est géré par le doublage ci-dessous
+                'æ' => 'a',
+                other => other,
+            };
+            if lower == 'œ' {
+                vec!['o', 'e']
+            } else if lower == 'æ' {
+                vec!['a', 'e']
+            } else {
+                vec![mapped]
+            }
+        })
+        .collect()
+}
 
 /// Connexion SQLite chiffrée (SQLCipher AES-256). La vérité est dans les sources ;
 /// l'index est dérivé et reconstructible (doc maître §8).
@@ -33,6 +72,16 @@ impl Db {
             .map_err(|_| AppError::Security("Mot de passe maître incorrect.".into()))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        conn.create_scalar_function(
+            "syn_fold",
+            1,
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8
+                | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+            |ctx| {
+                let s: String = ctx.get(0)?;
+                Ok(fold(&s))
+            },
+        )?;
         let db = Db {
             conn: Arc::new(Mutex::new(conn)),
         };

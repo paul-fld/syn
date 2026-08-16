@@ -30,16 +30,25 @@ export const [sessionsVersion, setSessionsVersion] = createSignal(0);
 export interface PendingQuery { text: string; screenContext?: ScreenContext | null }
 export const [barQuery, setBarQuery] = createSignal<PendingQuery | null>(null);
 
+export const [loadError, setLoadError] = createSignal<string | null>(null);
+
 export async function refreshStatus() {
-  const s = await ipc.appStatus();
-  setStatus(s);
-  if (!s.initialized) setScreen("onboarding");
-  else if (!s.unlocked) setScreen("locked");
-  else {
-    const st = await ipc.getSettings();
-    setSettings(st);
-    if (!st.onboarding_done) setScreen("onboarding");
-    else setScreen("app");
+  // Sans garde-fou, un échec ici laissait l'app bloquée sur le glyphe de
+  // chargement sans message ni retry (audit §3).
+  try {
+    const s = await ipc.appStatus();
+    setStatus(s);
+    setLoadError(null);
+    if (!s.initialized) setScreen("onboarding");
+    else if (!s.unlocked) setScreen("locked");
+    else {
+      const st = await ipc.getSettings();
+      setSettings(st);
+      if (!st.onboarding_done) setScreen("onboarding");
+      else setScreen("app");
+    }
+  } catch (e: any) {
+    setLoadError(e?.message ?? String(e));
   }
 }
 

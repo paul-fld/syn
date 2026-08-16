@@ -186,6 +186,66 @@ pub fn persist_turn(db: &Db, session_id: &str, role: &str, content: &str) -> Res
     })
 }
 
+/// Résumé de long terme d'une session : les tours trop anciens pour tenir dans
+/// la fenêtre sont condensés une fois pour toutes (mémoire de travail, doc §13).
+pub fn session_summary(db: &Db, session_id: &str) -> Result<Option<String>> {
+    db.with(|c| {
+        Ok(c.query_row(
+            "SELECT summary FROM sessions WHERE id=?1",
+            params![session_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(None))
+    })
+}
+
+pub fn set_session_summary(db: &Db, session_id: &str, summary: &str) -> Result<()> {
+    db.with(|c| {
+        c.execute(
+            "UPDATE sessions SET summary=?2 WHERE id=?1",
+            params![session_id, summary],
+        )?;
+        Ok(())
+    })
+}
+
+pub fn turn_count(db: &Db, session_id: &str) -> Result<i64> {
+    db.with(|c| {
+        Ok(c.query_row(
+            "SELECT COUNT(*) FROM conversations WHERE session_id=?1 AND role IN ('user','assistant')",
+            params![session_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0))
+    })
+}
+
+/// Les tours ANTÉRIEURS à la fenêtre récente (matière du résumé), bornés.
+pub fn older_turns(
+    db: &Db,
+    session_id: &str,
+    skip_recent: usize,
+    cap: usize,
+) -> Result<Vec<(String, String)>> {
+    db.with(|c| {
+        let mut stmt = c.prepare(
+            "SELECT role, content FROM (
+               SELECT role, content, turn FROM conversations
+               WHERE session_id = ?1 AND role IN ('user','assistant')
+               ORDER BY turn DESC LIMIT ?2 OFFSET ?3
+             ) ORDER BY turn ASC",
+        )?;
+        let rows = stmt.query_map(params![session_id, cap as i64, skip_recent as i64], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        let mut out = vec![];
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    })
+}
+
 pub fn recent_turns(db: &Db, session_id: &str, limit: usize) -> Result<Vec<(String, String)>> {
     db.with(|c| {
         let mut stmt = c.prepare(
@@ -314,15 +374,20 @@ pub fn find_or_create_person(
                 let mut v: Value = channels
                     .and_then(|s| serde_json::from_str(&s).ok())
                     .unwrap_or_else(|| serde_json::json!({"emails": [], "phones": []}));
-                if let Some(e) = email {
+                // Un JSON valide mais mal formé (emails/phones non-tableaux)
+                // ne doit pas faire paniquer l'app (audit §3) : on répare.
+                for key in ["emails", "phones"] {
+                    if !v[key].is_array() {
+                        v[key] = serde_json::json!([]);
+                    }
+                }
+                if let (Some(e), Some(arr)) = (email, v["emails"].as_array_mut()) {
                     let e = e.to_lowercase();
-                    let arr = v["emails"].as_array_mut().unwrap();
                     if !arr.iter().any(|x| x.as_str() == Some(&e)) {
                         arr.push(Value::String(e));
                     }
                 }
-                if let Some(p) = phone {
-                    let arr = v["phones"].as_array_mut().unwrap();
+                if let (Some(p), Some(arr)) = (phone, v["phones"].as_array_mut()) {
                     if !arr.iter().any(|x| x.as_str() == Some(p)) {
                         arr.push(Value::String(p.to_string()));
                     }
@@ -341,6 +406,66 @@ pub fn find_or_create_person(
             params![id, name, channels.to_string(), now()],
         )?;
         Ok(id)
+    })
+}
+
+/// Retrouve une personne par canal de communication (email exact, ou numéro
+/// de téléphone comparé sur ses 9 derniers chiffres pour absorber les formats
+/// « +33 6… » vs « 06… »).
+pub fn find_person_by_channel(db: &Db, handle: &str) -> Result<Option<String>> {
+    let handle_lower = handle.to_lowercase();
+    let handle_digits: String = handle.chars().filter(|c| c.is_ascii_digit()).collect();
+    let handle_tail: String = handle_digits
+        .chars()
+        .rev()
+        .take(9)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    db.with(|c| {
+        let mut stmt = c.prepare(
+            "SELECT id, COALESCE(comm_channels,'') FROM people WHERE comm_channels IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        for row in rows.flatten() {
+            let (id, channels) = row;
+            let v: Value = serde_json::from_str(&channels).unwrap_or(Value::Null);
+            let emails = v["emails"].as_array().cloned().unwrap_or_default();
+            if emails
+                .iter()
+                .any(|e| e.as_str().map(|s| s.to_lowercase()) == Some(handle_lower.clone()))
+            {
+                return Ok(Some(id));
+            }
+            if !handle_tail.is_empty() && handle_tail.len() >= 6 {
+                let phones = v["phones"].as_array().cloned().unwrap_or_default();
+                for p in phones {
+                    let digits: String = p
+                        .as_str()
+                        .unwrap_or("")
+                        .chars()
+                        .filter(|c| c.is_ascii_digit())
+                        .collect();
+                    if !digits.is_empty()
+                        && (digits.ends_with(&handle_tail)
+                            || handle_digits.ends_with(
+                                &digits
+                                    .chars()
+                                    .rev()
+                                    .take(9)
+                                    .collect::<Vec<_>>()
+                                    .into_iter()
+                                    .rev()
+                                    .collect::<String>(),
+                            ))
+                    {
+                        return Ok(Some(id));
+                    }
+                }
+            }
+        }
+        Ok(None)
     })
 }
 

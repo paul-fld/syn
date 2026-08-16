@@ -4,7 +4,7 @@ import { AskBar } from "../components/AskBar";
 import { ActionCard } from "../components/ActionCard";
 import { Icon } from "../components/Icon";
 import { ipc, on, type AgentProgress, type Answer, type Retrieved, type PendingAction, type ScreenContext, type ConversationSession } from "../lib/ipc";
-import { barQuery, setBarQuery, refreshPending, pendingActions, sessionsVersion } from "../lib/state";
+import { barQuery, setBarQuery, refreshPending, pendingActions, sessionsVersion, settings } from "../lib/state";
 
 interface Msg {
   role: "user" | "assistant";
@@ -17,6 +17,88 @@ type ConversationDialog = {
   kind: "rename" | "new-project" | "create-project" | "delete";
   session?: ConversationSession;
 };
+
+type LinkableSource = Pick<Retrieved, "title" | "source_ref" | "path">;
+
+function sourceTarget(source: LinkableSource): string {
+  return source.path ?? source.source_ref;
+}
+
+function InlineMessage(props: { text: string; sources?: LinkableSource[] }): JSX.Element {
+  const parts: JSX.Element[] = [];
+  const pattern = /(\*\*[^*]+\*\*|`[^`]+`)/g;
+  let cursor = 0;
+  for (const match of props.text.matchAll(pattern)) {
+    const start = match.index ?? 0;
+    if (start > cursor) parts.push(props.text.slice(cursor, start));
+    const token = match[0];
+    const label = token.startsWith("**") ? token.slice(2, -2) : "";
+    const source = label
+      ? props.sources?.find((candidate) => candidate.title === label)
+      : undefined;
+    parts.push(
+      source ? (
+        <button
+          type="button"
+          class="inline-source-link"
+          title={sourceTarget(source)}
+          aria-label={`Ouvrir ${label}`}
+          onClick={() => ipc.openSource(sourceTarget(source)).catch(() => {})}
+        >
+          {label}
+        </button>
+      ) : token.startsWith("**") ? (
+        <strong>{label}</strong>
+      ) : (
+        <code>{token.slice(1, -1)}</code>
+      ),
+    );
+    cursor = start + token.length;
+  }
+  if (cursor < props.text.length) parts.push(props.text.slice(cursor));
+  return <>{parts}</>;
+}
+
+function embeddedSource(raw: string, sources?: Retrieved[]): LinkableSource | undefined {
+  const numbered = raw.match(/^\s*(\d+)[.)]\s+/);
+  const structured = raw
+    .replace(/^\s*(?:[*-]|\d+[.)])\s+/, "")
+    .match(/^\*\*(.+?)\*\*\s+—\s+(.+)$/);
+  if (!structured) return undefined;
+  const fromAnswer = numbered ? sources?.[Number(numbered[1]) - 1] : undefined;
+  return fromAnswer ?? { title: structured[1], source_ref: structured[2], path: structured[2] };
+}
+
+function sourcesAreLinkedInline(content: string, sources?: Retrieved[]): boolean {
+  return !!sources?.length && sources.every((source) =>
+    !!source.title && content.includes(`**${source.title}**`),
+  );
+}
+
+function MessageContent(props: { content: string; sources?: Retrieved[] }): JSX.Element {
+  return (
+    <div class="msg-content">
+      <For each={props.content.split("\n")}>
+        {(raw) => {
+          const bullet = /^\s*[*-]\s+/.test(raw);
+          const numbered = /^\s*\d+[.)]\s+/.test(raw);
+          const text = raw.replace(/^\s*(?:[*-]|\d+[.)])\s+/, "");
+          const lineSource = embeddedSource(raw, props.sources);
+          return (
+            <div class="msg-line" classList={{ bullet, numbered, empty: !raw }}>
+              <Show when={raw} fallback={<br />}>
+                <InlineMessage
+                  text={text}
+                  sources={lineSource ? [lineSource] : props.sources}
+                />
+              </Show>
+            </div>
+          );
+        }}
+      </For>
+    </div>
+  );
+}
 
 export function Conversations(): JSX.Element {
   const [sessions, { refetch: refetchSessions }] = createResource(sessionsVersion, () => ipc.listSessions());
@@ -67,22 +149,29 @@ export function Conversations(): JSX.Element {
 
   // Requête venue de la barre d'interaction ou de l'Accueil.
   onMount(() => {
-    let unlisten: (() => void) | undefined;
+    let unlistenProgress: (() => void) | undefined;
+    let unlistenResolved: (() => void) | undefined;
     void on("agent_progress", (raw) => {
       const event = (raw?.payload ?? raw) as AgentProgress;
       if (event.session_id !== sessionId()) return;
       setProgress((steps) => [...steps, event].slice(-20));
       scrollDown();
-    }).then((fn) => (unlisten = fn));
-    onCleanup(() => unlisten?.());
-    const q = barQuery();
-    if (q) {
-      setBarQuery(null);
-      setSessionId(null);
-      setMessages([]);
-      send(q.text, q.screenContext);
-    }
+    }).then((fn) => (unlistenProgress = fn));
+    void on("action_resolved", async () => {
+      const active = sessionId();
+      if (!active) return;
+      const turns = await ipc.getConversation(active).catch(() => null);
+      if (turns) {
+        setMessages(turns.map((turn: any) => ({ role: turn.role, content: turn.content })));
+        scrollDown();
+      }
+    }).then((fn) => (unlistenResolved = fn));
+    onCleanup(() => {
+      unlistenProgress?.();
+      unlistenResolved?.();
+    });
   });
+  // Requête venue de la barre ou de l'Accueil (l'effet couvre aussi le montage).
   createEffect(() => {
     const q = barQuery();
     if (q) {
@@ -232,7 +321,7 @@ export function Conversations(): JSX.Element {
       </div>
 
       <div class="convo-main">
-        <div class="convo-thread" ref={threadEl}>
+        <div class="convo-thread" ref={threadEl} aria-live="polite" aria-busy={thinking()}>
           <Show when={messages().length === 0 && !thinking()}>
             <div class="empty-note" style={{ "margin-top": "80px" }}>
               Pose une question sur tes documents, tes mails, ton agenda ou ta machine.
@@ -241,16 +330,27 @@ export function Conversations(): JSX.Element {
           <For each={messages()}>
             {(m) => (
               <div class="msg fade-in" classList={{ user: m.role === "user", assistant: m.role === "assistant" }}>
-                {m.content}
-                <Show when={m.sources && m.sources.length > 0}>
+                <MessageContent content={m.content} sources={m.sources} />
+                <Show when={m.role === "assistant" && settings()?.voice_output_enabled && m.content}>
+                  <button
+                    class="source-pill"
+                    title="Lire à voix haute"
+                    aria-label="Lire à voix haute"
+                    style={{ "margin-left": "8px" }}
+                    onClick={() => ipc.speakText(m.content).catch(() => {})}
+                  >
+                    <Icon name="audio-lines" size={12} />
+                  </button>
+                </Show>
+                <Show when={m.sources && m.sources.length > 0 && !sourcesAreLinkedInline(m.content, m.sources)}>
                   <div class="sources">
                     <For each={m.sources}>
                       {(s, i) => (
                         <button
                           class="source-pill"
                           title={s.source_ref}
-                          disabled={!s.path}
-                          onClick={() => s.path && ipc.openSource(s.path).catch(() => {})}
+                          disabled={!s.path && !s.source_ref}
+                          onClick={() => ipc.openSource(s.path ?? s.source_ref).catch(() => {})}
                         >
                           [{i() + 1}] {s.title || s.source_ref}
                         </button>
@@ -265,10 +365,12 @@ export function Conversations(): JSX.Element {
             <For each={sessionPending()}>{(a) => <ActionCard action={a} />}</For>
           </Show>
           <Show when={thinking()}>
-            <details class="agent-progress" open>
+            <details class="agent-progress is-working" open>
               <summary>
                 <span class="dot" />
-                {progress()[progress().length - 1]?.title ?? "Démarrage du traitement local…"}
+                <span class="agent-progress-title">
+                  {progress()[progress().length - 1]?.title ?? "Syn analyse la demande…"}
+                </span>
               </summary>
               <div class="agent-progress-list">
                 <For each={progress()}>
@@ -292,8 +394,8 @@ export function Conversations(): JSX.Element {
       </div>
       <Show when={dialog()}>
         <div class="conversation-dialog-backdrop" onClick={() => setDialog(null)}>
-          <div class="conversation-dialog" onClick={(event) => event.stopPropagation()}>
-            <h3>
+          <div class="conversation-dialog" role="dialog" aria-modal="true" aria-labelledby="conversation-dialog-title" onClick={(event) => event.stopPropagation()}>
+            <h3 id="conversation-dialog-title">
               {dialog()!.kind === "rename"
                 ? "Renommer la conversation"
                 : dialog()!.kind === "delete"
@@ -306,6 +408,7 @@ export function Conversations(): JSX.Element {
             >
               <input
                 class="text-input"
+                aria-label={dialog()!.kind === "rename" ? "Titre de la conversation" : "Nom du projet"}
                 value={dialogValue()}
                 placeholder={dialog()!.kind === "rename" ? "Titre de la conversation" : "Nom du projet"}
                 autofocus

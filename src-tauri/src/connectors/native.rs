@@ -15,6 +15,12 @@ unsafe extern "C" {
         location: *const std::os::raw::c_char,
     ) -> *mut std::os::raw::c_char;
     fn syn_native_calendar_delete(identifier: *const std::os::raw::c_char) -> i32;
+    fn syn_native_reminders_json() -> *mut std::os::raw::c_char;
+    fn syn_native_reminder_create(
+        title: *const std::os::raw::c_char,
+        due: f64,
+    ) -> *mut std::os::raw::c_char;
+    fn syn_native_reminder_complete(identifier: *const std::os::raw::c_char) -> i32;
     fn syn_native_ocr_image_json(path: *const std::os::raw::c_char) -> *mut std::os::raw::c_char;
     fn syn_native_frontmost_context_json() -> *mut std::os::raw::c_char;
     fn syn_native_free(value: *mut std::os::raw::c_char);
@@ -38,11 +44,11 @@ pub fn ocr_image(path: &std::path::Path) -> Result<Vec<Value>> {
 pub fn frontmost_context() -> Value {
     #[cfg(target_os = "macos")]
     {
-        return take_json(
+        take_json(
             unsafe { syn_native_frontmost_context_json() },
             "Impossible d’identifier l’application visible.",
         )
-        .unwrap_or_else(|_| serde_json::json!({"available": true, "app": "", "window": ""}));
+        .unwrap_or_else(|_| serde_json::json!({"available": true, "app": "", "window": ""}))
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -128,6 +134,49 @@ pub fn calendar_events(from: i64, to: i64) -> Result<Vec<Value>> {
     }
     #[allow(unreachable_code)]
     Ok(vec![])
+}
+
+pub fn reminders_list() -> Result<Vec<Value>> {
+    #[cfg(target_os = "macos")]
+    {
+        let value = take_json(
+            unsafe { syn_native_reminders_json() },
+            "Autorise Rappels pour Syn dans Réglages système.",
+        )?;
+        return Ok(value.as_array().cloned().unwrap_or_default());
+    }
+    #[allow(unreachable_code)]
+    Ok(vec![])
+}
+
+pub fn reminder_create(title: &str, due: Option<i64>) -> Result<Value> {
+    #[cfg(target_os = "macos")]
+    {
+        let title = CString::new(title).map_err(|_| AppError::Invalid("titre invalide".into()))?;
+        return take_json(
+            unsafe { syn_native_reminder_create(title.as_ptr(), due.unwrap_or(0) as f64) },
+            "Impossible de créer le rappel.",
+        );
+    }
+    #[allow(unreachable_code)]
+    {
+        let _ = (title, due);
+        Err(AppError::Invalid("Rappels natifs indisponibles".into()))
+    }
+}
+
+pub fn reminder_complete(identifier: &str) -> Result<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        let identifier = CString::new(identifier)
+            .map_err(|_| AppError::Invalid("identifiant de rappel invalide".into()))?;
+        return Ok(unsafe { syn_native_reminder_complete(identifier.as_ptr()) } == 1);
+    }
+    #[allow(unreachable_code)]
+    {
+        let _ = identifier;
+        Ok(false)
+    }
 }
 
 pub fn calendar_create(title: &str, start: i64, end: i64, location: &str) -> Result<Value> {

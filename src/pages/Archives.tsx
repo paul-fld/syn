@@ -1,6 +1,7 @@
 // Activité : actions (+annulation), accès aux données et notifications proactives.
 import { createResource, createSignal, For, Show, type JSX } from "solid-js";
 import { Icon } from "../components/Icon";
+import { ReorganizePlanView } from "../components/ActionCard";
 import { ipc } from "../lib/ipc";
 import { fmtDate } from "../lib/state";
 
@@ -66,7 +67,8 @@ export function Archives(): JSX.Element {
         </Show>
         <For each={actions() ?? []}>
           {(a) => (
-            <div class="row-line">
+            <div class="archive-action">
+              <div class="row-line">
               <Icon
                 name={a.status === "executed" ? "circle-check-big" : a.status === "awaiting_confirmation" ? "hourglass" : a.status === "undone" ? "redo-2" : "x"}
                 size={14}
@@ -79,7 +81,7 @@ export function Archives(): JSX.Element {
                 </span>
               </span>
               <span class={`pill-status ${a.risk_class === "floor" ? "warn" : ""}`}>{RISK_FR[a.risk_class] ?? a.risk_class}</span>
-              <Show when={a.status === "executed" && a.undoable}>
+                <Show when={a.status === "executed" && a.undoable}>
                 <button
                   class="btn"
                   title="Annuler cette action"
@@ -94,6 +96,10 @@ export function Archives(): JSX.Element {
                 >
                   Annuler
                 </button>
+                </Show>
+              </div>
+              <Show when={a.tool === "files.apply_reorganize_plan"}>
+                <ReorganizePlanView input={a.input} compact />
               </Show>
             </div>
           )}

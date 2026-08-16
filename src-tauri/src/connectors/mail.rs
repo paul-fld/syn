@@ -11,6 +11,7 @@ use crate::error::{AppError, Result};
 use crate::ingestion;
 use crate::llm::LlmClient;
 use crate::memory::{self, Item};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -83,7 +84,18 @@ pub async fn sync_native(
         }
     }
     emlx.sort_by(|a, b| b.1.cmp(&a.1));
-    emlx.truncate(MAX_MAILS_PER_SYNC);
+    // Ne pas tronquer ici : si les 800 plus récents sont déjà connus, une
+    // troncature empêche à vie l'indexation des messages plus anciens.
+    let known: HashSet<String> = db.with(|c| {
+        let mut stmt =
+            c.prepare("SELECT source_ref FROM items WHERE source='mail' AND status='active'")?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        let mut out = HashSet::new();
+        for row in rows {
+            out.insert(row?);
+        }
+        Ok(out)
+    })?;
 
     let mut count = 0usize;
     for (path, mtime) in emlx {
@@ -92,7 +104,7 @@ pub async fn sync_native(
         }
         let source_ref = path.to_string_lossy().to_string();
         // Incrémental : déjà connu → skip.
-        if memory::item_hash(db, "mail", &source_ref)?.is_some() {
+        if known.contains(&source_ref) {
             continue;
         }
         let bytes = match std::fs::read(&path) {
@@ -164,8 +176,14 @@ pub async fn sync_native(
                 )?;
             }
         }
-        ingestion::extract_entities(db, &id, &source_ref, &body);
+        // Le contenu d'un mail est une donnée externe non fiable. Il peut
+        // enrichir la recherche et les liens vers des personnes, mais ne doit
+        // jamais créer silencieusement un engagement « dû par moi » à partir
+        // d'une phrase reçue ou d'une signature transférée.
         count += 1;
+        if count >= MAX_MAILS_PER_SYNC {
+            break;
+        }
     }
     crate::connectors::set_status(db, "apple", "apple", "connected")?;
     Ok(count)
@@ -201,25 +219,35 @@ fn extract_body(mail: &mailparse::ParsedMail) -> Option<String> {
 
 fn strip_html(html: &str) -> String {
     let mut out = String::with_capacity(html.len() / 2);
-    let mut in_tag = false;
     let mut in_style_or_script = false;
-    let lower = html.to_lowercase();
-    let mut i = 0;
-    let bytes = html.as_bytes();
-    while i < bytes.len() {
-        if !in_tag && bytes[i] == b'<' {
-            in_tag = true;
-            if lower[i..].starts_with("<style") || lower[i..].starts_with("<script") {
-                in_style_or_script = true;
-            } else if lower[i..].starts_with("</style") || lower[i..].starts_with("</script") {
-                in_style_or_script = false;
+    let mut chars = html.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '<' {
+            let mut tag = String::new();
+            for tag_ch in chars.by_ref() {
+                if tag_ch == '>' {
+                    break;
+                }
+                if tag.len() < 32 {
+                    tag.push(tag_ch);
+                }
             }
-        } else if in_tag && bytes[i] == b'>' {
-            in_tag = false;
-        } else if !in_tag && !in_style_or_script {
-            out.push(bytes[i] as char);
+            let tag = tag.trim().to_lowercase();
+            if tag.starts_with("style") || tag.starts_with("script") {
+                in_style_or_script = true;
+            } else if tag.starts_with("/style") || tag.starts_with("/script") {
+                in_style_or_script = false;
+            } else if !in_style_or_script
+                && (tag.starts_with("br")
+                    || tag.starts_with("/p")
+                    || tag.starts_with("/div")
+                    || tag.starts_with("/li"))
+            {
+                out.push('\n');
+            }
+        } else if !in_style_or_script {
+            out.push(ch);
         }
-        i += 1;
     }
     out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -237,5 +265,16 @@ fn parse_address(raw: &str) -> Option<(String, String)> {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn le_nettoyage_html_preserve_lutf8_et_ignore_les_scripts() {
+        let html = "<p>Échéance : décembre</p><script>faux TODO</script><div>À bientôt 👋</div>";
+        assert_eq!(strip_html(html), "Échéance : décembre À bientôt 👋");
     }
 }

@@ -187,7 +187,7 @@ pub fn build_brief(db: &Db) -> Result<Brief> {
         let recent: Option<(String, String)> = db.with(|c| {
             Ok(c.query_row(
                 "SELECT title, source_ref FROM items
-                 WHERE source='files' AND type='document' AND status='active' AND mtime >= ?1
+                 WHERE source='files' AND type IN ('document','code_project','code') AND status='active' AND mtime >= ?1
                  ORDER BY mtime DESC LIMIT 1",
                 params![now() - 3 * 86_400],
                 |r| {

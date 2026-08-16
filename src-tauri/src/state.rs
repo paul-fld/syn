@@ -84,7 +84,7 @@ impl AppState {
             settings.embed_model.clone(),
         );
         indexer.paused.store(
-            settings.indexing_paused || settings.eco_mode,
+            settings.indexing_paused,
             std::sync::atomic::Ordering::SeqCst,
         );
         let core = Arc::new(Core {
@@ -95,9 +95,12 @@ impl AppState {
             key_hex: Arc::new(std::sync::Mutex::new(key_hex.to_string())),
         });
         *self.core.write().unwrap() = Some(core.clone());
-        if cfg!(target_os = "macos")
-            && settings.files_full_access_requested
-            && crate::connectors::files::full_disk_access_granted()
+        // Toute portée déjà autorisée est vérifiée automatiquement à chaque
+        // démarrage. Une évolution de l'extracteur ou de l'index se propage
+        // donc sans demander à l'utilisateur de « réindexer » manuellement.
+        if !crate::connectors::files::folder_paths(&core.db)
+            .unwrap_or_default()
+            .is_empty()
         {
             let _ = core
                 .indexer
@@ -116,6 +119,23 @@ impl AppState {
             let embed_model = settings.embed_model.clone();
             tauri::async_runtime::spawn(async move {
                 let _ = crate::connectors::mail::sync_native(&db, &llm, &bus, &embed_model).await;
+            });
+        }
+        // Sens supplémentaires au déverrouillage : agenda (miroir proactivité),
+        // Rappels et Messages — tous best-effort, jamais bloquants.
+        if cfg!(target_os = "macos") && settings.onboarding_done {
+            let db = core.db.clone();
+            let llm = core.llm.clone();
+            let bus = core.bus.clone();
+            let embed_model = settings.embed_model.clone();
+            tauri::async_runtime::spawn(async move {
+                let db2 = db.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = crate::connectors::calendar::sync_native_to_db(&db2);
+                    let _ = crate::connectors::reminders::sync_native_to_db(&db2);
+                })
+                .await;
+                let _ = crate::connectors::messages::sync(&db, &llm, &bus, &embed_model).await;
             });
         }
         Ok(core)

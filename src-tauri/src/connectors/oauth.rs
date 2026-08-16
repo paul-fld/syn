@@ -46,7 +46,7 @@ pub fn is_configured(provider: &str) -> bool {
 
 pub fn configuration_detail(provider: &str) -> String {
     if has_token(provider) {
-        return "Compte autorisé ; jeton protégé dans le trousseau système.".into();
+        return "Compte autorisé et jeton protégé, mais synchronisation et actions non disponibles dans cette version.".into();
     }
     if is_configured(provider) {
         return match provider {

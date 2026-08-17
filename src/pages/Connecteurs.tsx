@@ -15,12 +15,12 @@ const BRAND_ICON: Record<string, string> = {
 
 const STATUS_LABEL: Record<string, { label: string; cls: string }> = {
   connected: { label: "Connecté", cls: "ok" },
-  syncing: { label: "Synchronisation…", cls: "warn" },
+  syncing: { label: "Connecté · cache en cours", cls: "working" },
   disconnected: { label: "Non connecté", cls: "" },
-  needs_reauth: { label: "À ré-autoriser", cls: "warn" },
+  needs_reauth: { label: "Reconnexion requise", cls: "err" },
   needs_permission: { label: "Permission requise", cls: "warn" },
   needs_configuration: { label: "Configuration requise", cls: "warn" },
-  authorized_only: { label: "Autorisé · intégration inactive", cls: "warn" },
+  authorized_only: { label: "Connecté", cls: "ready" },
   unavailable: { label: "Indisponible", cls: "err" },
 };
 
@@ -45,6 +45,8 @@ export function Connecteurs(): JSX.Element {
   const [native, { refetch: refetchNative }] = createResource(() => ipc.nativePermissions());
   const [indexStatus, setIndexStatus] = createSignal<IndexStatus | null>(null);
   const [message, setMessage] = createSignal<string | null>(null);
+  const [pendingAuth, setPendingAuth] = createSignal<string | null>(null);
+  const [syncProgress, setSyncProgress] = createSignal<Record<string, { pct: number; message: string }>>({});
   const fileAccess = () => native()?.services.find((service) => service.id === "files");
 
   const refreshIndex = () => ipc.filesIndexStatus().then(setIndexStatus).catch(() => {});
@@ -59,11 +61,34 @@ export function Connecteurs(): JSX.Element {
   onMount(() => {
     refreshIndex();
     void refreshPermissions();
-    const t = setInterval(() => {
-      refreshIndex();
-      void refreshPermissions();
-      void refetch();
-    }, 3000);
+    let polling = false;
+    let pollCount = 0;
+    const poll = async () => {
+      if (polling) return;
+      polling = true;
+      try {
+        await refreshIndex();
+        pollCount += 1;
+        // Le statut d'index reste fluide à 5 s. Le statut OAuth (qui consulte
+        // aussi le trousseau macOS) n'est sondé rapidement que pendant une
+        // connexion ; sinon 30 s suffisent et évitent les micro-blocages.
+        if (pendingAuth() || pollCount % 6 === 0) {
+          await Promise.resolve(refetch()).then((list: ConnectorInfo[] | null | undefined) => {
+          const waiting = pendingAuth();
+          const current = list?.find((connector) => connector.id === waiting);
+          if (current && (current.status === "authorized_only" || current.status === "syncing" || current.status === "connected" || current.last_error)) {
+            setPendingAuth(null);
+          }
+          });
+        }
+      } finally {
+        polling = false;
+      }
+    };
+    // Les autorisations natives ne changent pas spontanément pendant que la
+    // page est ouverte. Éviter leur resondage supprime des appels macOS et une
+    // activation de l'indexeur toutes les trois secondes.
+    const t = setInterval(() => void poll(), 5000);
     onCleanup(() => clearInterval(t));
     // L'écouteur doit être désabonné au démontage : il s'accumulait à chaque
     // visite de la page (audit §3).
@@ -71,19 +96,63 @@ export function Connecteurs(): JSX.Element {
     on("sync_progress", (raw) => {
       const p = raw?.payload ?? raw;
       if (p?.message) setMessage(p.message);
+      if (p?.connector) {
+        setSyncProgress((current) => ({
+          ...current,
+          [p.connector]: {
+            pct: Math.max(current[p.connector]?.pct ?? 0, Number(p.pct ?? 0)),
+            message: String(p.message ?? ""),
+          },
+        }));
+      }
     }).then((un) => (unlisten = un));
     onCleanup(() => unlisten?.());
   });
 
   const connect = async (id: string) => {
     try {
+      setPendingAuth(id);
       const r = await ipc.connectorConnect(id);
       if (r?.authorization_url) await openUrl(String(r.authorization_url));
       if (r?.message) setMessage(r.message);
       refetch();
     } catch (error: any) {
+      setPendingAuth(null);
       setMessage(error?.message ?? String(error));
     }
+  };
+
+  const sync = async (id: string) => {
+    try {
+      setSyncProgress((current) => ({ ...current, [id]: { pct: 1, message: "Préparation de la synchronisation…" } }));
+      setMessage(`Synchronisation ${id} en cours…`);
+      const request = ipc.connectorSync(id);
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      await refetch();
+      const result = await request;
+      setMessage(result.preparing
+        ? `${id === "google" ? "Google" : "Microsoft"} est accessible immédiatement. Le cache complet se prépare en arrière-plan.`
+        : `${id === "google" ? "Google" : "Microsoft"} synchronisé : ${result.mail} mail(s), ${result.files} fichier(s), ${result.events} événement(s).`);
+      await refetch();
+    } catch (error: any) {
+      setMessage(error?.message ?? String(error));
+      await refetch();
+    }
+  };
+
+  const formatLastSync = (value: number | null) => {
+    if (!value) return null;
+    return new Intl.DateTimeFormat("fr-FR", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }).format(new Date(value * 1000));
+  };
+  const friendlyError = (error: string | null) => {
+    if (!error) return "";
+    if (/401|invalid_grant|expired|réautorisation/i.test(error)) return "La session a expiré ou a été révoquée. Reconnecte le compte pour continuer.";
+    if (/403|insufficient|permission|scope/i.test(error)) return "Certaines autorisations nécessaires n’ont pas été accordées. Reconnecte le compte et accepte tous les accès demandés.";
+    if (/redirect_uri/i.test(error)) return "L’adresse de retour OAuth ne correspond pas à celle configurée chez le fournisseur.";
+    if (/client_secret.*missing/i.test(error)) return "Ce client Google exige son secret OAuth. Ajoute SYN_GOOGLE_CLIENT_SECRET dans .env, redémarre Syn, puis reconnecte le compte.";
+    if (/invalid_client/i.test(error)) return "Le client OAuth configuré n’est pas accepté par le fournisseur.";
+    if (/network|réseau|dns|connect/i.test(error)) return "Le service est temporairement inaccessible. Vérifie la connexion puis réessaie.";
+    return error.length > 240 ? `${error.slice(0, 237)}…` : error;
   };
 
   const services = () => (connectors() ?? []).filter((c) => BRAND_ICON[c.id] && c.id !== "apple");
@@ -129,9 +198,9 @@ export function Connecteurs(): JSX.Element {
             macOS ouvre Confidentialité et sécurité → Accès complet au disque. Active Syn puis reviens dans l’application.
           </div>
         </Show>
-        <Show when={indexStatus()?.running}>
+        <Show when={indexStatus()?.running && indexStatus()?.phase === "cataloging"}>
           <div class="sub" style={{ "margin-top": "8px", color: "var(--text-secondary)" }}>
-            Indexation en cours : {indexStatus()!.done}/{indexStatus()!.total}
+            Préparation rapide du catalogue : {indexStatus()!.done}/{indexStatus()!.total}
             <div class="progress-track">
               <div
                 class="progress-fill"
@@ -139,6 +208,23 @@ export function Connecteurs(): JSX.Element {
               />
             </div>
             <span class="mono muted">{indexStatus()!.current}</span>
+          </div>
+        </Show>
+        <Show when={indexStatus()?.catalog_ready}>
+          <div class="sub" style={{ "margin-top": "8px", color: "var(--text-secondary)" }}>
+            <Icon name="check" size={13} /> Fichiers disponibles immédiatement
+            <Show when={indexStatus()?.phase === "enriching"}> · enrichissement de tout le corpus en arrière-plan</Show>
+          </div>
+          <div class="sub" style={{ "margin-top": "8px", color: "var(--text-secondary)" }}>
+            Couverture sémantique : {indexStatus()!.coverage_pct.toFixed(1)} %
+            ({indexStatus()!.embedded_count}/{indexStatus()!.eligible_count} éléments éligibles)
+            <div class="progress-track">
+              <div class="progress-fill" style={{ width: `${Math.min(100, indexStatus()!.coverage_pct)}%` }} />
+            </div>
+            <span class="muted">
+              Index lexical : {indexStatus()!.lexical_count}/{indexStatus()!.eligible_count} · reprise FSEvents : {indexStatus()!.replayed_events} changement(s)
+              <Show when={(indexStatus()?.fallback_count ?? 0) > 0}> · {indexStatus()!.fallback_count} repli(s) catalogue</Show>
+            </span>
           </div>
         </Show>
         <Show when={(indexStatus()?.pending_embeddings ?? 0) > 0}>
@@ -213,36 +299,67 @@ export function Connecteurs(): JSX.Element {
       </div>
 
       <div class="section-label">Services externes</div>
-      <For each={services()}>
+      <div class="external-connectors">
+      <For each={services().filter((connector) => connector.id === "google" || connector.id === "microsoft")}>
         {(c: ConnectorInfo) => (
-          <div class="row-line" style={{ padding: "11px 12px" }}>
-            <span class="service">
+          <div class={`external-connector-card state-${c.status}`}>
+            <span class="external-connector-icon">
               <Icon name={BRAND_ICON[c.id]} size={20} />
             </span>
-            <span class="grow">
-              <b style={{ "text-transform": "capitalize" }}>{c.id}</b>
-              <Show when={c.detail}>
-                <span class="sub"> {EXTERNAL_DESCRIPTION[c.id] ?? c.detail}</span>
+            <div class="external-connector-content">
+              <div class="external-connector-heading">
+                <strong>{c.id === "google" ? "Google Workspace" : "Microsoft 365"}</strong>
+                <span class={`connector-status ${STATUS_LABEL[c.status]?.cls ?? ""}`}>
+                  <i />{STATUS_LABEL[c.status]?.label ?? c.status}
+                </span>
+              </div>
+              <p>{EXTERNAL_DESCRIPTION[c.id]}</p>
+              <Show when={c.status === "connected" && c.sync_summary}>
+                <div class="connector-meta"><Icon name="check" size={12} /> {c.sync_summary}<Show when={formatLastSync(c.last_sync)}> · dernière mise à jour {formatLastSync(c.last_sync)}</Show></div>
               </Show>
-            </span>
-            <span class={`pill-status ${STATUS_LABEL[c.status]?.cls ?? ""}`}>
-              {STATUS_LABEL[c.status]?.label ?? c.status}
-            </span>
-            <Show
-              when={c.status === "connected" || c.status === "authorized_only"}
-              fallback={
-                <button class="btn" disabled={c.status === "needs_configuration" || c.status === "syncing"} onClick={() => connect(c.id)}>
-                  {c.status === "needs_configuration" ? "Non disponible" : "Connecter"}
+              <Show when={c.status === "authorized_only"}>
+                <div class="connector-notice">Le compte est accessible. Syn prépare automatiquement son cache local en arrière-plan.</div>
+              </Show>
+              <Show when={c.last_error}>
+                <div class="connector-error"><Icon name="circle-alert" size={13} /><span>{friendlyError(c.last_error)}</span></div>
+              </Show>
+              <Show when={c.status === "syncing"}>
+                <div class="connector-progress">
+                  <div><span>{syncProgress()[c.id]?.message || "Synchronisation en cours…"}</span><b>{Math.round(syncProgress()[c.id]?.pct ?? 0)} %</b></div>
+                  <div class="progress-track"><div class="progress-fill" style={{ width: `${syncProgress()[c.id]?.pct ?? 4}%` }} /></div>
+                </div>
+              </Show>
+            </div>
+            <div class="external-connector-actions">
+              <Show when={c.status === "disconnected" || c.status === "needs_reauth"}>
+                <button class="btn primary connector-cta" disabled={pendingAuth() === c.id} onClick={() => connect(c.id)}>
+                  {pendingAuth() === c.id ? "Autorisation en cours…" : c.status === "needs_reauth" ? "Reconnecter" : "Connecter"}
                 </button>
-              }
-            >
-              <button class="btn" onClick={() => ipc.connectorDisconnect(c.id).then(() => refetch())}>
-                Déconnecter
-              </button>
-            </Show>
+              </Show>
+              <Show when={c.status === "authorized_only"}>
+                <button class="btn connector-secondary" onClick={() => sync(c.id)}>Actualiser le cache</button>
+              </Show>
+              <Show when={c.status === "connected"}>
+                <button class="btn connector-secondary" onClick={() => sync(c.id)}>Actualiser</button>
+              </Show>
+              <Show when={c.status === "syncing"}>
+                <button class="btn connector-secondary" disabled>Synchronisation…</button>
+              </Show>
+              <Show when={c.status === "connected" || c.status === "authorized_only"}>
+                <button class="connector-disconnect" onClick={() => ipc.connectorDisconnect(c.id).then(() => refetch())}>Déconnecter</button>
+              </Show>
+            </div>
           </div>
         )}
       </For>
+      </div>
+
+      <div class="section-label">Autres intégrations</div>
+      <div class="upcoming-connectors">
+        <For each={services().filter((connector) => connector.id !== "google" && connector.id !== "microsoft")}>
+          {(c) => <div><span class="external-connector-icon"><Icon name={BRAND_ICON[c.id]} size={18} /></span><span><b style={{ "text-transform": "capitalize" }}>{c.id}</b><small>{EXTERNAL_DESCRIPTION[c.id]}</small></span><em>Bientôt disponible</em></div>}
+        </For>
+      </div>
 
     </div>
   );

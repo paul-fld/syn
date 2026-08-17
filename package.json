@@ -8,7 +8,7 @@
     "build": "vite build",
     "typecheck": "tsc --noEmit",
     "check": "npm run typecheck && npm run build",
-    "tauri": "tauri"
+    "tauri": "set -a; test ! -f .env || . ./.env; set +a; tauri"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",

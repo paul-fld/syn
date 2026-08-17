@@ -34,8 +34,9 @@ impl RiskClass {
 pub fn classify(tool: &str, args: &Value) -> RiskClass {
     match tool {
         // Lectures
-        "memory.query" | "files.search" | "mail.search" | "calendar.list" | "tasks.list"
+        "memory.query" | "files.search" | "mail.search" | "cloud.search" | "calendar.list" | "tasks.list"
         | "commitments.list" | "people.context" | "photos.search" | "system.diagnose"
+        | "document.open" /* affiche un document déjà connu : ne modifie rien */
         | "files.reorganize" /* dry-run : produit un PLAN, ne déplace rien */ => RiskClass::Read,
 
         // Réversible local (preview + undo > demander à chaque fois)
@@ -44,9 +45,18 @@ pub fn classify(tool: &str, args: &Value) -> RiskClass {
         | "tasks.complete"
         | "memory.remember"
         | "files.move"
-        | "files.create_folder_and_move" => {
+        | "files.create_folder_and_move"
+        // Écriture de document : annulable (suppression du fichier créé,
+        // restauration de la version précédente). Un document déposé chez
+        // Google ou Microsoft sort en revanche de la machine : il reste
+        // réversible, mais avec un rayon externe.
+        | "document.write" => {
             RiskClass::ReversibleLocal
         }
+        "document.create" => match args.get("location").and_then(Value::as_str) {
+            Some("google") | Some("microsoft") => RiskClass::ReversibleExternal,
+            _ => RiskClass::ReversibleLocal,
+        },
 
         // Calendrier : privé = réversible quasi local ; avec invités = touche des
         // personnes externes → plancher (doc Connecteurs §2.2).
@@ -360,6 +370,41 @@ pub fn apply_undo(db: &Db, undo: &Value) -> Result<String> {
                 Ok(())
             })?;
             Ok("Élément supprimé.".into())
+        }
+        "delete_file" => {
+            let path = undo["path"]
+                .as_str()
+                .ok_or_else(|| AppError::Invalid("chemin manquant".into()))?;
+            let target = std::path::Path::new(path);
+            if target.is_file() {
+                std::fs::remove_file(target).map_err(|error| {
+                    AppError::Other(format!("suppression de {path} impossible : {error}"))
+                })?;
+            }
+            db.with(|c| {
+                c.execute(
+                    "DELETE FROM embeddings WHERE item_id IN
+                     (SELECT id FROM items WHERE source='files' AND source_ref=?1)",
+                    params![path],
+                )?;
+                c.execute(
+                    "DELETE FROM items WHERE source='files' AND source_ref=?1",
+                    params![path],
+                )?;
+                Ok(())
+            })?;
+            Ok(format!("Document supprimé : {path}."))
+        }
+        "restore_text_file" => {
+            let path = undo["path"]
+                .as_str()
+                .ok_or_else(|| AppError::Invalid("chemin manquant".into()))?;
+            crate::tools::documents::restore_text_file(
+                std::path::Path::new(path),
+                undo["previous"].as_str().unwrap_or_default(),
+                undo["backup"].as_str().map(std::path::Path::new),
+            )?;
+            Ok(format!("Version précédente de {path} restaurée."))
         }
         _ => Err(AppError::Invalid(
             "cette action ne peut pas être annulée".into(),

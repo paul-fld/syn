@@ -106,6 +106,31 @@ pub trait LlmClient: Send + Sync {
 
     async fn status(&self) -> LlmStatus;
 
+    /// Génère en diffusant les fragments au fil de l'eau dans `sink`.
+    ///
+    /// Le résultat final est identique à `generate` : seul le RESSENTI change,
+    /// et c'est justement ce que l'utilisateur mesure. Implémentation par
+    /// défaut : pas de diffusion, un seul bloc à la fin — un runtime qui ne
+    /// sait pas diffuser reste utilisable.
+    async fn generate_streaming(
+        &self,
+        system: &str,
+        messages: &[ChatMessage],
+        tools: &[ToolSpec],
+        params: GenParams,
+        _sink: tokio::sync::mpsc::UnboundedSender<String>,
+    ) -> Result<LlmResponse> {
+        self.generate(system, messages, tools, params).await
+    }
+
+    /// Charge les modèles en mémoire sans rien produire. Appelé au démarrage :
+    /// le coût de chargement (plusieurs secondes pour un modèle de 5 Go) est
+    /// alors payé pendant que l'utilisateur découvre l'interface, et non au
+    /// milieu de sa première question.
+    ///
+    /// Implémentation par défaut : sans objet pour les runtimes sans cache.
+    async fn warm_up(&self) {}
+
     /// Téléchargement d'un modèle (onboarding étape « mise en route ») — reprenable.
     async fn pull(
         &self,

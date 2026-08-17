@@ -95,18 +95,14 @@ impl AppState {
             key_hex: Arc::new(std::sync::Mutex::new(key_hex.to_string())),
         });
         *self.core.write().unwrap() = Some(core.clone());
-        // Toute portée déjà autorisée est vérifiée automatiquement à chaque
-        // démarrage. Une évolution de l'extracteur ou de l'index se propage
-        // donc sans demander à l'utilisateur de « réindexer » manuellement.
-        if !crate::connectors::files::folder_paths(&core.db)
-            .unwrap_or_default()
-            .is_empty()
-        {
-            let _ = core
-                .indexer
-                .tx
-                .send(crate::connectors::files::IndexJob::FullScan(None));
-        }
+        // Chargement des modèles dès le déverrouillage, en tâche de fond. Sans
+        // cela, c'est la première question de l'utilisateur qui attend que les
+        // poids montent en mémoire — le pire moment possible.
+        let warming = core.llm.clone();
+        tauri::async_runtime::spawn(async move { warming.warm_up().await });
+        // Aucun rescan au démarrage : Indexer rejoue FSEvents depuis le point
+        // de contrôle persistant et ne demande un catalogue de secours que si
+        // macOS déclare l'historique purgé ou invalide.
         // Sur macOS, Apple est intégré : si l'utilisateur a déjà accordé l'accès
         // à Mail et terminé l'onboarding, la synchronisation reprend sans faux login.
         if cfg!(target_os = "macos")

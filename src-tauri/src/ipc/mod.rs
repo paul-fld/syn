@@ -597,13 +597,51 @@ pub async fn connector_connect(state: State<'_, AppState>, id: String) -> Result
             }
         }
         "google" | "microsoft" | "slack" | "github" => {
-            connectors::oauth::start(&core.db, &id).await
+            let embed = crate::settings::load(&core.db)?.embed_model;
+            connectors::oauth::start(&core.db, &core.llm, &core.bus, &embed, &id).await
         }
         "files" | "system" => {
             connectors::set_status(&core.db, &id, &id, "connected")?;
             Ok(json!({"status": "connected"}))
         }
         _ => Err(AppError::NotFound(format!("connecteur inconnu : {id}"))),
+    }
+}
+
+#[tauri::command]
+pub async fn connector_sync(state: State<'_, AppState>, id: String) -> Result<Value> {
+    if !matches!(id.as_str(), "google" | "microsoft") {
+        return Err(AppError::Invalid(
+            "Ce connecteur ne propose pas cette synchronisation.".into(),
+        ));
+    }
+    let core = state.core()?;
+    connectors::set_status(&core.db, &id, &id, "syncing")?;
+    connectors::set_diagnostic(&core.db, &id, None, None)?;
+    let embed = crate::settings::load(&core.db)?.embed_model;
+    match connectors::external::sync(&id, &core.db, &core.llm, &core.bus, &embed).await {
+        Ok(result) => Ok(result),
+        Err(error) => {
+            let error_text = error.to_string();
+            let status = if error_text.contains("reconnect")
+                || error_text.contains("Réautorisation")
+                || error_text.contains("401")
+                || error_text.contains("403")
+                || error_text.contains("insufficient")
+            {
+                "needs_reauth"
+            } else {
+                "authorized_only"
+            };
+            let _ = connectors::set_status(&core.db, &id, &id, status);
+            let _ = connectors::set_diagnostic(&core.db, &id, Some(&error_text), None);
+            core.bus.emit(BusEvent::SyncProgress {
+                connector: id.clone(),
+                pct: 100.0,
+                message: Some(format!("Échec de la synchronisation : {error}")),
+            });
+            Err(error)
+        }
     }
 }
 
@@ -619,7 +657,17 @@ pub fn connector_disconnect(state: State<'_, AppState>, id: String) -> Result<()
         connectors::oauth::revoke_local(&id);
     }
     connectors::set_status(&core.db, &id, &id, "disconnected")?;
-    if id == "apple" {
+    if id == "google" || id == "microsoft" {
+        let prefix = format!("{id}:%");
+        core.db.with(|c| {
+            c.execute(
+                "UPDATE items SET status='removed' WHERE source_ref LIKE ?1",
+                [&prefix],
+            )?;
+            c.execute("DELETE FROM events WHERE source=?1", [&id])?;
+            Ok(())
+        })?;
+    } else if id == "apple" {
         core.db.with(|c| {
             c.execute("UPDATE items SET status='removed' WHERE source='mail'", [])?;
             Ok(())
@@ -710,7 +758,19 @@ pub fn set_settings(
             Ok(())
         })?;
     } else if !current.sensitive_consent && new_settings.sensitive_consent {
-        let _ = core.indexer.tx.send(files::IndexJob::FullScan(None));
+        let paths = core.db.with(|c| {
+            let mut statement = c.prepare(
+                "SELECT source_ref FROM items WHERE source='files'
+                 AND type='sensible_non_lu' AND status='active'",
+            )?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            let mut paths = Vec::new();
+            for row in rows {
+                paths.push(std::path::PathBuf::from(row?));
+            }
+            Ok(paths)
+        })?;
+        let _ = core.indexer.tx.send(files::IndexJob::Demand(paths));
     }
     core.indexer.paused.store(
         new_settings.indexing_paused,
@@ -808,12 +868,26 @@ pub fn files_activate_full_access(state: State<'_, AppState>) -> Result<Value> {
     let sensitive_was_disabled = !crate::settings::load(&core.db)?.sensitive_consent;
     crate::settings::set_key(&core.db, "sensitive_consent", &Value::Bool(true))?;
     let (root, started) = files::ensure_full_access_scope(&core.db)?;
-    if started || sensitive_was_disabled {
+    if started {
         core.indexer.watch_folder(std::path::Path::new(&root));
         let _ = core
             .indexer
             .tx
             .send(files::IndexJob::FullScan(Some(root.clone().into())));
+    } else if sensitive_was_disabled {
+        let paths = core.db.with(|c| {
+            let mut statement = c.prepare(
+                "SELECT source_ref FROM items WHERE source='files'
+                 AND type='sensible_non_lu' AND status='active'",
+            )?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            let mut paths = Vec::new();
+            for row in rows {
+                paths.push(std::path::PathBuf::from(row?));
+            }
+            Ok(paths)
+        })?;
+        let _ = core.indexer.tx.send(files::IndexJob::Demand(paths));
     }
     Ok(json!({"status":"granted", "root":root, "started":started || sensitive_was_disabled}))
 }
@@ -893,9 +967,7 @@ pub async fn files_search(
     query_text: String,
 ) -> Result<Vec<crate::retrieval::Retrieved>> {
     let core = state.core()?;
-    let mut results = crate::retrieval::search(&core.db, &core.llm, &query_text, 20).await?;
-    results.retain(|r| r.source == "files");
-    Ok(results)
+    crate::retrieval::search_lexical_source(&core.db, &query_text, 20, "files").await
 }
 
 #[tauri::command]
@@ -1378,12 +1450,6 @@ pub fn open_source(
     source_ref: String,
 ) -> Result<()> {
     let core = state.core()?;
-    let path = std::path::Path::new(&source_ref);
-    if !path.exists() {
-        return Err(AppError::NotFound(
-            "cette source n'est pas un fichier ouvrable".into(),
-        ));
-    }
     // Garde de périmètre (audit §2) : on n'ouvre que ce que Syn connaît —
     // un chemin indexé ou couvert par un dossier suivi. source_ref provient
     // de l'UI, donc indirectement du contenu indexé.
@@ -1395,12 +1461,34 @@ pub fn open_source(
         )
         .unwrap_or(false))
     })?;
+
+    use tauri_plugin_opener::OpenerExt;
+    // Un résultat Google Drive ou OneDrive s'ouvre dans le navigateur : son
+    // « chemin » est une URL, jamais un fichier local. Sans ce cas, cliquer le
+    // nom d'un document cloud échouait en silence.
+    if source_ref.starts_with("https://") || source_ref.starts_with("http://") {
+        if !known {
+            return Err(AppError::Security(
+                "ce lien ne provient pas d'un document connu de Syn".into(),
+            ));
+        }
+        return app
+            .opener()
+            .open_url(source_ref, None::<String>)
+            .map_err(|e| AppError::Other(e.to_string()));
+    }
+
+    let path = std::path::Path::new(&source_ref);
+    if !path.exists() {
+        return Err(AppError::NotFound(
+            "cette source n'est pas un fichier ouvrable".into(),
+        ));
+    }
     if !known && !files::is_path_in_active_scope(&core.db, path)? {
         return Err(AppError::Security(
             "ce chemin est hors du périmètre suivi par Syn".into(),
         ));
     }
-    use tauri_plugin_opener::OpenerExt;
     app.opener()
         .open_path(source_ref, None::<String>)
         .map_err(|e| AppError::Other(e.to_string()))?;

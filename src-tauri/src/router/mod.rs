@@ -3,6 +3,9 @@
 //! appelé À L'INTÉRIEUR de la boucle. La confirmation est un point d'arrêt
 //! DANS la boucle (plancher humain), pas une couche UI par-dessus.
 
+#[cfg(test)]
+pub mod eval;
+pub mod intent;
 pub mod prompt;
 
 use crate::actions;
@@ -76,10 +79,51 @@ pub async fn handle_query_with_context(
         .collect::<Vec<_>>()
         .join("\n");
 
-    let device_only = is_device_diagnostic_query(user_text);
-    let file_request = resolve_file_search_request(user_text, &convo);
+    // Compréhension de l'intention. Les portes à mots-clés qui suivent ne
+    // servent plus qu'à tenir le service quand le modèle local est arrêté :
+    // exiger « cherche » ou « document » pour comprendre une demande revenait à
+    // ne servir que les utilisateurs qui parlent comme le code est écrit.
+    let keyword_request = resolve_file_search_request(user_text, &convo);
+    let understood = intent::classify(
+        &core.llm,
+        user_text,
+        intent::fallback(
+            user_text,
+            keyword_request.clone(),
+            match file_search_scope(user_text) {
+                FileSearchScope::Cloud(Some("google")) => intent::Scope::Google,
+                FileSearchScope::Cloud(Some("microsoft")) => intent::Scope::Microsoft,
+                FileSearchScope::Cloud(_) => intent::Scope::AnyCloud,
+                FileSearchScope::Local => intent::Scope::Local,
+                FileSearchScope::Federated(_) => intent::Scope::Any,
+            },
+            is_device_diagnostic_query(user_text),
+            is_mail_composition_query(user_text),
+        ),
+    )
+    .await;
+
+    // Une correction (« ces fichiers n'ont rien à voir ») reste traitée par la
+    // continuité de conversation : elle porte sur la recherche précédente, pas
+    // sur une intention nouvelle.
+    let correction = keyword_request
+        .as_ref()
+        .filter(|(_, is_correction)| *is_correction)
+        .cloned();
+    let file_request = match (&correction, understood.kind) {
+        (Some(correction), _) => Some(correction.clone()),
+        (None, intent::Kind::FileSearch) => Some((
+            understood
+                .subject
+                .clone()
+                .unwrap_or_else(|| requested_document_query(user_text)),
+            false,
+        )),
+        _ => None,
+    };
+    let device_only = understood.kind == intent::Kind::DeviceDiagnostic;
     let file_search = file_request.is_some();
-    let mail_composition = is_mail_composition_query(user_text)
+    let mail_composition = understood.kind == intent::Kind::MailCompose
         || (is_mail_content_followup(user_text)
             && trusted_user_history.lines().any(is_mail_composition_query));
     emit_progress(
@@ -109,6 +153,7 @@ pub async fn handle_query_with_context(
             core,
             session_id,
             &query,
+            understood.scope,
             is_correction,
             settings.voice.formality == "vous",
         )
@@ -247,9 +292,23 @@ pub async fn handle_query_with_context(
             5,
             "running",
         );
-        let resp = match core
+        // Diffusion au fil de l'eau : l'utilisateur voit la réponse s'écrire au
+        // lieu d'attendre un bloc. Le relais est refermé à la fin de l'étape,
+        // ce qui termine la tâche d'émission sans la laisser filer.
+        let (sink, mut deltas) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let delta_bus = core.bus.clone();
+        let delta_session = session_id.to_string();
+        let relay = tauri::async_runtime::spawn(async move {
+            while let Some(delta) = deltas.recv().await {
+                delta_bus.emit(BusEvent::AnswerDelta {
+                    session_id: delta_session.clone(),
+                    delta,
+                });
+            }
+        });
+        let generated = core
             .llm
-            .generate(
+            .generate_streaming(
                 &system,
                 &messages,
                 &catalog,
@@ -258,9 +317,11 @@ pub async fn handle_query_with_context(
                     max_tokens: Some(1200),
                     json: false,
                 },
+                sink,
             )
-            .await
-        {
+            .await;
+        relay.await.ok();
+        let resp = match generated {
             Ok(r) => r,
             Err(e) => {
                 // Mode dégradé (doc maître §22) : le retrieval fonctionne,
@@ -643,6 +704,9 @@ fn is_file_search_query(text: &str) -> bool {
         "trouve",
         "retrouve",
         "retrouver",
+        "ressors",
+        "ressortir",
+        "ouvre",
         "ou est",
         "localise",
     ]
@@ -661,6 +725,13 @@ fn is_file_search_query(text: &str) -> bool {
         "rapport",
         "presentation",
         "tableur",
+        "word",
+        "excel",
+        "powerpoint",
+        "power point",
+        "google docs",
+        "google slides",
+        "google sheets",
         "note",
     ]
     .iter()
@@ -742,14 +813,109 @@ fn file_search_variants(query: &str) -> Vec<String> {
     Vec::new()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileSearchScope {
+    Local,
+    Cloud(Option<&'static str>),
+    /// Aucun emplacement imposé : toutes les sources sont interrogées. Le
+    /// fournisseur optionnel n'est qu'un signal de classement (ex. Word).
+    Federated(Option<&'static str>),
+}
+
+fn file_search_scope(query: &str) -> FileSearchScope {
+    let folded = crate::db::fold(query);
+    if folded.contains("google docs")
+        || folded.contains("google doc")
+        || folded.contains("google slides")
+        || folded.contains("google sheets")
+        || folded.contains("google drive")
+        || folded.contains("dans drive")
+    {
+        FileSearchScope::Cloud(Some("google"))
+    } else if folded.contains("onedrive")
+        || folded.contains("microsoft 365")
+        || folded.contains("sharepoint")
+    {
+        FileSearchScope::Cloud(Some("microsoft"))
+    } else if folded.contains("dans le cloud") || folded.contains("sur le cloud") {
+        FileSearchScope::Cloud(None)
+    } else if folded.contains("sur mon mac")
+        || folded.contains("sur mon disque")
+        || folded.contains("sur le disque")
+        || folded.contains("en local")
+        || folded.contains("fichier local")
+    {
+        FileSearchScope::Local
+    } else if ["word", "excel", "powerpoint", "power point"]
+        .iter()
+        .any(|product| folded.contains(product))
+    {
+        FileSearchScope::Federated(Some("microsoft"))
+    } else {
+        FileSearchScope::Federated(None)
+    }
+}
+
+/// Extrait le sujet du document sans transmettre à Drive toute la phrase
+/// conversationnelle ("peux-tu me ressortir… qui se trouve dans…").
+fn requested_document_query(query: &str) -> String {
+    // Segmentation par classes de mots : aucune tournure n'est énumérée ici, la
+    // même règle vaut pour « ressors-moi le document du X qui se trouve dans mes
+    // Google Docs » que pour « where is the Q3 forecast ».
+    if let Some(subject) = retrieval::subject_span(query) {
+        if subject.chars().count() >= 2 {
+            return subject;
+        }
+    }
+    // Aucun mot porteur (« ouvre-le », « et celui-là ? ») : on rend la demande
+    // telle quelle plutôt que d'inventer un sujet.
+    query.trim().to_string()
+}
+
+/// `query` est ici le SUJET déjà extrait de la demande, et `scope` la portée
+/// que l'utilisateur a lui-même nommée. Ni l'un ni l'autre n'est re-dérivé de
+/// la phrase : la compréhension a eu lieu une fois, en amont.
 async fn answer_file_search(
     core: &Core,
     session_id: &str,
     query: &str,
+    scope: intent::Scope,
     is_correction: bool,
     formal: bool,
 ) -> Result<Answer> {
-    let mut results = retrieval::search_source(&core.db, &core.llm, query, 8, "files").await?;
+    let resolved = match scope {
+        intent::Scope::Google => FileSearchScope::Cloud(Some("google")),
+        intent::Scope::Microsoft => FileSearchScope::Cloud(Some("microsoft")),
+        intent::Scope::AnyCloud => FileSearchScope::Cloud(None),
+        intent::Scope::Local => FileSearchScope::Local,
+        intent::Scope::Any => FileSearchScope::Federated(None),
+    };
+    match resolved {
+        FileSearchScope::Cloud(provider) => {
+            return answer_cloud_file_search(
+                core,
+                session_id,
+                query,
+                provider,
+                is_correction,
+                formal,
+            )
+            .await;
+        }
+        FileSearchScope::Federated(preferred) => {
+            return answer_federated_file_search(
+                core,
+                session_id,
+                query,
+                preferred,
+                is_correction,
+                formal,
+            )
+            .await;
+        }
+        FileSearchScope::Local => {}
+    }
+    let mut results = retrieval::search_lexical_source(&core.db, query, 8, "files").await?;
     filter_file_domain(query, &mut results);
 
     // Filet de sécurité immédiat pendant la construction de l'index : cherche
@@ -757,11 +923,14 @@ async fn answer_file_search(
     // leur ingestion. Aucun chemin utilisateur ni cas métier n'est codé ici.
     let roots = crate::connectors::files::folder_paths(&core.db)?;
     let keywords = retrieval::keywords(query);
-    let mut live_results = tokio::task::spawn_blocking(move || {
+    let live_search = tokio::task::spawn_blocking(move || {
         crate::connectors::files::live_metadata_search(&roots, &keywords, 12)
-    })
-    .await
-    .unwrap_or_default();
+    });
+    let mut live_results =
+        match tokio::time::timeout(std::time::Duration::from_millis(1_200), live_search).await {
+            Ok(Ok(results)) => results,
+            _ => Vec::new(),
+        };
     filter_file_domain(query, &mut live_results);
     if !live_results.is_empty() {
         let live_paths = live_results
@@ -771,7 +940,7 @@ async fn answer_file_search(
         let _ = core
             .indexer
             .tx
-            .send(crate::connectors::files::IndexJob::Paths(live_paths));
+            .send(crate::connectors::files::IndexJob::Demand(live_paths));
         // Recherche en niveaux : une correspondance explicite dans le nom ou
         // le dossier est une preuve plus forte qu'une occurrence aperçue dans
         // le contenu ou l'OCR d'une capture. Mélanger les deux niveaux recréait
@@ -785,9 +954,7 @@ async fn answer_file_search(
     if results.is_empty() {
         let mut by_id = std::collections::HashMap::new();
         for variant in file_search_variants(query) {
-            for result in
-                retrieval::search_source(&core.db, &core.llm, &variant, 4, "files").await?
-            {
+            for result in retrieval::search_lexical_source(&core.db, &variant, 4, "files").await? {
                 if !file_matches_requested_domain(query, &result) {
                     continue;
                 }
@@ -811,6 +978,32 @@ async fn answer_file_search(
     }
 
     crate::security::log_access(&core.db, "files", "search", Some(query));
+    // La réponse lexicale part immédiatement. La voie sémantique est calculée
+    // derrière un budget et streamée ensuite vers la conversation.
+    let semantic_db = core.db.clone();
+    let semantic_llm = core.llm.clone();
+    let semantic_bus = core.bus.clone();
+    let semantic_query = query.to_string();
+    let semantic_session = session_id.to_string();
+    tauri::async_runtime::spawn(async move {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+        for pass in 0..2 {
+            if let Ok(Ok(results)) = tokio::time::timeout_at(
+                deadline,
+                retrieval::search_source(&semantic_db, &semantic_llm, &semantic_query, 8, "files"),
+            )
+            .await
+            {
+                semantic_bus.emit(BusEvent::SemanticResults {
+                    session_id: semantic_session.clone(),
+                    results,
+                });
+            }
+            if pass == 0 && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+            }
+        }
+    });
     let status = core.indexer.status(&core.db)?;
     let correction_prefix = if is_correction {
         if formal {
@@ -892,6 +1085,375 @@ async fn answer_file_search(
         text,
         sources: results,
         pending_actions,
+        session_id: session_id.into(),
+        degraded: false,
+    })
+}
+
+/// Fait entrer un résultat live dans le cache : il devient ouvrable (la garde de
+/// périmètre d'`open_source` ne connaît que les objets indexés) et sa file
+/// d'enrichissement téléchargera son contenu.
+async fn remember_live_cloud(core: &Core, value: &serde_json::Value) {
+    let settings = match crate::settings::load(&core.db) {
+        Ok(settings) => settings,
+        Err(_) => return,
+    };
+    let _ = crate::connectors::external::remember_live_result(
+        &core.db,
+        &core.llm,
+        &core.bus,
+        &settings.embed_model,
+        value,
+    )
+    .await;
+}
+
+fn retrieved_from_live_cloud(value: &serde_json::Value) -> Option<retrieval::Retrieved> {
+    let source_ref = value["source_ref"].as_str()?;
+    Some(retrieval::Retrieved {
+        item_id: value["item_id"].as_str().unwrap_or(source_ref).to_string(),
+        source: "cloud".into(),
+        source_ref: source_ref.to_string(),
+        title: value["title"]
+            .as_str()
+            .unwrap_or("Document cloud")
+            .to_string(),
+        path: value["path"].as_str().map(str::to_string),
+        snippet: value["snippet"].as_str().unwrap_or_default().to_string(),
+        // Le connecteur classe déjà ses résultats par correspondance de titre ;
+        // un score plat ferait remonter le premier venu au-dessus du bon.
+        score: value["score"].as_f64().unwrap_or(5.0) as f32,
+    })
+}
+
+async fn answer_federated_file_search(
+    core: &Core,
+    session_id: &str,
+    query: &str,
+    preferred_provider: Option<&'static str>,
+    is_correction: bool,
+    formal: bool,
+) -> Result<Answer> {
+    let target = query.to_string();
+    let roots = crate::connectors::files::folder_paths(&core.db)?;
+    let keywords = retrieval::keywords(&target);
+    let disk_search = tokio::task::spawn_blocking(move || {
+        crate::connectors::files::live_metadata_search(&roots, &keywords, 12)
+    });
+    let local_future = retrieval::search_lexical_source(&core.db, &target, 12, "files");
+    let cloud_future = retrieval::search_lexical_source(&core.db, &target, 12, "cloud");
+    let live_cloud_future = tokio::time::timeout(
+        std::time::Duration::from_secs(6),
+        crate::connectors::external::live_search("cloud", &target),
+    );
+    let (local, cloud, disk, live_cloud) = tokio::join!(
+        local_future,
+        cloud_future,
+        tokio::time::timeout(std::time::Duration::from_millis(1_200), disk_search),
+        live_cloud_future,
+    );
+
+    let mut candidates = local?;
+    filter_file_domain(&target, &mut candidates);
+    let mut live_paths = Vec::new();
+    if let Ok(Ok(mut disk_results)) = disk {
+        filter_file_domain(&target, &mut disk_results);
+        live_paths.extend(
+            disk_results
+                .iter()
+                .map(|result| std::path::PathBuf::from(&result.source_ref)),
+        );
+        candidates.extend(disk_results);
+    }
+    if !live_paths.is_empty() {
+        let _ = core
+            .indexer
+            .tx
+            .send(crate::connectors::files::IndexJob::Demand(live_paths));
+    }
+    candidates.extend(cloud?);
+    if let Ok(values) = live_cloud {
+        for value in &values {
+            remember_live_cloud(core, value).await;
+        }
+        candidates.extend(values.iter().filter_map(retrieved_from_live_cloud));
+    }
+
+    let mut by_ref = std::collections::HashMap::new();
+    for mut candidate in candidates {
+        if preferred_provider.is_some_and(|provider| candidate.source_ref.starts_with(provider)) {
+            candidate.score += 1.0;
+        }
+        by_ref
+            .entry(candidate.source_ref.clone())
+            .and_modify(|old: &mut retrieval::Retrieved| {
+                if candidate.score > old.score {
+                    *old = candidate.clone();
+                }
+            })
+            .or_insert(candidate);
+    }
+    let mut results = by_ref.into_values().collect::<Vec<_>>();
+    results.sort_by(|left, right| {
+        right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    results.truncate(8);
+
+    // Une seconde vague sémantique couvre les formulations conceptuelles. Les
+    // deux index sont interrogés, toujours hors du chemin de réponse.
+    let semantic_db = core.db.clone();
+    let semantic_llm = core.llm.clone();
+    let semantic_bus = core.bus.clone();
+    let semantic_query = target.clone();
+    let semantic_session = session_id.to_string();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        let (local, cloud) = tokio::join!(
+            retrieval::search_source(&semantic_db, &semantic_llm, &semantic_query, 8, "files"),
+            retrieval::search_source(&semantic_db, &semantic_llm, &semantic_query, 8, "cloud"),
+        );
+        let mut streamed = local.unwrap_or_default();
+        streamed.extend(cloud.unwrap_or_default());
+        if let Some(provider) = preferred_provider {
+            for result in &mut streamed {
+                if result.source_ref.starts_with(provider) {
+                    result.score += 1.0;
+                }
+            }
+        }
+        streamed.sort_by(|left, right| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        streamed.truncate(8);
+        semantic_bus.emit(BusEvent::SemanticResults {
+            session_id: semantic_session,
+            results: streamed,
+        });
+    });
+
+    crate::security::log_access(&core.db, "federated", "search", Some(&target));
+    let correction = if is_correction {
+        if formal {
+            "Vous avez raison : j’ai relancé la recherche dans toutes vos sources disponibles.\n\n"
+        } else {
+            "Tu as raison : j’ai relancé la recherche dans toutes tes sources disponibles.\n\n"
+        }
+    } else {
+        ""
+    };
+    let text = if results.is_empty() {
+        format!(
+            "{correction}Je n’ai trouvé aucun document suffisamment pertinent pour « {target} » sur le Mac, Google Drive ou OneDrive. Les connecteurs absents ou déconnectés ont été ignorés, sans générer de faux résultat."
+        )
+    } else {
+        let mut body = format!(
+            "{correction}J’ai cherché sur le Mac, Google Drive et OneDrive et trouvé {} document{} pertinent{} :\n",
+            results.len(),
+            if results.len() > 1 { "s" } else { "" },
+            if results.len() > 1 { "s" } else { "" },
+        );
+        for (index, result) in results.iter().enumerate() {
+            let location = if result.source_ref.starts_with("google:drive:") {
+                "Google Drive"
+            } else if result.source_ref.starts_with("microsoft:drive:") {
+                "OneDrive"
+            } else {
+                "Mac"
+            };
+            let path = result.path.as_deref().unwrap_or(&result.source_ref);
+            body.push_str(&format!(
+                "\n{}. **{}** — {} — {}",
+                index + 1,
+                result.title,
+                location,
+                path
+            ));
+        }
+        body.push_str(if formal {
+            "\n\nCliquez sur le nom du document pour l’ouvrir."
+        } else {
+            "\n\nClique sur le nom du document pour l’ouvrir."
+        });
+        body
+    };
+    memory::persist_turn(&core.db, session_id, "assistant", &text)?;
+    emit_progress(
+        core,
+        session_id,
+        "complete",
+        if results.is_empty() {
+            "Recherche fédérée terminée sans résultat"
+        } else {
+            "Recherche fédérée terminée"
+        },
+        Some("Mac · Google Drive · OneDrive".into()),
+        5,
+        5,
+        "done",
+    );
+    Ok(Answer {
+        text,
+        sources: results,
+        pending_actions: Vec::new(),
+        session_id: session_id.into(),
+        degraded: false,
+    })
+}
+
+async fn answer_cloud_file_search(
+    core: &Core,
+    session_id: &str,
+    query: &str,
+    provider: Option<&'static str>,
+    is_correction: bool,
+    formal: bool,
+) -> Result<Answer> {
+    // `query` est déjà le sujet compris ; le re-découper reviendrait à faire
+    // confiance à la forme de la phrase après l'avoir justement abandonnée.
+    let target = query.to_string();
+    let mut results = retrieval::search_lexical_source(&core.db, &target, 12, "cloud").await?;
+    if let Some(provider) = provider {
+        let prefix = format!("{provider}:drive:");
+        results.retain(|result| result.source_ref.starts_with(&prefix));
+    }
+
+    // Un fournisseur lent ne doit pas faire échouer la réponse : le cache local
+    // reste affichable, et le dépassement devient un diagnostic dans le texte.
+    let live = match provider {
+        Some(provider) => tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            crate::connectors::external::live_search_provider("cloud", &target, provider),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(crate::error::AppError::Other(
+                "la recherche cloud a dépassé 15 secondes".into(),
+            ))
+        }),
+        None => Ok(crate::connectors::external::live_search("cloud", &target).await),
+    };
+    let live_error = live.as_ref().err().map(ToString::to_string);
+    if let Ok(values) = live {
+        for value in values {
+            let Some(source_ref) = value["source_ref"].as_str() else {
+                continue;
+            };
+            remember_live_cloud(core, &value).await;
+            if results.iter().any(|result| result.source_ref == source_ref) {
+                continue;
+            }
+            if let Some(result) = retrieved_from_live_cloud(&value) {
+                results.push(result);
+            }
+        }
+    }
+    results.sort_by(|left, right| {
+        right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    results.truncate(8);
+
+    // Le cache sémantique complète ensuite la réponse, mais reste strictement
+    // limité au fournisseur demandé : aucun fichier local ne peut s'y glisser.
+    let semantic_db = core.db.clone();
+    let semantic_llm = core.llm.clone();
+    let semantic_bus = core.bus.clone();
+    let semantic_query = target.clone();
+    let semantic_session = session_id.to_string();
+    tauri::async_runtime::spawn(async move {
+        if let Ok(Ok(mut semantic)) = tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            retrieval::search_source(&semantic_db, &semantic_llm, &semantic_query, 8, "cloud"),
+        )
+        .await
+        {
+            if let Some(provider) = provider {
+                let prefix = format!("{provider}:drive:");
+                semantic.retain(|result| result.source_ref.starts_with(&prefix));
+            }
+            semantic_bus.emit(BusEvent::SemanticResults {
+                session_id: semantic_session,
+                results: semantic,
+            });
+        }
+    });
+
+    crate::security::log_access(
+        &core.db,
+        provider.unwrap_or("cloud"),
+        "live_search",
+        Some(&target),
+    );
+    let correction = if is_correction {
+        if formal {
+            "Vous avez raison : j’ai limité cette nouvelle recherche au connecteur demandé.\n\n"
+        } else {
+            "Tu as raison : j’ai limité cette nouvelle recherche au connecteur demandé.\n\n"
+        }
+    } else {
+        ""
+    };
+    let service = match provider {
+        Some("google") => "Google Drive",
+        Some("microsoft") => "OneDrive",
+        _ => "vos services cloud",
+    };
+    let text = if results.is_empty() {
+        let diagnostic = live_error
+            .map(|error| format!(" La recherche directe a échoué : {error}"))
+            .unwrap_or_default();
+        format!(
+            "{correction}Je n’ai trouvé aucun document correspondant à « {target} » dans {service}.{diagnostic} Je n’affiche pas de fichiers locaux, car ils ne font pas partie du périmètre demandé."
+        )
+    } else {
+        let mut body = format!(
+            "{correction}J’ai trouvé {} document{} dans {service} :\n",
+            results.len(),
+            if results.len() > 1 { "s" } else { "" }
+        );
+        for (index, result) in results.iter().enumerate() {
+            let location = result.path.as_deref().unwrap_or(&result.source_ref);
+            body.push_str(&format!(
+                "\n{}. **{}** — {}",
+                index + 1,
+                result.title,
+                location
+            ));
+        }
+        body.push_str(if formal {
+            "\n\nCliquez sur le nom du document pour l’ouvrir."
+        } else {
+            "\n\nClique sur le nom du document pour l’ouvrir."
+        });
+        body
+    };
+    memory::persist_turn(&core.db, session_id, "assistant", &text)?;
+    emit_progress(
+        core,
+        session_id,
+        "complete",
+        if results.is_empty() {
+            "Recherche cloud terminée sans résultat"
+        } else {
+            "Documents cloud pertinents trouvés"
+        },
+        Some(format!("Source : {service}")),
+        5,
+        5,
+        "done",
+    );
+    Ok(Answer {
+        text,
+        sources: results,
+        pending_actions: Vec::new(),
         session_id: session_id.into(),
         degraded: false,
     })
@@ -1494,9 +2056,10 @@ fn degraded_answer(ctx: &retrieval::ContextBundle, error: &str) -> String {
 mod intent_tests {
     use super::{
         cited_sources, expected_folder_from_query, explicit_action_intent,
-        file_matches_requested_domain, is_device_diagnostic_query, is_explicit_chat_confirmation,
-        is_file_search_query, mail_request_missing_content, mail_send_preflight,
-        resolve_file_search_request, screen_context_text,
+        file_matches_requested_domain, file_search_scope, is_device_diagnostic_query,
+        is_explicit_chat_confirmation, is_file_search_query, mail_request_missing_content,
+        mail_send_preflight, requested_document_query, resolve_file_search_request,
+        screen_context_text, FileSearchScope,
     };
     use crate::db::Db;
     use crate::retrieval::Retrieved;
@@ -1527,6 +2090,75 @@ mod intent_tests {
             "Tu peux ranger le dossier USA dans Photos de famille ?",
             "files.move"
         ));
+    }
+
+    #[test]
+    fn google_docs_reste_un_perimetre_cloud_strict() {
+        let query = "Tu peux me ressortir le document du Jeu de la Vie qui se trouve dans mes Google Docs ?";
+        assert_eq!(
+            file_search_scope(query),
+            FileSearchScope::Cloud(Some("google"))
+        );
+        assert_eq!(requested_document_query(query), "Jeu de la Vie");
+        assert_eq!(
+            file_search_scope("Retrouve mon contrat dans OneDrive"),
+            FileSearchScope::Cloud(Some("microsoft"))
+        );
+        assert_eq!(
+            file_search_scope("Retrouve mon contrat sur le disque"),
+            FileSearchScope::Local
+        );
+        assert_eq!(
+            file_search_scope("Retrouve mon contrat de location"),
+            FileSearchScope::Federated(None)
+        );
+        assert_eq!(
+            file_search_scope("Retrouve le document Word du budget"),
+            FileSearchScope::Federated(Some("microsoft"))
+        );
+        // L'expression est rendue telle que l'utilisateur l'a écrite, liaisons
+        // internes comprises : « contrat de location » peut être le titre exact
+        // d'un fichier, « contrat location » ne l'est jamais.
+        assert_eq!(
+            requested_document_query("Peux-tu retrouver mon contrat de location ?"),
+            "contrat de location"
+        );
+    }
+
+    /// Aucune de ces demandes n'est prévue par le code : elles n'ont ni verbe,
+    /// ni tournure, ni langue en commun. C'est la garde contre une correction
+    /// qui ne vaudrait que pour l'exemple ayant servi à la trouver.
+    #[test]
+    fn le_sujet_est_extrait_sans_connaitre_la_tournure() {
+        for (demande, sujet) in [
+            (
+                "Tu peux me ressortir le document du Jeu de la Vie qui se trouve dans mes Google Docs ?",
+                "Jeu de la Vie",
+            ),
+            (
+                "cherche le rapport de stage de Maxime dans mon OneDrive",
+                "rapport de stage de Maxime",
+            ),
+            (
+                "montre-moi le tableur du budget prévisionnel 2027",
+                "tableur du budget prévisionnel 2027",
+            ),
+            ("Where is the Q3 revenue forecast?", "Q3 revenue forecast"),
+            (
+                "ouvre le vade_mecum des sections européennes",
+                "vade_mecum des sections européennes",
+            ),
+            (
+                "il me faudrait la convention collective Syntec, stp",
+                "convention collective Syntec",
+            ),
+            ("Cours 2", "Cours 2"),
+        ] {
+            assert_eq!(requested_document_query(demande), sujet, "« {demande} »");
+        }
+
+        // Une demande sans aucun mot porteur ne doit pas fabriquer un sujet.
+        assert_eq!(requested_document_query("ouvre-le stp"), "ouvre-le stp");
     }
 
     #[test]
@@ -1570,6 +2202,10 @@ mod intent_tests {
     fn une_recherche_de_quittance_est_bien_une_recherche_de_fichier() {
         assert!(is_file_search_query(
             "Je cherche un document lié à ma quittance de loyer, tu peux me le retrouver ?"
+        ));
+        assert!(is_file_search_query("Ressors-moi le Word du budget 2026"));
+        assert!(is_file_search_query(
+            "Ouvre la présentation PowerPoint du comité"
         ));
         assert!(!is_file_search_query("Explique-moi le projet Aberration"));
     }
@@ -1715,5 +2351,150 @@ mod intent_tests {
         assert!(text.contains("fenêtres de Syn : Code"));
         assert!(text.contains("présence du mot « Syn »"));
         assert!(text.contains("Visual Studio Code"));
+    }
+}
+
+#[cfg(test)]
+mod routing_eval {
+    use super::eval::{Route, CORPUS, VALIDATION};
+    use super::*;
+
+    /// Aiguillage tel qu'il est décidé aujourd'hui dans `handle_query_with_context`,
+    /// reproduit à l'identique et dans le même ordre.
+    fn route_actuelle(text: &str) -> Route {
+        if is_device_diagnostic_query(text) {
+            return Route::DeviceDiagnostic;
+        }
+        if resolve_file_search_request(text, &[]).is_some() {
+            return match file_search_scope(text) {
+                FileSearchScope::Cloud(Some("google")) => Route::FileSearchGoogle,
+                FileSearchScope::Cloud(Some("microsoft")) => Route::FileSearchMicrosoft,
+                FileSearchScope::Local => Route::FileSearchLocal,
+                _ => Route::FileSearch,
+            };
+        }
+        if is_mail_composition_query(text) {
+            return Route::MailCompose;
+        }
+        // Tout le reste part dans la boucle agentique : le modèle choisit seul
+        // s'il appelle un outil. Pour la mesure, c'est « Conversation ».
+        Route::Conversation
+    }
+
+    /// Une portée non demandée n'est pas une erreur de même gravité qu'une
+    /// intention manquée : on compte les deux, séparément.
+    fn meme_famille(a: Route, b: Route) -> bool {
+        let famille = |route: Route| match route {
+            Route::FileSearch
+            | Route::FileSearchGoogle
+            | Route::FileSearchMicrosoft
+            | Route::FileSearchLocal => 0,
+            Route::MailCompose => 1,
+            Route::DeviceDiagnostic => 2,
+            Route::DocumentCreate => 3,
+            Route::Conversation => 4,
+        };
+        famille(a) == famille(b)
+    }
+
+    #[test]
+    fn mesure_du_taux_derreur_de_routage() {
+        let mut intention_ratee = Vec::new();
+        let mut portee_ratee = Vec::new();
+        for case in CORPUS {
+            let obtenue = route_actuelle(case.text);
+            if !meme_famille(obtenue, case.expected) {
+                intention_ratee.push((case, obtenue));
+            } else if obtenue != case.expected {
+                portee_ratee.push((case, obtenue));
+            }
+        }
+        let total = CORPUS.len();
+        println!("\n╭─ Routage : {total} demandes du corpus");
+        println!("│  intention manquée : {} ({:.0} %)", intention_ratee.len(),
+                 100.0 * intention_ratee.len() as f64 / total as f64);
+        println!("│  portée manquée    : {} ({:.0} %)", portee_ratee.len(),
+                 100.0 * portee_ratee.len() as f64 / total as f64);
+        println!("╰─ total erroné      : {} ({:.0} %)",
+                 intention_ratee.len() + portee_ratee.len(),
+                 100.0 * (intention_ratee.len() + portee_ratee.len()) as f64 / total as f64);
+        println!("\n  Intentions manquées :");
+        for (case, obtenue) in &intention_ratee {
+            println!("   ✗ {:?} au lieu de {:?}  « {} »\n       ({})",
+                     obtenue, case.expected, case.text, case.note);
+        }
+        println!("\n  Portées manquées :");
+        for (case, obtenue) in &portee_ratee {
+            println!("   ~ {:?} au lieu de {:?}  « {} »", obtenue, case.expected, case.text);
+        }
+        println!();
+    }
+
+    /// Mesure la compréhension du modèle local sur le même corpus. Ignoré si
+    /// Ollama n'est pas joignable : le secours déterministe reste mesuré par le
+    /// test ci-dessus, et le contrat produit suppose le modèle disponible.
+    #[tokio::test]
+    async fn mesure_du_taux_derreur_avec_comprehension() {
+        let llm: std::sync::Arc<dyn crate::llm::LlmClient> =
+            std::sync::Arc::new(crate::llm::ollama::OllamaClient::new(
+                "http://127.0.0.1:11434",
+                "llama3.1:latest",
+                "nomic-embed-text",
+                std::sync::Arc::new(crate::security::egress::EgressGuard::new()),
+            ));
+        if !llm.status().await.chat_model_ready {
+            println!("Modèle de conversation absent : mesure ignorée.");
+            return;
+        }
+
+        for (nom, jeu) in [("réglage", CORPUS), ("VALIDATION (jamais utilisé pour régler)", VALIDATION)] {
+        let mut intention_ratee = Vec::new();
+        let mut portee_ratee = Vec::new();
+        for case in jeu {
+            let comprise = super::intent::classify(
+                &llm,
+                case.text,
+                super::intent::Intent {
+                    kind: super::intent::Kind::Conversation,
+                    scope: super::intent::Scope::Any,
+                    subject: None,
+                    source: super::intent::Source::Fallback,
+                },
+            )
+            .await;
+            let obtenue = match (comprise.kind, comprise.scope) {
+                (super::intent::Kind::FileSearch, super::intent::Scope::Google) => Route::FileSearchGoogle,
+                (super::intent::Kind::FileSearch, super::intent::Scope::Microsoft) => Route::FileSearchMicrosoft,
+                (super::intent::Kind::FileSearch, super::intent::Scope::Local) => Route::FileSearchLocal,
+                (super::intent::Kind::FileSearch, _) => Route::FileSearch,
+                (super::intent::Kind::MailCompose, _) => Route::MailCompose,
+                (super::intent::Kind::DeviceDiagnostic, _) => Route::DeviceDiagnostic,
+                (super::intent::Kind::DocumentCreate, _) => Route::DocumentCreate,
+                (super::intent::Kind::Conversation, _) => Route::Conversation,
+            };
+            if !meme_famille(obtenue, case.expected) {
+                intention_ratee.push((case, obtenue, comprise.subject.clone()));
+            } else if obtenue != case.expected {
+                portee_ratee.push((case, obtenue));
+            }
+        }
+        let total = jeu.len();
+        let errones = intention_ratee.len() + portee_ratee.len();
+        println!("\n╭─ Compréhension · jeu de {nom} : {total} demandes");
+        println!("│  intention manquée : {} ({:.0} %)", intention_ratee.len(),
+                 100.0 * intention_ratee.len() as f64 / total as f64);
+        println!("│  portée manquée    : {} ({:.0} %)", portee_ratee.len(),
+                 100.0 * portee_ratee.len() as f64 / total as f64);
+        println!("╰─ total erroné      : {errones} ({:.1} %)",
+                 100.0 * errones as f64 / total as f64);
+        for (case, obtenue, sujet) in &intention_ratee {
+            println!("   ✗ {:?} au lieu de {:?}  « {} »  [sujet: {:?}]",
+                     obtenue, case.expected, case.text, sujet);
+        }
+        for (case, obtenue) in &portee_ratee {
+            println!("   ~ {:?} au lieu de {:?}  « {} »", obtenue, case.expected, case.text);
+        }
+        println!();
+        }
     }
 }

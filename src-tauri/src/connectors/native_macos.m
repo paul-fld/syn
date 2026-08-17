@@ -5,6 +5,7 @@
 #import <Photos/Photos.h>
 #import <ApplicationServices/ApplicationServices.h>
 #import <CoreGraphics/CoreGraphics.h>
+#import <CoreServices/CoreServices.h>
 #import <Vision/Vision.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,6 +19,108 @@ static char *syn_copy_json(id object) {
 }
 
 void syn_native_free(char *value) { if (value) free(value); }
+
+double syn_native_idle_seconds(void) {
+    return CGEventSourceSecondsSinceLastEventType(
+        kCGEventSourceStateCombinedSessionState,
+        kCGAnyInputEventType
+    );
+}
+
+uint64_t syn_native_fsevents_current_id(void) {
+    return FSEventsGetCurrentEventId();
+}
+
+typedef struct {
+    __unsafe_unretained NSMutableArray *events;
+    BOOL historyDone;
+    BOOL valid;
+    uint64_t lastID;
+} SynFSEventsReplay;
+
+static void syn_fsevents_callback(
+    ConstFSEventStreamRef streamRef,
+    void *clientCallBackInfo,
+    size_t numEvents,
+    void *eventPaths,
+    const FSEventStreamEventFlags eventFlags[],
+    const FSEventStreamEventId eventIds[]
+) {
+    (void)streamRef;
+    SynFSEventsReplay *context = (SynFSEventsReplay *)clientCallBackInfo;
+    NSArray *paths = (__bridge NSArray *)eventPaths;
+    for (size_t index = 0; index < numEvents; index++) {
+        FSEventStreamEventFlags flags = eventFlags[index];
+        context->lastID = MAX(context->lastID, eventIds[index]);
+        if (flags & kFSEventStreamEventFlagHistoryDone) {
+            context->historyDone = YES;
+            continue;
+        }
+        if (flags & (kFSEventStreamEventFlagMustScanSubDirs |
+                     kFSEventStreamEventFlagUserDropped |
+                     kFSEventStreamEventFlagKernelDropped |
+                     kFSEventStreamEventFlagEventIdsWrapped |
+                     kFSEventStreamEventFlagRootChanged)) {
+            context->valid = NO;
+        }
+        NSString *path = index < paths.count ? paths[index] : @"";
+        if (path.length > 0) {
+            [context->events addObject:@{
+                @"path": path,
+                @"id": @(eventIds[index]),
+                @"flags": @(flags)
+            }];
+        }
+    }
+}
+
+char *syn_native_fsevents_replay_json(const char *raw_root, uint64_t sinceID) {
+    NSString *root = [NSString stringWithUTF8String:raw_root ?: ""];
+    if (root.length == 0 || sinceID == 0) {
+        return syn_copy_json(@{
+            @"valid": @NO, @"history_done": @NO,
+            @"current_id": @(FSEventsGetCurrentEventId()), @"events": @[]
+        });
+    }
+    NSMutableArray *events = [NSMutableArray array];
+    SynFSEventsReplay replay = { events, NO, YES, sinceID };
+    FSEventStreamContext context = {0, &replay, NULL, NULL, NULL};
+    NSArray *paths = @[root];
+    FSEventStreamRef stream = FSEventStreamCreate(
+        NULL,
+        &syn_fsevents_callback,
+        &context,
+        (__bridge CFArrayRef)paths,
+        sinceID,
+        0.05,
+        kFSEventStreamCreateFlagUseCFTypes |
+        kFSEventStreamCreateFlagFileEvents |
+        kFSEventStreamCreateFlagNoDefer |
+        kFSEventStreamCreateFlagWatchRoot
+    );
+    if (!stream) {
+        return syn_copy_json(@{
+            @"valid": @NO, @"history_done": @NO,
+            @"current_id": @(FSEventsGetCurrentEventId()), @"events": @[]
+        });
+    }
+    FSEventStreamScheduleWithRunLoop(stream, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
+    BOOL started = FSEventStreamStart(stream);
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:5.0];
+    while (started && !replay.historyDone && deadline.timeIntervalSinceNow > 0) {
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.05, true);
+    }
+    if (started) FSEventStreamStop(stream);
+    FSEventStreamInvalidate(stream);
+    FSEventStreamRelease(stream);
+    uint64_t current = FSEventsGetCurrentEventId();
+    return syn_copy_json(@{
+        @"valid": @(started && replay.valid && replay.historyDone),
+        @"history_done": @(replay.historyDone),
+        @"current_id": @(MAX(current, replay.lastID)),
+        @"events": events
+    });
+}
 
 // 0 inconnu, 1 autorisé, 2 refusé, 3 restreint, 4 limité, -1 indisponible.
 int32_t syn_native_permission_status(const char *raw_service) {

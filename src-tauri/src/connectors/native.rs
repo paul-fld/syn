@@ -24,6 +24,44 @@ unsafe extern "C" {
     fn syn_native_ocr_image_json(path: *const std::os::raw::c_char) -> *mut std::os::raw::c_char;
     fn syn_native_frontmost_context_json() -> *mut std::os::raw::c_char;
     fn syn_native_free(value: *mut std::os::raw::c_char);
+    fn syn_native_idle_seconds() -> f64;
+    fn syn_native_fsevents_current_id() -> u64;
+    fn syn_native_fsevents_replay_json(
+        root: *const std::os::raw::c_char,
+        since_id: u64,
+    ) -> *mut std::os::raw::c_char;
+}
+
+pub fn idle_seconds() -> f64 {
+    #[cfg(target_os = "macos")]
+    {
+        return unsafe { syn_native_idle_seconds() };
+    }
+    #[allow(unreachable_code)]
+    60.0
+}
+
+pub fn fsevents_current_id() -> u64 {
+    #[cfg(target_os = "macos")]
+    {
+        return unsafe { syn_native_fsevents_current_id() };
+    }
+    #[allow(unreachable_code)]
+    0
+}
+
+pub fn fsevents_replay(root: &str, since_id: u64) -> Result<Value> {
+    #[cfg(target_os = "macos")]
+    {
+        let root =
+            CString::new(root).map_err(|_| AppError::Invalid("racine FSEvents invalide".into()))?;
+        return take_json(
+            unsafe { syn_native_fsevents_replay_json(root.as_ptr(), since_id) },
+            "Historique FSEvents indisponible.",
+        );
+    }
+    #[allow(unreachable_code)]
+    Ok(serde_json::json!({"valid":false,"current_id":0,"events":[]}))
 }
 
 pub fn ocr_image(path: &std::path::Path) -> Result<Vec<Value>> {

@@ -3,14 +3,17 @@
 //! utilisent Authorization Code + PKCE, GitHub utilise le Device Flow.
 //! Les jetons sont conservés dans le trousseau du système, jamais dans SQLite.
 
+use crate::bus::Bus;
 use crate::connectors;
 use crate::db::Db;
 use crate::error::{AppError, Result};
+use crate::llm::LlmClient;
 use base64::Engine;
 use rand::RngCore;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const KEYCHAIN_SERVICE: &str = "app.syn.desktop.oauth";
@@ -31,6 +34,14 @@ fn client_id(provider: &str) -> Option<String> {
     })
 }
 
+fn client_secret(provider: &str) -> Option<String> {
+    env(match provider {
+        "google" => "SYN_GOOGLE_CLIENT_SECRET",
+        "microsoft" => "SYN_MICROSOFT_CLIENT_SECRET",
+        _ => return None,
+    })
+}
+
 pub fn is_configured(provider: &str) -> bool {
     match provider {
         "google" | "microsoft" | "github" => client_id(provider).is_some(),
@@ -46,7 +57,7 @@ pub fn is_configured(provider: &str) -> bool {
 
 pub fn configuration_detail(provider: &str) -> String {
     if has_token(provider) {
-        return "Compte autorisé et jeton protégé, mais synchronisation et actions non disponibles dans cette version.".into();
+        return "Compte autorisé et accessible. Le cache local chiffré est maintenu automatiquement en arrière-plan.".into();
     }
     if is_configured(provider) {
         return match provider {
@@ -81,11 +92,81 @@ pub fn has_token(provider: &str) -> bool {
 }
 
 fn save_token(provider: &str, token: &Value) -> Result<()> {
+    let mut token = token.clone();
+    if let Some(object) = token.as_object_mut() {
+        let expires_in = object
+            .get("expires_in")
+            .and_then(Value::as_i64)
+            .unwrap_or(3600);
+        object.insert("expires_at".into(), json!(crate::db::now() + expires_in));
+    }
     entry(provider)?
         .set_password(&token.to_string())
         .map_err(|error| {
             AppError::Other(format!("Impossible de protéger le jeton OAuth : {error}"))
         })
+}
+
+fn load_token(provider: &str) -> Result<Value> {
+    let raw = entry(provider)?
+        .get_password()
+        .map_err(|_| AppError::Security(format!("Le compte {provider} doit être reconnecté.")))?;
+    serde_json::from_str(&raw).map_err(Into::into)
+}
+
+/// Renvoie un jeton utilisable et renouvelle silencieusement les jetons courts.
+pub async fn access_token(provider: &str) -> Result<String> {
+    let mut stored = load_token(provider)?;
+    let valid = stored["expires_at"].as_i64().unwrap_or(0) > crate::db::now() + 90;
+    if valid {
+        return stored["access_token"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| AppError::Security("Jeton OAuth incomplet.".into()));
+    }
+    let refresh = stored["refresh_token"]
+        .as_str()
+        .ok_or_else(|| AppError::Security(format!("Le compte {provider} doit être reconnecté.")))?
+        .to_string();
+    let endpoint = if provider == "google" {
+        "https://oauth2.googleapis.com/token"
+    } else {
+        "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+    };
+    let id =
+        client_id(provider).ok_or_else(|| AppError::Invalid(configuration_detail(provider)))?;
+    let mut form = vec![
+        ("client_id", id.as_str()),
+        ("refresh_token", refresh.as_str()),
+        ("grant_type", "refresh_token"),
+    ];
+    let secret = client_secret(provider);
+    if let Some(secret) = secret.as_deref() {
+        form.push(("client_secret", secret));
+    }
+    let response = reqwest::Client::new()
+        .post(endpoint)
+        .form(&form)
+        .send()
+        .await?;
+    let status = response.status();
+    let fresh: Value = response.json().await?;
+    if !status.is_success() {
+        return Err(AppError::Security(format!(
+            "Réautorisation {provider} requise : {fresh}"
+        )));
+    }
+    if let (Some(old), Some(new)) = (stored.as_object_mut(), fresh.as_object()) {
+        for (key, value) in new {
+            old.insert(key.clone(), value.clone());
+        }
+        old.insert("refresh_token".into(), json!(refresh));
+    }
+    save_token(provider, &stored)?;
+    stored["access_token"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| AppError::Security("Jeton OAuth renouvelé incomplet.".into()))
 }
 
 pub fn revoke_local(provider: &str) {
@@ -94,12 +175,27 @@ pub fn revoke_local(provider: &str) {
     }
 }
 
-pub async fn start(db: &Db, provider: &str) -> Result<Value> {
+pub async fn start(
+    db: &Db,
+    llm: &Arc<dyn LlmClient>,
+    bus: &Bus,
+    embed_model: &str,
+    provider: &str,
+) -> Result<Value> {
     if !is_configured(provider) {
         return Err(AppError::Invalid(configuration_detail(provider)));
     }
     match provider {
-        "google" | "microsoft" => start_pkce(db.clone(), provider.to_string()).await,
+        "google" | "microsoft" => {
+            start_pkce(
+                db.clone(),
+                llm.clone(),
+                bus.clone(),
+                embed_model.to_string(),
+                provider.to_string(),
+            )
+            .await
+        }
         "github" => start_github_device(db.clone()).await,
         "slack" => start_slack(db.clone()).await,
         _ => Err(AppError::Invalid("fournisseur OAuth inconnu".into())),
@@ -194,17 +290,31 @@ async fn receive_slack_callback(
         .send()
         .await
         .map_err(|error| AppError::Other(format!("Échange Slack impossible : {error}")))?;
-    let token: Value = response
-        .json()
-        .await
-        .map_err(|error| AppError::Other(error.to_string()))?;
+    let token: Value = match response.json().await {
+        Ok(token) => token,
+        Err(error) => {
+            write_callback_page(
+                &mut stream,
+                false,
+                "La réponse du fournisseur est illisible. Le détail est visible dans Syn.",
+            )
+            .await;
+            return Err(AppError::Other(error.to_string()));
+        }
+    };
     if token["ok"] != true {
         return Err(AppError::Other(format!("OAuth Slack refusé : {token}")));
     }
     Ok(token)
 }
 
-async fn start_pkce(db: Db, provider: String) -> Result<Value> {
+async fn start_pkce(
+    db: Db,
+    llm: Arc<dyn LlmClient>,
+    bus: Bus,
+    embed_model: String,
+    provider: String,
+) -> Result<Value> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .map_err(|error| AppError::Other(format!("Callback OAuth indisponible : {error}")))?;
@@ -212,7 +322,10 @@ async fn start_pkce(db: Db, provider: String) -> Result<Value> {
         .local_addr()
         .map_err(|error| AppError::Other(error.to_string()))?
         .port();
-    let redirect = format!("http://127.0.0.1:{port}/oauth/callback");
+    // OAuth desktop providers accept a loopback redirect on localhost and
+    // intentionally ignore the ephemeral port selected by the application.
+    // Keep the listener bound to 127.0.0.1 so it is never exposed on the LAN.
+    let redirect = format!("http://localhost:{port}/oauth/callback");
     let state = random_hex(24);
     let verifier = random_hex(48);
     let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -221,13 +334,18 @@ async fn start_pkce(db: Db, provider: String) -> Result<Value> {
     let (authorize, scope, extra) = if provider == "google" {
         (
             "https://accounts.google.com/o/oauth2/v2/auth",
-            "openid email profile https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/calendar https://www.googleapis.com/auth/drive.metadata.readonly",
+            // `drive.file` n'ouvre l'écriture QUE sur les documents créés par Syn :
+            // la lecture reste en `drive.readonly`, Syn ne peut pas réécrire un
+            // document existant de l'utilisateur.
+            "openid email profile https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/calendar https://www.googleapis.com/auth/drive.readonly https://www.googleapis.com/auth/drive.file",
             "&access_type=offline&prompt=consent",
         )
     } else {
         (
             "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
-            "openid profile email offline_access User.Read Mail.Read Mail.Send Calendars.ReadWrite Files.Read.All",
+            // `Sites.Read.All` est ce qui rend SharePoint et les fichiers partagés
+            // visibles ; `Files.ReadWrite.All` permet de déposer un document.
+            "openid profile email offline_access User.Read Mail.Read Mail.Send Calendars.ReadWrite Files.ReadWrite.All Sites.Read.All",
             "",
         )
     };
@@ -239,9 +357,46 @@ async fn start_pkce(db: Db, provider: String) -> Result<Value> {
     tokio::spawn(async move {
         let result =
             receive_pkce_callback(listener, &provider, &id, &redirect, &state, &verifier).await;
-        if let Ok(token) = result {
-            if save_token(&provider, &token).is_ok() {
-                let _ = connectors::set_status(&db, &provider, &provider, "connected");
+        match result {
+            Ok(token) => match save_token(&provider, &token) {
+                Ok(()) => {
+                    let _ = connectors::set_status(&db, &provider, &provider, "syncing");
+                    let _ = connectors::set_diagnostic(&db, &provider, None, None);
+                    // L'autorisation est la seule action demandée à l'utilisateur.
+                    // La mise en cache initiale démarre immédiatement et reste en
+                    // arrière-plan ; les actions cloud utilisent déjà le jeton.
+                    if let Err(error) =
+                        connectors::external::sync(&provider, &db, &llm, &bus, &embed_model).await
+                    {
+                        let detail = error.to_string();
+                        let _ = connectors::set_status(
+                            &db,
+                            &provider,
+                            &provider,
+                            if detail.contains("401") || detail.contains("403") {
+                                "needs_reauth"
+                            } else {
+                                "connected"
+                            },
+                        );
+                        let _ = connectors::set_diagnostic(&db, &provider, Some(&detail), None);
+                        bus.emit(crate::bus::BusEvent::SyncProgress {
+                            connector: provider.clone(),
+                            pct: 100.0,
+                            message: Some(format!("Cache interrompu : {detail}")),
+                        });
+                    }
+                }
+                Err(error) => {
+                    let _ = connectors::set_status(&db, &provider, &provider, "needs_reauth");
+                    let _ =
+                        connectors::set_diagnostic(&db, &provider, Some(&error.to_string()), None);
+                }
+            },
+            Err(error) => {
+                eprintln!("OAuth {provider} : {error}");
+                let _ = connectors::set_status(&db, &provider, &provider, "needs_reauth");
+                let _ = connectors::set_diagnostic(&db, &provider, Some(&error.to_string()), None);
             }
         }
     });
@@ -284,44 +439,109 @@ async fn receive_pkce_callback(
     let valid = query
         .get("state")
         .is_some_and(|value| value == expected_state);
-    let code = query.get("code").cloned();
-    let body = if valid && code.is_some() {
-        "Connexion autorisée. Tu peux fermer cette page et revenir dans Syn."
-    } else {
-        "Connexion refusée ou invalide. Reviens dans Syn pour réessayer."
-    };
-    let http = format!("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
-    let _ = stream.write_all(http.as_bytes()).await;
     if !valid {
+        write_callback_page(
+            &mut stream,
+            false,
+            "La réponse de sécurité ne correspond pas à la demande initiale.",
+        )
+        .await;
         return Err(AppError::Security("État OAuth invalide".into()));
     }
-    let code = code.ok_or_else(|| AppError::Invalid("autorisation OAuth refusée".into()))?;
+    let code = match query.get("code").cloned() {
+        Some(code) => code,
+        None => {
+            let reason = query
+                .get("error_description")
+                .or_else(|| query.get("error"))
+                .map(String::as_str)
+                .unwrap_or("Autorisation refusée.");
+            write_callback_page(&mut stream, false, reason).await;
+            return Err(AppError::Invalid(format!(
+                "autorisation OAuth refusée : {reason}"
+            )));
+        }
+    };
     let token_endpoint = if provider == "google" {
         "https://oauth2.googleapis.com/token"
     } else {
         "https://login.microsoftonline.com/common/oauth2/v2.0/token"
     };
-    let response = reqwest::Client::new()
+    let mut form = vec![
+        ("client_id", id),
+        ("code", code.as_str()),
+        ("redirect_uri", redirect),
+        ("grant_type", "authorization_code"),
+        ("code_verifier", verifier),
+    ];
+    let secret = client_secret(provider);
+    if let Some(secret) = secret.as_deref() {
+        form.push(("client_secret", secret));
+    }
+    let response = match reqwest::Client::new()
         .post(token_endpoint)
-        .form(&[
-            ("client_id", id),
-            ("code", code.as_str()),
-            ("redirect_uri", redirect),
-            ("grant_type", "authorization_code"),
-            ("code_verifier", verifier),
-        ])
+        .form(&form)
         .send()
         .await
-        .map_err(|error| AppError::Other(format!("Échange OAuth impossible : {error}")))?;
+    {
+        Ok(response) => response,
+        Err(error) => {
+            write_callback_page(
+                &mut stream,
+                false,
+                "Le fournisseur n’a pas pu finaliser la connexion.",
+            )
+            .await;
+            return Err(AppError::Other(format!(
+                "Échange OAuth impossible : {error}"
+            )));
+        }
+    };
     let status = response.status();
     let token: Value = response
         .json()
         .await
         .map_err(|error| AppError::Other(error.to_string()))?;
     if !status.is_success() {
+        write_callback_page(
+            &mut stream,
+            false,
+            "Le fournisseur a refusé de créer la session. Le détail est visible dans Syn.",
+        )
+        .await;
         return Err(AppError::Other(format!("OAuth refusé : {token}")));
     }
+    write_callback_page(
+        &mut stream,
+        true,
+        "Le compte est autorisé et déjà accessible à Syn. La mise en cache se poursuit automatiquement en arrière-plan.",
+    )
+    .await;
     Ok(token)
+}
+
+async fn write_callback_page(stream: &mut tokio::net::TcpStream, success: bool, message: &str) {
+    let title = if success {
+        "Connexion réussie"
+    } else {
+        "Connexion impossible"
+    };
+    let color = if success { "#4cd964" } else { "#ff6b5e" };
+    let icon = if success { "✓" } else { "!" };
+    let safe = message
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    let close = if success {
+        "<script>setTimeout(()=>window.close(),1800)</script>"
+    } else {
+        ""
+    };
+    let body = format!(
+        r#"<!doctype html><html lang="fr"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>{title} · Syn</title><style>html,body{{height:100%;margin:0}}body{{display:grid;place-items:center;background:#1c1c1e;color:#ededf0;font:15px -apple-system,BlinkMacSystemFont,sans-serif}}main{{width:min(440px,calc(100% - 48px));padding:32px;border:1px solid rgba(255,255,255,.1);border-radius:16px;background:#2b2b2e;text-align:center;box-shadow:0 24px 80px rgba(0,0,0,.45)}}i{{display:grid;place-items:center;width:44px;height:44px;margin:0 auto 18px;border-radius:50%;background:{color}22;color:{color};font-size:24px;font-style:normal}}h1{{font-size:22px;margin:0 0 10px}}p{{color:#a6a6ac;line-height:1.5;margin:0}}small{{display:block;color:#77777d;margin-top:20px}}</style><main><i>{icon}</i><h1>{title}</h1><p>{safe}</p><small>Tu peux fermer cette page et revenir dans Syn.</small></main>{close}</html>"#
+    );
+    let http = format!("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+    let _ = stream.write_all(http.as_bytes()).await;
 }
 
 async fn start_github_device(db: Db) -> Result<Value> {

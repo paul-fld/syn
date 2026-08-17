@@ -104,8 +104,20 @@ pub fn spawn_background_loops(app: &AppHandle) {
             if let Err(e) = crate::proactivity::evaluate_tick(&core.db, &core.bus).await {
                 eprintln!("proactivité : {e}");
             }
-            // Mode dégradé → nominal : rattraper les embeddings en attente.
-            let _ = crate::ingestion::backfill_embeddings(&core.db, &core.llm, 64).await;
+            // La file persistante converge vers tout le corpus, uniquement
+            // lorsque le Mac est idle et branché. Le backfill vectoriel suit
+            // le même budget pour ne jamais faire laguer l'interactif.
+            if crate::connectors::system::background_enrichment_allowed()
+                && !crate::settings::load(&core.db)
+                    .map(|settings| settings.indexing_paused)
+                    .unwrap_or(true)
+            {
+                let _ = core
+                    .indexer
+                    .tx
+                    .send(crate::connectors::files::IndexJob::Drain(32));
+                let _ = crate::ingestion::backfill_embeddings(&core.db, &core.llm, 64).await;
+            }
             // Miroir agenda (15 min, et au réveil) : nourrit la proactivité.
             if tick % 15 == 1 || woke {
                 let db = core.db.clone();
@@ -130,6 +142,26 @@ pub fn spawn_background_loops(app: &AppHandle) {
                     .await;
                 });
             }
+            // Les comptes cloud déjà autorisés restent frais sans intervention.
+            // Une panne fournisseur n'interrompt jamais les autres boucles.
+            if tick % 30 == 5 {
+                for provider in ["google", "microsoft"] {
+                    if crate::connectors::is_connected(&core.db, provider) {
+                        let db = core.db.clone();
+                        let llm = core.llm.clone();
+                        let bus = core.bus.clone();
+                        let embed = crate::settings::load(&core.db)
+                            .map(|settings| settings.embed_model)
+                            .unwrap_or_default();
+                        tauri::async_runtime::spawn(async move {
+                            let _ = crate::connectors::external::sync(
+                                provider, &db, &llm, &bus, &embed,
+                            )
+                            .await;
+                        });
+                    }
+                }
+            }
         }
     });
 }
@@ -152,6 +184,8 @@ pub fn forward_bus(app: &AppHandle) {
                 BusEvent::ItemIngested { .. } => "item_ingested",
                 BusEvent::IngestionStatus { .. } => "ingestion_status",
                 BusEvent::FilesError { .. } => "files_error",
+                BusEvent::AnswerDelta { .. } => "answer_delta",
+                BusEvent::SemanticResults { .. } => "semantic_results",
                 BusEvent::SyncProgress { .. } => "sync_progress",
                 BusEvent::BriefReady => "brief_ready",
                 BusEvent::ProactiveAlert { .. } => "proactive_alert",

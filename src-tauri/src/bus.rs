@@ -20,6 +20,17 @@ pub enum BusEvent {
         path: String,
         reason: String,
     },
+    /// Fragment de réponse produit au fil de la génération. Sans lui, Syn
+    /// attend d'avoir écrit sa réponse ENTIÈRE avant d'afficher le premier mot :
+    /// le temps d'attente est le même, mais il est vécu comme un blocage.
+    AnswerDelta {
+        session_id: String,
+        delta: String,
+    },
+    SemanticResults {
+        session_id: String,
+        results: Vec<crate::retrieval::Retrieved>,
+    },
     SyncProgress {
         connector: String,
         pct: f32,

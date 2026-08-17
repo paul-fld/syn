@@ -71,28 +71,29 @@ pub async fn ingest_item(
 
     if changed {
         let chunks = content.map(chunk).unwrap_or_default();
-        let vectors = if chunks.is_empty() {
-            Vec::new()
-        } else {
-            match llm.embed(&chunks).await {
-                Ok(vs) => vs
-                    .into_iter()
-                    .map(|v| Some(vec_to_blob(&v)))
-                    .collect::<Vec<_>>(),
-                Err(_) => chunks.iter().map(|_| None).collect(), // embedding en attente
-            }
-        };
-        let rows: Vec<(String, Option<Vec<u8>>)> =
-            chunks.into_iter().zip(vectors.into_iter()).collect();
-        // Important même quand `content` devient vide/non extractible : cette
-        // opération supprime les anciens vecteurs et empêche un contenu périmé
-        // de continuer à ressortir dans la recherche.
-        memory::replace_embeddings(db, &id, embed_model, &rows)?;
+        // Barrière de disponibilité : FTS/BM25 reçoit le texte extrait et ses
+        // chunks AVANT tout appel réseau/modèle. Une recherche concurrente ne
+        // peut donc jamais attendre l'embedding.
+        let lexical_rows = chunks
+            .iter()
+            .cloned()
+            .map(|text| (text, None))
+            .collect::<Vec<_>>();
+        memory::replace_embeddings(db, &id, embed_model, &lexical_rows)?;
         bus.emit(BusEvent::ItemIngested {
             item_id: id.clone(),
             source,
             title,
         });
+        if !chunks.is_empty() {
+            if let Ok(vectors) = llm.embed(&chunks).await {
+                let rows = chunks
+                    .into_iter()
+                    .zip(vectors.into_iter().map(|vector| Some(vec_to_blob(&vector))))
+                    .collect::<Vec<_>>();
+                memory::replace_embeddings(db, &id, embed_model, &rows)?;
+            }
+        }
     }
     Ok(id)
 }
@@ -127,6 +128,21 @@ pub async fn backfill_embeddings(db: &Db, llm: &Arc<dyn LlmClient>, limit: usize
         for i in 0..n {
             let (id, model, idx, _) = &pending[i];
             stmt.execute(rusqlite::params![id, model, idx, vec_to_blob(&vectors[i])])?;
+        }
+        // Le rattrapage ne vectorise que ce qui est DÉJÀ en base. Pour un objet
+        // cloud, ce « déjà » se limite aux métadonnées : le corps du document
+        // n'est téléchargé que par `external::enrich_item`, via la file. Le
+        // marquer « embedded » ici le sortirait de la file et son contenu ne
+        // serait jamais indexé — c'est ce qui rendait Drive et OneDrive muets.
+        let mut done = c.prepare(
+            "UPDATE enrichment_queue SET
+                 state=CASE WHEN source='cloud' AND state IN ('pending','error')
+                            THEN state ELSE 'embedded' END,
+                 embedding_ready=1,lexical_ready=1,updated_at=?2
+             WHERE item_id=?1",
+        )?;
+        for (id, _, _, _) in &pending[..n] {
+            done.execute(rusqlite::params![id, crate::db::now()])?;
         }
         Ok(())
     })?;

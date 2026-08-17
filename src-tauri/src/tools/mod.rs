@@ -2,6 +2,7 @@
 //! ajouter une capacité = ajouter un outil. Chaque outil déclare son side_effect ;
 //! la classe de risque est calculée par la porte d'action (actions::classify).
 
+pub mod documents;
 pub mod reorganize;
 
 use crate::bus::Bus;
@@ -63,6 +64,13 @@ pub fn catalog() -> Vec<ToolSpec> {
             SideEffect::Read,
         ),
         spec(
+            "cloud.search",
+            "Recherche dans les fichiers Google Drive et Microsoft OneDrive synchronisés. Renvoie des liens ouvrables et sourcés.",
+            json!({"query": {"type": "string"}}),
+            &["query"],
+            SideEffect::Read,
+        ),
+        spec(
             "files.reorganize",
             "Prépare un PLAN de rangement intelligent d'un fichier, dossier ou emplacement autorisé (simulation, rien n'est déplacé). Accepte un chemin exact ou un nom non ambigu. L'utilisateur revoit le plan une seule fois avant exécution.",
             json!({"target_dir": {"type": "string", "description": "fichier ou dossier cible, par nom ou chemin, dans le périmètre autorisé"}}),
@@ -90,6 +98,38 @@ pub fn catalog() -> Vec<ToolSpec> {
             SideEffect::WriteLocal,
         ),
         spec(
+            "document.create",
+            "Crée un NOUVEAU document et l'enregistre réellement : sur le Mac (md, txt, csv, docx), dans Google Docs ou dans OneDrive au format Word. À utiliser dès que l'utilisateur demande d'écrire, rédiger ou créer un document, un compte rendu, une note ou un tableau.",
+            json!({
+                "title": {"type": "string", "description": "titre du document, il devient son nom de fichier"},
+                "content": {"type": "string", "description": "contenu rédigé du document"},
+                "location": {"type": "string", "enum": ["local", "google", "microsoft"], "description": "où l'enregistrer ; « local » par défaut, « google » pour Google Docs, « microsoft » pour un Word sur OneDrive"},
+                "format": {"type": "string", "enum": ["md", "txt", "csv", "docx"], "description": "format local ; ignoré pour google et microsoft"},
+                "folder": {"type": "string", "description": "dossier local de destination (nom ou chemin) ; Documents par défaut"},
+                "open": {"type": "boolean", "description": "ouvrir le document juste après sa création"}
+            }),
+            &["title", "content"],
+            SideEffect::WriteLocal,
+        ),
+        spec(
+            "document.write",
+            "Écrit dans un document texte local EXISTANT (md, txt, csv), en le complétant ou en le remplaçant. La version précédente est conservée pour permettre l'annulation.",
+            json!({
+                "target": {"type": "string", "description": "nom ou chemin du document à modifier"},
+                "content": {"type": "string", "description": "texte à écrire"},
+                "mode": {"type": "string", "enum": ["append", "replace"], "description": "« append » complète (défaut), « replace » remplace tout le contenu"}
+            }),
+            &["target", "content"],
+            SideEffect::WriteLocal,
+        ),
+        spec(
+            "document.open",
+            "Ouvre un document dans l'application de l'utilisateur : chemin local, nom indexé, ou lien Google Drive / OneDrive déjà connu de Syn.",
+            json!({"target": {"type": "string", "description": "nom, chemin ou lien du document à ouvrir"}}),
+            &["target"],
+            SideEffect::Read,
+        ),
+        spec(
             "mail.search",
             "Recherche dans les mails ingérés.",
             json!({"query": {"type": "string"}}),
@@ -102,14 +142,15 @@ pub fn catalog() -> Vec<ToolSpec> {
             json!({
                 "to": {"type": "string"},
                 "subject": {"type": "string"},
-                "body": {"type": "string"}
+                "body": {"type": "string"},
+                "via": {"type": "string", "enum": ["apple", "google", "microsoft"], "description": "service d’envoi ; choisir le compte demandé par l’utilisateur"}
             }),
             &["to", "subject", "body"],
             SideEffect::WriteLocal,
         ),
         spec(
             "mail.send",
-            "Envoie un mail via Apple Mail (compte par défaut de l'utilisateur). Action vers une personne réelle : TOUJOURS confirmée par l'utilisateur (plancher).",
+            "Envoie un mail via Apple Mail, Gmail ou Microsoft Outlook. Utilise `via` selon le compte demandé. Action vers une personne réelle : TOUJOURS confirmée par l'utilisateur.",
             json!({
                 "to": {"type": "string"},
                 "subject": {"type": "string"},
@@ -133,7 +174,8 @@ pub fn catalog() -> Vec<ToolSpec> {
                 "start": {"type": "string", "description": "ISO 8601"},
                 "end": {"type": "string"},
                 "location": {"type": "string"},
-                "attendees": {"type": "array", "items": {"type": "string"}}
+                "attendees": {"type": "array", "items": {"type": "string"}},
+                "via": {"type": "string", "enum": ["apple", "google", "microsoft"], "description": "calendrier de destination"}
             }),
             &["title", "start"],
             SideEffect::WriteExternal,
@@ -255,6 +297,29 @@ pub fn preview_for(tool: &str, args: &Value) -> String {
             s("destination"),
             s("source")
         ),
+        "document.create" => {
+            let service = match args["location"].as_str().unwrap_or("local") {
+                "google" => "Google Docs",
+                "microsoft" => "OneDrive (Word)",
+                _ => "le Mac",
+            };
+            format!(
+                "Créer le document « {} » dans {service}\n{}",
+                s("title"),
+                s("content").chars().take(500).collect::<String>()
+            )
+        }
+        "document.write" => format!(
+            "{} le document « {} »\n{}",
+            if args["mode"].as_str() == Some("replace") {
+                "Remplacer le contenu de"
+            } else {
+                "Compléter"
+            },
+            s("target"),
+            s("content").chars().take(500).collect::<String>()
+        ),
+        "document.open" => format!("Ouvrir « {} »", s("target")),
         "memory.remember" => format!("Mémoriser : « {} »", s("fact")),
         _ => format!("{tool} {args}"),
     }
@@ -263,7 +328,6 @@ pub fn preview_for(tool: &str, args: &Value) -> String {
 /// Exécution effective (appelée pour les lectures, ou après passage de la porte).
 pub async fn execute(ctx: &ToolCtx, tool: &str, args: &Value) -> Result<ToolResult> {
     let connector = match tool.split('.').next().unwrap_or("") {
-        "mail" => Some("apple"),
         "system" => Some("system"),
         _ => None,
     };
@@ -274,22 +338,27 @@ pub async fn execute(ctx: &ToolCtx, tool: &str, args: &Value) -> Result<ToolResu
             )));
         }
     }
-    if tool.starts_with("mail.") && !crate::connectors::mail::native_available() {
-        return Err(AppError::Security(
-            "Apple Mail n’est pas autorisé. Ouvre Connecteurs → Services Apple → Apple Mail."
-                .into(),
-        ));
-    }
     match tool {
-        "memory.query" | "files.search" | "mail.search" => {
+        "memory.query" | "files.search" | "mail.search" | "cloud.search" => {
             let query = args["query"].as_str().unwrap_or("");
-            let results = if tool == "files.search" {
-                retrieval::search_source(&ctx.db, &ctx.llm, query, 10, "files").await?
+            let local_results = if tool == "files.search" {
+                retrieval::search_lexical_source(&ctx.db, query, 10, "files").await?
             } else if tool == "mail.search" {
                 retrieval::search_source(&ctx.db, &ctx.llm, query, 10, "mail").await?
+            } else if tool == "cloud.search" {
+                retrieval::search_source(&ctx.db, &ctx.llm, query, 10, "cloud").await?
             } else {
                 retrieval::search(&ctx.db, &ctx.llm, query, 10).await?
             };
+            let mut results = local_results
+                .into_iter()
+                .filter_map(|result| serde_json::to_value(result).ok())
+                .collect::<Vec<_>>();
+            if tool == "mail.search" {
+                results.extend(crate::connectors::external::live_search("mail", query).await);
+            } else if tool == "cloud.search" {
+                results.extend(crate::connectors::external::live_search("cloud", query).await);
+            }
             crate::security::log_access(
                 &ctx.db,
                 tool.split('.').next().unwrap_or("memory"),
@@ -409,6 +478,126 @@ pub async fn execute(ctx: &ToolCtx, tool: &str, args: &Value) -> Result<ToolResu
             })
         }
 
+        "document.create" => {
+            let title = args["title"]
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| AppError::Invalid("titre du document requis".into()))?;
+            let content = args["content"].as_str().unwrap_or_default();
+            let location = args["location"].as_str().unwrap_or("local").to_lowercase();
+            match location.as_str() {
+                "google" | "microsoft" => {
+                    let created =
+                        crate::connectors::external::create_document(&location, title, content)
+                            .await?;
+                    crate::security::log_access(&ctx.db, &location, "create_document", Some(title));
+                    // Le document distant est immédiatement présent dans le cache :
+                    // l'utilisateur peut le retrouver sans attendre la synchro.
+                    if let Some(source_ref) = created["source_ref"].as_str() {
+                        memory::upsert_item(
+                            &ctx.db,
+                            &memory::Item {
+                                id: String::new(),
+                                source: "cloud".into(),
+                                source_ref: source_ref.into(),
+                                r#type: "document".into(),
+                                title: Some(title.to_string()),
+                                body: Some(content.to_string()),
+                                created_at: Some(now()),
+                                ingested_at: now(),
+                                hash: None,
+                                path: created["url"].as_str().map(str::to_string),
+                                mime: None,
+                                size: None,
+                                mtime: Some(now()),
+                                status: "active".into(),
+                            },
+                        )?;
+                    }
+                    if args["open"].as_bool() == Some(true) {
+                        if let Some(url) = created["url"].as_str() {
+                            let _ = documents::open_target(&ctx.db, url);
+                        }
+                    }
+                    Ok(ToolResult {
+                        result: created,
+                        undo: None,
+                    })
+                }
+                "local" | "mac" | "" => {
+                    let document = documents::create_local(
+                        &ctx.db,
+                        &ctx.llm,
+                        &ctx.bus,
+                        &ctx.settings.embed_model,
+                        title,
+                        content,
+                        args["format"].as_str().unwrap_or("md"),
+                        args["folder"].as_str(),
+                    )
+                    .await?;
+                    let path = document.path.to_string_lossy().to_string();
+                    crate::security::log_access(&ctx.db, "files", "create_document", Some(&path));
+                    if args["open"].as_bool() == Some(true) {
+                        let _ = documents::open_target(&ctx.db, &path);
+                    }
+                    Ok(ToolResult {
+                        result: json!({
+                            "service": "Mac",
+                            "path": path,
+                            "name": document.path.file_name().map(|name| name.to_string_lossy()),
+                        }),
+                        undo: Some(json!({"kind": "delete_file", "path": path})),
+                    })
+                }
+                other => Err(AppError::Invalid(format!(
+                    "Emplacement « {other} » inconnu : local, google ou microsoft."
+                ))),
+            }
+        }
+
+        "document.write" => {
+            let target = args["target"]
+                .as_str()
+                .ok_or_else(|| AppError::Invalid("document cible requis".into()))?;
+            let content = args["content"].as_str().unwrap_or_default();
+            let (report, undo) = documents::write_local(
+                &ctx.db,
+                target,
+                content,
+                args["mode"].as_str().unwrap_or("append"),
+            )?;
+            crate::security::log_access(&ctx.db, "files", "write_document", Some(target));
+            // Le document modifié doit rester cherchable sur son nouveau contenu.
+            if let Some(path) = report["path"].as_str() {
+                crate::connectors::files::index_file(
+                    &ctx.db,
+                    &ctx.llm,
+                    &ctx.bus,
+                    &ctx.settings.embed_model,
+                    std::path::Path::new(path),
+                )
+                .await?;
+            }
+            Ok(ToolResult {
+                result: report,
+                undo: Some(undo),
+            })
+        }
+
+        "document.open" => {
+            let target = args["target"]
+                .as_str()
+                .ok_or_else(|| AppError::Invalid("document à ouvrir requis".into()))?;
+            let result = documents::open_target(&ctx.db, target)?;
+            crate::security::log_access(&ctx.db, "files", "open_document", Some(target));
+            Ok(ToolResult {
+                result,
+                undo: None,
+            })
+        }
+
         "mail.draft" => {
             let id = new_id();
             let (to, subject, body) = (
@@ -467,6 +656,18 @@ pub async fn execute(ctx: &ToolCtx, tool: &str, args: &Value) -> Result<ToolResu
                     "Un objet et un contenu non vides sont requis avant l'envoi.".into(),
                 ));
             }
+            let via = args["via"].as_str().unwrap_or("apple");
+            if matches!(via, "google" | "microsoft") {
+                if !crate::connectors::is_connected(&ctx.db, via) {
+                    return Err(AppError::Security(format!(
+                        "Le connecteur {via} n’est pas synchronisé."
+                    )));
+                }
+                let result =
+                    crate::connectors::external::send_mail(via, &to, &subject, &body).await?;
+                crate::security::log_access(&ctx.db, via, "mail.send", Some(&to));
+                return Ok(ToolResult { result, undo: None });
+            }
             if !cfg!(target_os = "macos") || !crate::connectors::mail::native_available() {
                 return Err(AppError::Invalid(
                     "L'envoi passe par Apple Mail, indisponible sur cette machine. Le brouillon reste possible.".into(),
@@ -496,6 +697,24 @@ pub async fn execute(ctx: &ToolCtx, tool: &str, args: &Value) -> Result<ToolResu
         }
 
         "calendar.create" => {
+            if let Some(via @ ("google" | "microsoft")) = args["via"].as_str() {
+                if !crate::connectors::is_connected(&ctx.db, via) {
+                    return Err(AppError::Security(format!(
+                        "Le connecteur {via} n’est pas synchronisé."
+                    )));
+                }
+                let event = crate::connectors::external::create_event(via, args).await?;
+                crate::security::log_access(
+                    &ctx.db,
+                    via,
+                    "calendar.create",
+                    event["event"]["id"].as_str(),
+                );
+                return Ok(ToolResult {
+                    result: event,
+                    undo: None,
+                });
+            }
             let ev = calendar::create(&ctx.db, args)?;
             Ok(ToolResult {
                 result: json!({"status": "événement créé", "event": ev.clone()}),

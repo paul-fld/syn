@@ -194,6 +194,8 @@ export interface ConnectorInfo {
   scopes: string | null;
   last_sync: number | null;
   detail: string | null;
+  last_error: string | null;
+  sync_summary: string | null;
 }
 
 export interface NativePermission {
@@ -232,6 +234,8 @@ export interface RuleOutcome {
 
 export interface IndexStatus {
   running: boolean;
+  phase: "cataloging" | "enriching" | "ready";
+  catalog_ready: boolean;
   done: number;
   total: number;
   current: string | null;
@@ -239,6 +243,15 @@ export interface IndexStatus {
   pending_embeddings: number;
   sensitive_skipped: number;
   unreadable_files: number;
+  eligible_count: number;
+  embedded_count: number;
+  lexical_count: number;
+  coverage_pct: number;
+  coverage_high_water_pct: number;
+  replay_count: number;
+  replayed_events: number;
+  fallback_count: number;
+  full_scan_count: number;
   folders: { path: string; last_indexed: number | null }[];
 }
 
@@ -301,6 +314,7 @@ export const ipc = {
   // connecteurs
   connectorStatus: () => invoke<ConnectorInfo[]>("connector_status"),
   connectorConnect: (id: string) => invoke<any>("connector_connect", { id }),
+  connectorSync: (id: string) => invoke<any>("connector_sync", { id }),
   connectorDisconnect: (id: string) => invoke<void>("connector_disconnect", { id }),
   nativePermissions: () => invoke<NativePermissions>("native_permissions"),
   requestNativePermission: (service: string) => invoke<{ service: string; status: string }>("request_native_permission", { service }),

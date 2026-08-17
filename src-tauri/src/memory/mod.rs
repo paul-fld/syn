@@ -247,7 +247,7 @@ pub fn older_turns(
 }
 
 pub fn recent_turns(db: &Db, session_id: &str, limit: usize) -> Result<Vec<(String, String)>> {
-    db.with(|c| {
+    db.read(|c| {
         let mut stmt = c.prepare(
             "SELECT role, content FROM (
                SELECT role, content, turn FROM conversations

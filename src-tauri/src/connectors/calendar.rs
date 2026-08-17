@@ -67,13 +67,15 @@ pub fn sync_native_to_db(db: &Db) -> Result<usize> {
 pub fn list_range(db: &Db, from: &str, to: &str) -> Result<Vec<Value>> {
     let from_ts = parse_iso(from).unwrap_or(0);
     let to_ts = parse_iso(to).unwrap_or(i64::MAX);
-    if cfg!(target_os = "macos") {
-        return crate::connectors::native::calendar_events(from_ts, to_ts);
-    }
-    db.with(|c| {
+    let mut combined = if cfg!(target_os = "macos") {
+        crate::connectors::native::calendar_events(from_ts, to_ts).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let mut mirrored = db.with(|c| {
         let mut stmt = c.prepare(
             "SELECT id, title, \"start\", \"end\", location, attendees, notes, source
-             FROM events WHERE \"start\" >= ?1 AND \"start\" <= ?2 ORDER BY \"start\" LIMIT 200",
+             FROM events WHERE source != 'apple' AND \"start\" >= ?1 AND \"start\" <= ?2 ORDER BY \"start\" LIMIT 200",
         )?;
         let rows = stmt.query_map(params![from_ts, to_ts], |r| {
             Ok(json!({
@@ -95,7 +97,10 @@ pub fn list_range(db: &Db, from: &str, to: &str) -> Result<Vec<Value>> {
             out.push(r?);
         }
         Ok(out)
-    })
+    })?;
+    combined.append(&mut mirrored);
+    combined.sort_by_key(|event| event["start"].as_i64().unwrap_or(i64::MAX));
+    Ok(combined)
 }
 
 pub fn create(db: &Db, args: &Value) -> Result<Value> {

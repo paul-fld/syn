@@ -105,6 +105,16 @@ fn battery_info() -> Option<Value> {
     Some(json!({"pct": pct, "charging": charging}))
 }
 
+/// Le travail lourd ne démarre que lorsque l'utilisateur est inactif et que
+/// le Mac est sur secteur. Un Mac sans batterie est considéré comme branché.
+pub fn background_enrichment_allowed() -> bool {
+    let idle = super::native::idle_seconds() >= 30.0;
+    let on_ac = battery_info()
+        .and_then(|battery| battery["charging"].as_bool())
+        .unwrap_or(true);
+    idle && on_ac
+}
+
 /// Corrèle les signaux et EXPLIQUE (jamais « Syn a deviné »).
 pub fn diagnose(s: &SystemSnapshot) -> String {
     let mut findings: Vec<String> = vec![];

@@ -95,6 +95,7 @@ pub fn run() {
             ipc::request_native_permission,
             ipc::open_native_settings,
             ipc::connector_connect,
+            ipc::connector_sync,
             ipc::connector_disconnect,
             ipc::screen_context,
             // réglages & modèle

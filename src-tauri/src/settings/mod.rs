@@ -145,7 +145,7 @@ impl Default for Settings {
 
 pub fn load(db: &Db) -> Result<Settings> {
     let mut base = serde_json::to_value(Settings::default())?;
-    db.with(|c| {
+    db.read(|c| {
         let mut stmt = c.prepare("SELECT key, value FROM settings")?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
         for row in rows {

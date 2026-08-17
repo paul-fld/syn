@@ -33,6 +33,7 @@ fn main() {
             "Photos",
             "ApplicationServices",
             "CoreGraphics",
+            "CoreServices",
             "Foundation",
             "Vision",
         ] {

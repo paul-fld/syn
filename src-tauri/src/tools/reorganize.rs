@@ -82,7 +82,7 @@ fn location_name(target: &str) -> String {
     trimmed.to_string()
 }
 
-fn is_protected_target(path: &Path, home: &Path) -> bool {
+pub(crate) fn is_protected_target(path: &Path, home: &Path) -> bool {
     if path == Path::new("/") || path == home {
         return true;
     }
@@ -252,7 +252,7 @@ fn directory_category(name: &str) -> Option<(&'static str, &'static str, f32)> {
     None
 }
 
-fn unique_destination(path: PathBuf) -> PathBuf {
+pub(crate) fn unique_destination(path: PathBuf) -> PathBuf {
     if !path.exists() {
         return path;
     }

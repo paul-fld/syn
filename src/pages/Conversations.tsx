@@ -106,6 +106,8 @@ export function Conversations(): JSX.Element {
   const [sessionId, setSessionId] = createSignal<string | null>(null);
   const [messages, setMessages] = createSignal<Msg[]>([]);
   const [thinking, setThinking] = createSignal(false);
+  /// Réponse en cours d'écriture, affichée avant que le tour soit terminé.
+  const [streaming, setStreaming] = createSignal("");
   const [progress, setProgress] = createSignal<AgentProgress[]>([]);
   const [openMenu, setOpenMenu] = createSignal<string | null>(null);
   const [moveMenu, setMoveMenu] = createSignal<string | null>(null);
@@ -127,6 +129,7 @@ export function Conversations(): JSX.Element {
     const sid = sessionId() ?? crypto.randomUUID();
     setSessionId(sid);
     setProgress([]);
+    setStreaming("");
     setMessages((m) => [...m, { role: "user", content: text }]);
     setThinking(true);
     scrollDown();
@@ -143,6 +146,7 @@ export function Conversations(): JSX.Element {
       setMessages((m) => [...m, { role: "assistant", content: `⚠ ${e?.message ?? e}`, degraded: true }]);
     } finally {
       setThinking(false);
+      setStreaming("");
       scrollDown();
     }
   };
@@ -151,12 +155,41 @@ export function Conversations(): JSX.Element {
   onMount(() => {
     let unlistenProgress: (() => void) | undefined;
     let unlistenResolved: (() => void) | undefined;
+    let unlistenSemantic: (() => void) | undefined;
+    let unlistenDelta: (() => void) | undefined;
     void on("agent_progress", (raw) => {
       const event = (raw?.payload ?? raw) as AgentProgress;
       if (event.session_id !== sessionId()) return;
       setProgress((steps) => [...steps, event].slice(-20));
       scrollDown();
     }).then((fn) => (unlistenProgress = fn));
+    // Réponse en cours d'écriture : on affiche les fragments dès qu'ils
+    // arrivent au lieu d'attendre le bloc final. Le message est remplacé par la
+    // version définitive quand `ipc.query` rend la main — les sources et le
+    // texte canonique viennent de là.
+    void on("answer_delta", (raw) => {
+      const event = (raw?.payload ?? raw) as { session_id: string; delta: string };
+      if (event.session_id !== sessionId() || !event.delta) return;
+      setStreaming((current) => current + event.delta);
+      scrollDown();
+    }).then((fn) => (unlistenDelta = fn));
+    void on("semantic_results", (raw) => {
+      const event = (raw?.payload ?? raw) as { session_id: string; results: Retrieved[] };
+      if (event.session_id !== sessionId() || !event.results?.length) return;
+      setMessages((current) => {
+        const index = current.findLastIndex((message) => message.role === "assistant");
+        if (index < 0) return current;
+        const next = [...current];
+        const existing = next[index].sources ?? [];
+        const seen = new Set(existing.map((source) => source.item_id));
+        next[index] = {
+          ...next[index],
+          sources: [...existing, ...event.results.filter((source) => !seen.has(source.item_id))],
+        };
+        return next;
+      });
+      scrollDown();
+    }).then((fn) => (unlistenSemantic = fn));
     void on("action_resolved", async () => {
       const active = sessionId();
       if (!active) return;
@@ -169,6 +202,8 @@ export function Conversations(): JSX.Element {
     onCleanup(() => {
       unlistenProgress?.();
       unlistenResolved?.();
+      unlistenSemantic?.();
+      unlistenDelta?.();
     });
   });
   // Requête venue de la barre ou de l'Accueil (l'effet couvre aussi le montage).
@@ -363,6 +398,11 @@ export function Conversations(): JSX.Element {
           </For>
           <Show when={sessionPending().length > 0}>
             <For each={sessionPending()}>{(a) => <ActionCard action={a} />}</For>
+          </Show>
+          <Show when={streaming()}>
+            <div class="msg assistant is-streaming">
+              <InlineMessage text={streaming()} />
+            </div>
           </Show>
           <Show when={thinking()}>
             <details class="agent-progress is-working" open>

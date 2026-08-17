@@ -64,8 +64,10 @@ automatique après autorisation macOS). Les modèles par palier : `llama3.2:3b` 
   bidirectionnel avec `tasks`) ; Contacts macOS (best-effort) ; Calendrier EventKit
   (lecture + création, **miroir local pour la proactivité**, invités ⇒ plancher) ;
   Système (sysinfo + pmset, diagnostic explicable) ; Contexte d'écran v0 ; lecture à
-  voix haute (`say`). OAuth de développement prêt : Google/Microsoft en PKCE, GitHub
-  en Device Flow et Slack via callback HTTPS.
+  voix haute (`say`). Google Workspace et Microsoft 365 sont opérationnels en PKCE :
+  synchronisation Gmail/Outlook, Drive/OneDrive et calendriers, recherche locale
+  chiffrée, renouvellement de jeton, envoi de mail et création d'événement confirmés.
+  GitHub utilise le Device Flow et Slack un callback HTTPS.
 - **Recherche** — normalisation française côté SQLite (`syn_fold` : accents/casse),
   mots vides filtrés, radicaux singulier/pluriel, recherche structurée
   (événements/tâches/engagements/personnes) fusionnée au retrieval, transparence
@@ -76,13 +78,34 @@ automatique après autorisation macOS). Les modèles par palier : `llama3.2:3b` 
 ## OAuth de développement
 
 Les inscriptions fournisseur ne doivent pas être publiées pour tester les connexions.
-Crée les clients de développement, puis exporte les variables décrites dans
-`.env.example` avant `npm run tauri dev`. Les jetons obtenus sont stockés dans le
-trousseau du système, jamais dans Git ni dans la base Syn.
+Crée les clients de développement, copie `.env.example` vers `.env`, puis renseigne
+les identifiants locaux. Les scripts Tauri chargent automatiquement ce fichier avant
+`npm run tauri dev`. Les jetons obtenus sont stockés dans le trousseau du système,
+jamais dans Git ni dans la base Syn.
 
 Google et Microsoft n'utilisent aucun secret embarqué. GitHub ne demande que le
 Client ID du Device Flow. Slack exige son secret et un callback HTTPS : utilise en
 développement un tunnel HTTPS vers le port local configuré.
+
+Microsoft doit enregistrer `http://localhost/oauth/callback` comme URI « Mobile et
+bureau » et autoriser les permissions déléguées `User.Read`, `Mail.Read`,
+`Mail.Send`, `Calendars.ReadWrite`, `Files.ReadWrite.All` et `Sites.Read.All`.
+`Sites.Read.All` est ce qui rend SharePoint et les fichiers partagés visibles à la
+recherche ; sans lui, seul le OneDrive personnel répond. Google doit utiliser un
+client « Application de bureau », activer Gmail, Calendar et Drive, puis autoriser
+`gmail.readonly`, `gmail.send`, `calendar`, `drive.readonly` et `drive.file`.
+`drive.file` n'ouvre l'écriture que sur les documents créés par Syn : il permet
+`document.create` vers Google Docs sans donner de droit d'écriture sur le reste du
+Drive. En mode test, le compte utilisé doit figurer parmi les utilisateurs de test
+Google.
+
+Ces portées ont changé : un compte autorisé avant cette version doit être
+déconnecté puis reconnecté dans **Connecteurs** pour que la recherche SharePoint et
+la création de documents fonctionnent.
+
+Après autorisation dans Connecteurs, le bouton **Synchroniser** construit le miroir
+local. Syn l'actualise ensuite toutes les 30 minutes. Déconnecter un compte supprime
+ses jetons du trousseau et retire immédiatement son miroir de l'index actif.
 
 ## Décisions 🔎 tranchées à ce build
 

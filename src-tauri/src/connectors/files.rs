@@ -91,7 +91,8 @@ const SENSITIVE_HINTS: &[&str] = &[
     "avis-imposition",
 ];
 const MAX_FILE_SIZE: u64 = 200 * 1024 * 1024;
-const EXTRACTION_VERSION: &[u8] = b"files-v3-ocr-project-domain";
+const EXTRACTION_VERSION_ID: &str = "files-v4-progressive-fts";
+const EXTRACTION_VERSION: &[u8] = EXTRACTION_VERSION_ID.as_bytes();
 const TECHNICAL_FILE_NAMES: &[&str] = &[
     ".ds_store",
     "thumbs.db",
@@ -259,12 +260,21 @@ pub fn live_metadata_search(
 pub enum IndexJob {
     FullScan(Option<PathBuf>),
     Paths(Vec<PathBuf>),
+    Replay {
+        paths: Vec<PathBuf>,
+        root: String,
+        through_event_id: u64,
+    },
+    Demand(Vec<PathBuf>),
+    Drain(usize),
     Shutdown,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct IndexStatus {
     pub running: bool,
+    pub phase: String,
+    pub catalog_ready: bool,
     pub done: u64,
     pub total: u64,
     pub current: Option<String>,
@@ -272,6 +282,15 @@ pub struct IndexStatus {
     pub pending_embeddings: i64,
     pub sensitive_skipped: i64,
     pub unreadable_files: i64,
+    pub eligible_count: i64,
+    pub embedded_count: i64,
+    pub lexical_count: i64,
+    pub coverage_pct: f64,
+    pub coverage_high_water_pct: f64,
+    pub replay_count: i64,
+    pub replayed_events: i64,
+    pub fallback_count: i64,
+    pub full_scan_count: i64,
     pub folders: Vec<FolderStatus>,
 }
 
@@ -341,18 +360,34 @@ impl Indexer {
 
         // Boucle d'ingestion.
         let ix = indexer.clone();
+        let startup_db = db.clone();
         let worker = tauri::async_runtime::spawn(async move {
             while let Some(job) = rx.recv().await {
                 if ix.stopping.load(Ordering::SeqCst) || matches!(job, IndexJob::Shutdown) {
                     break;
                 }
                 ix.running.store(true, Ordering::SeqCst);
+                let mut replay_checkpoint = None;
                 let result = match job {
                     IndexJob::FullScan(one) => {
                         ix.full_scan(&db, &llm, &bus, &embed_model, one).await
                     }
                     IndexJob::Paths(paths) => {
                         ix.incremental(&db, &llm, &bus, &embed_model, paths).await
+                    }
+                    IndexJob::Replay {
+                        paths,
+                        root,
+                        through_event_id,
+                    } => {
+                        replay_checkpoint = Some((root, through_event_id));
+                        ix.incremental(&db, &llm, &bus, &embed_model, paths).await
+                    }
+                    IndexJob::Demand(paths) => {
+                        ix.demand(&db, &llm, &bus, &embed_model, paths).await
+                    }
+                    IndexJob::Drain(limit) => {
+                        ix.drain_queue(&db, &llm, &bus, &embed_model, limit).await
                     }
                     IndexJob::Shutdown => break,
                 };
@@ -361,6 +396,9 @@ impl Indexer {
                         path: String::new(),
                         reason: e.to_string(),
                     });
+                } else if let Some((root, event_id)) = replay_checkpoint {
+                    // Le curseur n'avance qu'après écriture du lot rejoué.
+                    let _ = set_fsevents_checkpoint(&db, &root, event_id);
                 }
                 ix.running.store(false, Ordering::SeqCst);
                 bus.emit(BusEvent::IngestionStatus {
@@ -374,6 +412,41 @@ impl Indexer {
             ix.stopped.store(true, Ordering::SeqCst);
         });
         *indexer.worker.lock().unwrap() = Some(worker);
+        // Le replay est lancé après le worker afin de ne jamais bloquer le
+        // déverrouillage. Un scan catalogue n'est envoyé que si macOS déclare
+        // explicitement l'historique invalide/purgé.
+        #[cfg(target_os = "macos")]
+        {
+            let replay_db = startup_db.clone();
+            let checkpoint_db = startup_db;
+            let replay_tx = tx;
+            tauri::async_runtime::spawn(async move {
+                let recovered = tokio::task::spawn_blocking(move || replay_fsevents(&replay_db))
+                    .await
+                    .unwrap_or_default();
+                for recovery in recovered {
+                    match recovery {
+                        FsRecovery::Delta {
+                            paths,
+                            root,
+                            current,
+                        } if !paths.is_empty() => {
+                            let _ = replay_tx.send(IndexJob::Replay {
+                                paths,
+                                root,
+                                through_event_id: current,
+                            });
+                        }
+                        FsRecovery::Delta { root, current, .. } => {
+                            let _ = set_fsevents_checkpoint(&checkpoint_db, &root, current);
+                        }
+                        FsRecovery::Fallback(root) => {
+                            let _ = replay_tx.send(IndexJob::FullScan(Some(root)));
+                        }
+                    }
+                }
+            });
+        }
         indexer
     }
 
@@ -410,16 +483,22 @@ impl Indexer {
     async fn full_scan(
         &self,
         db: &Db,
-        llm: &Arc<dyn LlmClient>,
+        _llm: &Arc<dyn LlmClient>,
         bus: &Bus,
-        embed_model: &str,
+        _embed_model: &str,
         only: Option<PathBuf>,
     ) -> Result<()> {
+        // Point de départ conservateur : tout événement arrivé pendant le scan
+        // restera rejouable au prochain lancement.
+        let scan_baseline = crate::connectors::native::fsevents_current_id();
         let folders = match only {
             Some(p) => vec![p.to_string_lossy().to_string()],
             None => folder_paths(db)?,
         };
         crate::security::log_access(db, "files", "full_scan", None);
+        self.done.store(0, Ordering::SeqCst);
+        self.total.store(0, Ordering::SeqCst);
+        *self.current.lock().unwrap() = Some("Préparation du catalogue…".into());
 
         // 1. Énumération (walk + exclusions + projets atomiques).
         let mut files: Vec<PathBuf> = vec![];
@@ -437,49 +516,36 @@ impl Indexer {
             .store((files.len() + projects.len()) as u64, Ordering::SeqCst);
         self.done.store(0, Ordering::SeqCst);
 
-        // Les documents personnels sont utiles immédiatement. Les images,
-        // médias et projets de développement passent ensuite.
+        // Phase 1 : un catalogue léger (nom, chemin, taille, date) rend tous les
+        // fichiers trouvables immédiatement, sans lire leurs octets ni appeler
+        // le moteur d'embeddings. Les contenus sont enrichis paresseusement.
         files.sort_by_key(|path| document_index_priority(path));
+        catalog_metadata(db, &files).await?;
+        self.total.store(files.len() as u64, Ordering::SeqCst);
+        self.done.store(files.len() as u64, Ordering::SeqCst);
+        bus.emit(BusEvent::IngestionStatus {
+            state: "ready".into(),
+            current: None,
+            done: files.len() as u64,
+            total: files.len() as u64,
+        });
 
-        // 2. Traitement incrémental, throttlé, reprenable (checkpoint = upsert par fichier).
-        for file in files {
-            if self.stopping.load(Ordering::SeqCst) {
-                break;
-            }
-            if !is_path_in_active_scope(db, &file)? {
-                continue;
-            }
-            self.set_current(&file);
-            if let Err(e) = index_file(db, llm, bus, embed_model, &file).await {
-                bus.emit(BusEvent::FilesError {
-                    path: file.to_string_lossy().into(),
-                    reason: e.to_string(),
-                });
-            }
-            self.tick(bus).await;
-        }
-        for project in projects {
-            if self.stopping.load(Ordering::SeqCst) {
-                break;
-            }
-            if !is_path_in_active_scope(db, &project)? {
-                continue;
-            }
-            self.set_current(&project);
-            if let Err(e) = index_project(db, llm, bus, embed_model, &project).await {
-                bus.emit(BusEvent::FilesError {
-                    path: project.to_string_lossy().into(),
-                    reason: e.to_string(),
-                });
-            }
-            self.tick(bus).await;
-        }
+        // Les projets déjà connus restent dans l'index. Les nouveaux sont
+        // découverts à la demande ; leur analyse ne bloque pas le catalogue.
+        let _ = projects;
 
         for folder in &folders {
             db.with(|c| {
                 c.execute(
                     "UPDATE folders SET last_indexed=?2 WHERE path=?1",
                     params![folder, now()],
+                )?;
+                c.execute(
+                    "INSERT INTO fs_journal_state(root,last_event_id,full_scan_count,updated_at)
+                     VALUES (?1,?2,1,?3) ON CONFLICT(root) DO UPDATE SET
+                     last_event_id=excluded.last_event_id,
+                     full_scan_count=full_scan_count+1,updated_at=excluded.updated_at",
+                    params![folder, scan_baseline as i64, now()],
                 )?;
                 Ok(())
             })?;
@@ -491,17 +557,23 @@ impl Indexer {
             reconcile_missing_files(db, &folders)?;
         }
         *self.current.lock().unwrap() = None;
+
+        // Aucun plafond artificiel : la file persistante contient tout le
+        // corpus éligible et sera drainée par les périodes idle + secteur.
+        record_coverage(db, "catalog_ready")?;
         Ok(())
     }
 
     async fn incremental(
         &self,
         db: &Db,
-        llm: &Arc<dyn LlmClient>,
-        bus: &Bus,
-        embed_model: &str,
+        _llm: &Arc<dyn LlmClient>,
+        _bus: &Bus,
+        _embed_model: &str,
         paths: Vec<PathBuf>,
     ) -> Result<()> {
+        self.total.store(paths.len() as u64, Ordering::SeqCst);
+        self.done.store(0, Ordering::SeqCst);
         for path in paths {
             if self.stopping.load(Ordering::SeqCst) {
                 break;
@@ -518,20 +590,82 @@ impl Indexer {
             if !path.exists() {
                 // Suppression : marquer retiré, ne pas casser les citations passées.
                 let _ = memory::mark_removed(db, "files", &path.to_string_lossy());
+                let _ = db.with(|connection| {
+                    connection.execute(
+                        "UPDATE enrichment_queue SET state='removed',updated_at=?2
+                         WHERE source='files' AND source_ref=?1",
+                        params![path.to_string_lossy(), now()],
+                    )?;
+                    Ok(())
+                });
                 continue;
             }
             if path.is_dir() {
                 continue;
             }
-            self.set_current(&path);
-            if let Err(e) = index_file(db, llm, bus, embed_model, &path).await {
+            catalog_metadata(db, std::slice::from_ref(&path)).await?;
+        }
+        Ok(())
+    }
+
+    async fn demand(
+        &self,
+        db: &Db,
+        llm: &Arc<dyn LlmClient>,
+        bus: &Bus,
+        embed_model: &str,
+        paths: Vec<PathBuf>,
+    ) -> Result<()> {
+        self.incremental(db, llm, bus, embed_model, paths.clone())
+            .await?;
+        prioritize_paths(db, &paths)?;
+        // Le travail reste derrière la réponse de recherche, dans ce worker.
+        self.drain_queue(db, llm, bus, embed_model, paths.len().min(8))
+            .await
+    }
+
+    async fn drain_queue(
+        &self,
+        db: &Db,
+        llm: &Arc<dyn LlmClient>,
+        bus: &Bus,
+        embed_model: &str,
+        limit: usize,
+    ) -> Result<()> {
+        let jobs = next_enrichment_jobs(db, limit)?;
+        self.total.store(jobs.len() as u64, Ordering::SeqCst);
+        self.done.store(0, Ordering::SeqCst);
+        for (item_id, source, source_ref) in jobs {
+            if self.stopping.load(Ordering::SeqCst) {
+                break;
+            }
+            mark_enrichment_started(db, &item_id)?;
+            let result = if source == "files" {
+                let path = PathBuf::from(&source_ref);
+                self.set_current(&path);
+                index_file(db, llm, bus, embed_model, &path).await
+            } else {
+                crate::connectors::external::enrich_item(
+                    &source,
+                    &item_id,
+                    &source_ref,
+                    db,
+                    llm,
+                    bus,
+                    embed_model,
+                )
+                .await
+            };
+            finish_enrichment(db, &item_id, result.as_ref().err())?;
+            if let Err(error) = result {
                 bus.emit(BusEvent::FilesError {
-                    path: path.to_string_lossy().into(),
-                    reason: e.to_string(),
+                    path: source_ref,
+                    reason: error.to_string(),
                 });
             }
             self.tick(bus).await;
         }
+        record_coverage(db, "background_batch")?;
         Ok(())
     }
 
@@ -599,8 +733,31 @@ impl Indexer {
             }
             Ok(out)
         })?;
+        let running = self.running.load(Ordering::SeqCst);
+        let catalog_ready =
+            !folders.is_empty() && folders.iter().all(|folder| folder.last_indexed.is_some());
+        let (eligible, embedded, lexical, coverage_pct, high_water) = coverage(db)?;
+        let (replay_count, replayed_events, fallback_count, full_scan_count) = db.with(|c| {
+            c.query_row(
+                "SELECT COALESCE(SUM(replay_count),0),COALESCE(SUM(replayed_events),0),
+                        COALESCE(SUM(fallback_count),0),COALESCE(SUM(full_scan_count),0)
+                 FROM fs_journal_state",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .map_err(Into::into)
+        })?;
         Ok(IndexStatus {
-            running: self.running.load(Ordering::SeqCst),
+            running,
+            phase: if running && catalog_ready {
+                "enriching"
+            } else if running {
+                "cataloging"
+            } else {
+                "ready"
+            }
+            .into(),
+            catalog_ready,
             done: self.done.load(Ordering::SeqCst),
             total: self.total.load(Ordering::SeqCst),
             current: self.current.lock().unwrap().clone(),
@@ -608,6 +765,17 @@ impl Indexer {
             pending_embeddings: pending,
             sensitive_skipped: sensitive,
             unreadable_files: unreadable,
+            eligible_count: eligible,
+            embedded_count: embedded,
+            lexical_count: lexical,
+            // La valeur publique est un high-water monotone. Les compteurs
+            // bruts permettent toujours d'auditer la couverture courante.
+            coverage_pct: coverage_pct.max(high_water),
+            coverage_high_water_pct: high_water,
+            replay_count,
+            replayed_events,
+            fallback_count,
+            full_scan_count,
             folders,
         })
     }
@@ -630,6 +798,14 @@ fn reconcile_missing_files(db: &Db, folders: &[String]) -> Result<usize> {
         let in_scanned_scope = folders.iter().any(|folder| path.starts_with(folder));
         if in_scanned_scope && !path.exists() {
             memory::mark_removed(db, "files", &source_ref)?;
+            db.with(|connection| {
+                connection.execute(
+                    "UPDATE enrichment_queue SET state='removed',updated_at=?2
+                     WHERE source='files' AND source_ref=?1",
+                    params![source_ref, now()],
+                )?;
+                Ok(())
+            })?;
             removed += 1;
         }
     }
@@ -637,7 +813,7 @@ fn reconcile_missing_files(db: &Db, folders: &[String]) -> Result<usize> {
 }
 
 pub fn folder_paths(db: &Db) -> Result<Vec<String>> {
-    db.with(|c| {
+    db.read(|c| {
         let mut stmt = c.prepare("SELECT path FROM folders WHERE status='active'")?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         let mut out = vec![];
@@ -645,6 +821,148 @@ pub fn folder_paths(db: &Db) -> Result<Vec<String>> {
             out.push(r?);
         }
         Ok(out)
+    })
+}
+
+#[derive(Debug)]
+enum FsRecovery {
+    Delta {
+        paths: Vec<PathBuf>,
+        root: String,
+        current: u64,
+    },
+    Fallback(PathBuf),
+}
+
+fn replay_fsevents(db: &Db) -> Vec<FsRecovery> {
+    let roots = folder_paths(db).unwrap_or_default();
+    let extractor_changed = db
+        .with(|connection| {
+            let previous = connection
+                .query_row(
+                    "SELECT value FROM settings WHERE key='files_extractor_version'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap_or_default();
+            connection.execute(
+                "INSERT INTO settings(key,value) VALUES ('files_extractor_version',?1)
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                [EXTRACTION_VERSION_ID],
+            )?;
+            Ok(previous != EXTRACTION_VERSION_ID)
+        })
+        .unwrap_or(false);
+    if extractor_changed {
+        let _ = db.with(|connection| {
+            // Nouvelle génération de couverture : un ancien 100 % ne doit pas
+            // masquer le rattrapage rendu nécessaire par le nouvel extracteur.
+            connection.execute("DELETE FROM index_metric_log", [])?;
+            Ok(())
+        });
+        crate::security::log_access(
+            db,
+            "files",
+            "extractor_version_rebuild",
+            Some(EXTRACTION_VERSION_ID),
+        );
+        return roots
+            .into_iter()
+            .map(|root| FsRecovery::Fallback(PathBuf::from(root)))
+            .collect();
+    }
+    let mut recoveries = Vec::new();
+    for root in roots {
+        let since = db
+            .with(|connection| {
+                Ok(connection
+                    .query_row(
+                        "SELECT last_event_id FROM fs_journal_state WHERE root=?1",
+                        [&root],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap_or(0))
+            })
+            .unwrap_or(0);
+        let replay = crate::connectors::native::fsevents_replay(&root, since.max(0) as u64)
+            .unwrap_or_else(|_| serde_json::json!({"valid":false,"current_id":since,"events":[]}));
+        recoveries.push(apply_fsevents_replay(db, &root, since, &replay));
+    }
+    recoveries
+}
+
+fn apply_fsevents_replay(
+    db: &Db,
+    root: &str,
+    since: i64,
+    replay: &serde_json::Value,
+) -> FsRecovery {
+    let valid = replay["valid"].as_bool().unwrap_or(false);
+    let current = replay["current_id"].as_u64().unwrap_or(since.max(0) as u64);
+    let mut paths = replay["events"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|event| event["path"].as_str().map(PathBuf::from))
+        .filter(|path| path.starts_with(&root))
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    let _ = db.with(|connection| {
+        connection.execute(
+            "INSERT INTO fs_journal_state
+                 (root,last_event_id,history_valid,replay_count,replayed_events,fallback_count,updated_at)
+                 VALUES (?1,?2,?3,1,?4,?5,?6)
+                 ON CONFLICT(root) DO UPDATE SET
+                   history_valid=excluded.history_valid,
+                   replay_count=replay_count+1,
+                   replayed_events=replayed_events+excluded.replayed_events,
+                   fallback_count=fallback_count+excluded.fallback_count,
+                   updated_at=excluded.updated_at",
+            params![
+                root,
+                since,
+                valid,
+                paths.len() as i64,
+                if valid { 0 } else { 1 },
+                now()
+            ],
+        )?;
+        Ok(())
+    });
+    crate::security::log_access(
+        db,
+        "files",
+        if valid {
+            "fsevents_replay"
+        } else {
+            "catalog_fallback"
+        },
+        Some(&format!(
+            "root={root};events={};since={since};current={current}",
+            paths.len()
+        )),
+    );
+    if valid {
+        FsRecovery::Delta {
+            paths,
+            root: root.to_string(),
+            current,
+        }
+    } else {
+        FsRecovery::Fallback(PathBuf::from(root))
+    }
+}
+
+fn set_fsevents_checkpoint(db: &Db, root: &str, event_id: u64) -> Result<()> {
+    db.with(|connection| {
+        connection.execute(
+            "UPDATE fs_journal_state SET last_event_id=?2,history_valid=1,updated_at=?3
+             WHERE root=?1",
+            params![root, event_id as i64, now()],
+        )?;
+        Ok(())
     })
 }
 
@@ -767,6 +1085,261 @@ fn walk_collect(
     }
 }
 
+/// Insère ou rafraîchit toutes les métadonnées en une transaction. Sur un
+/// disque de plusieurs dizaines de milliers de fichiers, cette phase prend des
+/// secondes plutôt que les heures nécessaires à extraction + OCR + embeddings.
+async fn catalog_metadata(db: &Db, files: &[PathBuf]) -> Result<()> {
+    // Des transactions courtes empêchent le catalogue de monopoliser le
+    // mutex SQLCipher et laissent les commandes interactives répondre.
+    // Lots courts, volontairement. Chaque lot est une transaction : pendant sa
+    // durée, aucune autre écriture de Syn ne progresse — y compris celles du
+    // tour de conversation en cours. Un lot de 500 fichiers gardait la main
+    // assez longtemps pour que la question de l'utilisateur échoue sur un
+    // verrou. Le débit global change à peine, la réactivité beaucoup.
+    for paths in files.chunks(64) {
+        let records = paths
+            .iter()
+            .filter_map(|path| {
+                let Ok(meta) = std::fs::metadata(path) else {
+                    return None;
+                };
+                let source_ref = path.to_string_lossy().to_string();
+                let title = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string());
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|date| date.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_secs() as i64);
+                let priority = enrichment_base_priority(path, mtime);
+                Some((source_ref, title, meta.len() as i64, mtime, priority))
+            })
+            .collect::<Vec<_>>();
+        db.with(|connection| {
+            let transaction = connection.unchecked_transaction()?;
+            {
+                let mut update = transaction.prepare(
+                    "UPDATE items SET title=?2, path=?1, size=?3, mtime=?4, created_at=?4,
+                     ingested_at=?5, status='active',
+                     hash=CASE WHEN size IS NOT ?3 OR mtime IS NOT ?4 THEN ?6 ELSE hash END
+                     WHERE source='files' AND source_ref=?1",
+                )?;
+                let mut insert = transaction.prepare(
+                    "INSERT INTO items (id,source,source_ref,type,title,body,created_at,ingested_at,
+                     hash,path,mime,size,mtime,status)
+                     VALUES (?1,'files',?2,'document',?3,NULL,?5,?6,?7,?2,NULL,?4,?5,'active')",
+                )?;
+                let mut enqueue = transaction.prepare(
+                    "INSERT INTO enrichment_queue
+                     (item_id,source,source_ref,state,base_priority,extractor_version,updated_at)
+                     SELECT id,'files',source_ref,'pending',?2,?3,?4 FROM items
+                     WHERE source='files' AND source_ref=?1
+                     ON CONFLICT(item_id) DO UPDATE SET
+                       source_ref=excluded.source_ref,
+                       base_priority=excluded.base_priority,
+                       state=CASE
+                         WHEN enrichment_queue.extractor_version<>excluded.extractor_version
+                           OR (SELECT hash FROM items WHERE id=excluded.item_id) LIKE 'metadata:%'
+                         THEN 'pending' ELSE enrichment_queue.state END,
+                       embedding_ready=CASE
+                         WHEN (SELECT hash FROM items WHERE id=excluded.item_id) LIKE 'metadata:%'
+                         THEN 0 ELSE enrichment_queue.embedding_ready END,
+                       extractor_version=excluded.extractor_version,
+                       updated_at=excluded.updated_at",
+                )?;
+                for (source_ref, title, size, mtime, priority) in &records {
+                    let metadata_hash = format!("metadata:{}:{}", size, mtime.unwrap_or_default());
+                    let changed = update.execute(params![
+                        source_ref,
+                        title,
+                        size,
+                        mtime,
+                        now(),
+                        metadata_hash
+                    ])?;
+                    if changed == 0 {
+                        insert.execute(params![
+                            crate::db::new_id(),
+                            source_ref,
+                            title,
+                            size,
+                            mtime,
+                            now(),
+                            metadata_hash,
+                        ])?;
+                    }
+                    enqueue.execute(params![source_ref, priority, EXTRACTION_VERSION_ID, now()])?;
+                }
+            }
+            transaction.commit()?;
+            Ok(())
+        })?;
+        tokio::task::yield_now().await;
+    }
+    Ok(())
+}
+
+fn enrichment_base_priority(path: &Path, mtime: Option<i64>) -> f64 {
+    let type_score = match document_index_priority(path) {
+        0 => 500.0,
+        1 => 120.0,
+        _ => 260.0,
+    };
+    let folded = crate::db::fold(&path.to_string_lossy());
+    let location_score = if ["/documents/", "/desktop/", "/bureau/"]
+        .iter()
+        .any(|part| folded.contains(part))
+    {
+        300.0
+    } else if folded.contains("application support") || folded.contains("/library/") {
+        -500.0
+    } else {
+        80.0
+    };
+    let age_days = mtime
+        .map(|value| (now() - value).max(0) as f64 / 86_400.0)
+        .unwrap_or(3650.0);
+    let recency_score = 400.0 / (1.0 + age_days / 30.0);
+    type_score + location_score + recency_score
+}
+
+fn prioritize_paths(db: &Db, paths: &[PathBuf]) -> Result<()> {
+    db.with(|connection| {
+        let mut statement = connection.prepare(
+            "UPDATE enrichment_queue SET access_count=access_count+1,
+             last_accessed=?2, state=CASE WHEN embedding_ready=1 THEN state ELSE 'pending' END,
+             updated_at=?2 WHERE source='files' AND source_ref=?1",
+        )?;
+        for path in paths {
+            statement.execute(params![path.to_string_lossy(), now()])?;
+        }
+        Ok(())
+    })
+}
+
+fn next_enrichment_jobs(db: &Db, limit: usize) -> Result<Vec<(String, String, String)>> {
+    db.with(|connection| {
+        let mut statement = connection.prepare(
+            "SELECT item_id,source,source_ref FROM enrichment_queue
+             WHERE state IN ('pending','error')
+             ORDER BY (base_priority + access_count*1000 +
+                       CASE WHEN last_accessed IS NULL THEN 0 ELSE 2000 END - attempts*250) DESC,
+                      updated_at ASC LIMIT ?1",
+        )?;
+        let rows = statement.query_map([limit.max(1) as i64], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+        let mut jobs = Vec::new();
+        for row in rows {
+            jobs.push(row?);
+        }
+        Ok(jobs)
+    })
+}
+
+fn mark_enrichment_started(db: &Db, item_id: &str) -> Result<()> {
+    db.with(|connection| {
+        connection.execute(
+            "UPDATE enrichment_queue SET state='processing',attempts=attempts+1,
+             updated_at=?2 WHERE item_id=?1",
+            params![item_id, now()],
+        )?;
+        Ok(())
+    })
+}
+
+fn finish_enrichment(db: &Db, item_id: &str, error: Option<&crate::error::AppError>) -> Result<()> {
+    let (has_body, has_vector): (bool, bool) = db.with(|connection| {
+        let body = connection
+            .query_row(
+                "SELECT COALESCE(length(body),0)>0 FROM items WHERE id=?1",
+                [item_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        let vector = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM embeddings WHERE item_id=?1 AND vector IS NOT NULL)",
+                [item_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        Ok((body, vector))
+    })?;
+    let state = if error.is_some() {
+        "error"
+    } else if has_vector {
+        "embedded"
+    } else if has_body {
+        "waiting_embedding"
+    } else {
+        "ineligible"
+    };
+    db.with(|connection| {
+        connection.execute(
+            "UPDATE enrichment_queue SET state=?2,lexical_ready=?3,embedding_ready=?4,
+             last_error=?5,updated_at=?6 WHERE item_id=?1",
+            params![
+                item_id,
+                state,
+                has_body,
+                has_vector,
+                error.map(ToString::to_string),
+                now()
+            ],
+        )?;
+        Ok(())
+    })
+}
+
+fn coverage(db: &Db) -> Result<(i64, i64, i64, f64, f64)> {
+    db.with(|connection| {
+        let (eligible, embedded, lexical): (i64, i64, i64) = connection.query_row(
+            "SELECT COUNT(*),COALESCE(SUM(embedding_ready),0),COALESCE(SUM(lexical_ready),0)
+             FROM enrichment_queue WHERE state NOT IN ('ineligible','removed')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        let pct = if eligible == 0 {
+            0.0
+        } else {
+            embedded as f64 * 100.0 / eligible as f64
+        };
+        let old_high: f64 = connection
+            .query_row(
+                "SELECT COALESCE(MAX(high_water_pct),0) FROM index_metric_log",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0.0);
+        Ok((eligible, embedded, lexical, pct, old_high.max(pct)))
+    })
+}
+
+fn record_coverage(db: &Db, reason: &str) -> Result<()> {
+    let (eligible, embedded, lexical, pct, high) = coverage(db)?;
+    db.with(|connection| {
+        let unchanged = connection
+            .query_row(
+                "SELECT eligible_count=?1 AND embedded_count=?2 AND lexical_count=?3
+                 FROM index_metric_log ORDER BY id DESC LIMIT 1",
+                params![eligible, embedded, lexical],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap_or(false);
+        if unchanged {
+            return Ok(());
+        }
+        connection.execute(
+            "INSERT INTO index_metric_log(recorded_at,eligible_count,embedded_count,
+             lexical_count,coverage_pct,high_water_pct,reason) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![now(), eligible, embedded, lexical, pct, high, reason],
+        )?;
+        Ok(())
+    })
+}
+
 fn collect_project_files(dir: &Path, files: &mut Vec<PathBuf>, stopping: &AtomicBool) {
     const MAX_PROJECT_FILES: usize = 500;
     let mut added = 0;
@@ -870,7 +1443,7 @@ fn file_hash(path: &Path, meta: &std::fs::Metadata) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
-async fn index_file(
+pub(crate) async fn index_file(
     db: &Db,
     llm: &Arc<dyn LlmClient>,
     bus: &Bus,
@@ -893,7 +1466,13 @@ async fn index_file(
         Ok(m) => m,
         Err(_) => return Ok(()), // disparu en cours de traitement → abandon sans erreur
     };
-    let hash = file_hash(path, &meta);
+    // Le hash lit potentiellement plusieurs dizaines de Mo : jamais sur un
+    // worker async partagé avec l'IPC/UI.
+    let hash_path = path.to_path_buf();
+    let hash_meta = meta.clone();
+    let hash = tokio::task::spawn_blocking(move || file_hash(&hash_path, &hash_meta))
+        .await
+        .map_err(|error| crate::error::AppError::Other(format!("hash interrompu : {error}")))?;
     let consent: bool = db
         .with(|c| {
             Ok(c.query_row(
@@ -983,6 +1562,7 @@ async fn index_file(
 /// Le projet fournit l'entité racine (README + arborescence + activité). Les
 /// sources sont indexées séparément pour la recherche, sans changer l'unité de
 /// déplacement utilisée par les outils de rangement.
+#[allow(dead_code)]
 async fn index_project(
     db: &Db,
     llm: &Arc<dyn LlmClient>,
@@ -1089,6 +1669,13 @@ async fn index_project(
 mod tests {
     use super::*;
 
+    fn test_db(label: &str) -> (Db, PathBuf) {
+        let root = std::env::temp_dir().join(format!("syn-{label}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let db = Db::open(&root.join("test.db"), &"1".repeat(64)).unwrap();
+        (db, root)
+    }
+
     #[test]
     fn exclusions_minecraft_et_caches() {
         assert!(is_excluded_dir("node_modules"));
@@ -1154,6 +1741,140 @@ mod tests {
         );
         assert_eq!(results.len(), 1, "{results:#?}");
         assert_eq!(results[0].source_ref, expected.to_string_lossy());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn la_file_couvre_tout_le_corpus_sans_plafond_300() {
+        let (db, root) = test_db("queue-all");
+        db.with(|connection| {
+            for index in 0..750 {
+                connection.execute(
+                    "INSERT INTO items(id,source,source_ref,type,title,ingested_at,status)
+                     VALUES (?1,'files',?2,'document',?1,0,'active')",
+                    params![format!("i{index}"), format!("/Documents/{index}.txt")],
+                )?;
+                connection.execute(
+                    "INSERT INTO enrichment_queue(item_id,source,source_ref,state,base_priority,updated_at)
+                     VALUES (?1,'files',?2,'pending',1,0)",
+                    params![format!("i{index}"), format!("/Documents/{index}.txt")],
+                )?;
+            }
+            Ok(())
+        }).unwrap();
+        assert_eq!(next_enrichment_jobs(&db, 1_000).unwrap().len(), 750);
+        assert_eq!(coverage(&db).unwrap().0, 750);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn la_couverture_expose_un_high_water_monotone() {
+        let (db, root) = test_db("coverage");
+        db.with(|connection| {
+            for index in 0..4 {
+                connection.execute(
+                    "INSERT INTO enrichment_queue(item_id,source,source_ref,state,base_priority,embedding_ready,lexical_ready,updated_at)
+                     VALUES (?1,'files',?2,?3,1,?4,1,0)",
+                    params![format!("i{index}"), format!("/{index}"), if index < 2 { "embedded" } else { "pending" }, index < 2],
+                )?;
+            }
+            Ok(())
+        }).unwrap();
+        record_coverage(&db, "half").unwrap();
+        db.with(|connection| {
+            connection.execute(
+                "INSERT INTO enrichment_queue(item_id,source,source_ref,state,base_priority,updated_at)
+                 VALUES ('new','files','/new','pending',1,0)", [],)?;
+            Ok(())
+        }).unwrap();
+        let (_, _, _, raw, high) = coverage(&db).unwrap();
+        assert!(raw < high);
+        assert_eq!(high, 50.0);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn un_replay_valide_ne_declenche_aucun_rescan_complet() {
+        let (db, root_dir) = test_db("fsevents-delta");
+        let root = root_dir.to_string_lossy().to_string();
+        let changed = root_dir.join("ancien.txt");
+        let recovery = apply_fsevents_replay(
+            &db,
+            &root,
+            41,
+            &serde_json::json!({
+                "valid": true,
+                "current_id": 44,
+                "events": [{"path": changed}]
+            }),
+        );
+        assert!(
+            matches!(recovery, FsRecovery::Delta { paths, current: 44, .. } if paths.len() == 1)
+        );
+        let counters: (i64, i64, i64, i64) = db.with(|connection| {
+            connection.query_row(
+                "SELECT replay_count,replayed_events,full_scan_count,last_event_id FROM fs_journal_state WHERE root=?1",
+                [&root],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            ).map_err(Into::into)
+        }).unwrap();
+        assert_eq!(
+            counters,
+            (1, 1, 0, 41),
+            "le curseur ne doit pas avancer avant l'écriture du delta"
+        );
+        set_fsevents_checkpoint(&db, &root, 44).unwrap();
+        let stored: i64 = db
+            .with(|connection| {
+                connection
+                    .query_row(
+                        "SELECT last_event_id FROM fs_journal_state WHERE root=?1",
+                        [&root],
+                        |row| row.get(0),
+                    )
+                    .map_err(Into::into)
+            })
+            .unwrap();
+        assert_eq!(stored, 44);
+        let _ = std::fs::remove_dir_all(root_dir);
+    }
+
+    #[tokio::test]
+    async fn le_watcher_reprogramme_uniquement_un_fichier_modifie() {
+        let (db, root) = test_db("watcher-delta");
+        let path = root.join("ancien.txt");
+        std::fs::write(&path, "version une").unwrap();
+        catalog_metadata(&db, std::slice::from_ref(&path))
+            .await
+            .unwrap();
+        db.with(|connection| {
+            connection.execute(
+                "UPDATE items SET hash='contenu-complet' WHERE source_ref=?1",
+                [path.to_string_lossy().to_string()],
+            )?;
+            connection.execute(
+                "UPDATE enrichment_queue SET state='embedded',embedding_ready=1",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        std::fs::write(&path, "version deux sensiblement plus longue").unwrap();
+        catalog_metadata(&db, std::slice::from_ref(&path))
+            .await
+            .unwrap();
+        let state: (String, bool) = db
+            .with(|connection| {
+                connection
+                    .query_row(
+                        "SELECT state,embedding_ready FROM enrichment_queue",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .map_err(Into::into)
+            })
+            .unwrap();
+        assert_eq!(state, ("pending".into(), false));
         let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -16,6 +16,8 @@ export type PageId =
   | "economie";
 
 export const [screen, setScreen] = createSignal<Screen>("loading");
+/// Vrai pendant la préparation du moteur, après déverrouillage.
+export const [preparing, setPreparing] = createSignal(false);
 export const [page, setPage] = createSignal<PageId>("accueil");
 export const [settings, setSettings] = createSignal<Settings | null>(null);
 export const [status, setStatus] = createSignal<AppStatus | null>(null);
@@ -45,11 +47,31 @@ export async function refreshStatus() {
       const st = await ipc.getSettings();
       setSettings(st);
       if (!st.onboarding_done) setScreen("onboarding");
-      else setScreen("app");
+      else await enterApp();
     }
   } catch (e: any) {
     setLoadError(e?.message ?? String(e));
   }
+}
+
+/// Délai maximal d'attente au démarrage. Passé ce temps, on entre quand même :
+/// un moteur lent ou absent ne doit jamais retenir l'utilisateur devant un
+/// écran de chargement.
+const PREPARATION_MAX_MS = 10_000;
+
+/// N'affiche l'application qu'une fois les modèles chargés — mais jamais plus
+/// longtemps que nécessaire. C'est la contrepartie honnête de l'écran de
+/// démarrage : il ne dure pas un temps fixe, il dure le temps du travail réel.
+async function enterApp() {
+  const started = Date.now();
+  while (Date.now() - started < PREPARATION_MAX_MS) {
+    const ready = await ipc.runtimeReady().catch(() => true);
+    if (ready) break;
+    setPreparing(true);
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  setPreparing(false);
+  setScreen("app");
 }
 
 export async function refreshSettings() {

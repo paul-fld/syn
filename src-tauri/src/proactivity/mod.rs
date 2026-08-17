@@ -69,7 +69,7 @@ pub fn arbitrate(db: &Db, bus: &Bus, candidate: Candidate) -> Result<bool> {
     }
     // Anti-répétition : même raison déjà surfacée aujourd'hui.
     let today_start = today_start_ts();
-    let repeated: bool = db.with(|c| {
+    let repeated: bool = db.read(|c| {
         Ok(c.query_row(
             "SELECT 1 FROM proactive_log WHERE reason = ?1 AND surfaced_at >= ?2",
             params![candidate.reason, today_start],
@@ -81,7 +81,7 @@ pub fn arbitrate(db: &Db, bus: &Bus, candidate: Candidate) -> Result<bool> {
         return Ok(false);
     }
     // Budget de rareté : plafond/jour ; `urgent` passe toujours ; `info` premier sacrifié.
-    let surfaced_today: i64 = db.with(|c| {
+    let surfaced_today: i64 = db.read(|c| {
         Ok(c.query_row(
             "SELECT COUNT(*) FROM proactive_log WHERE surfaced_at >= ?1 AND kind != 'brief'",
             params![today_start],
@@ -217,7 +217,7 @@ pub async fn evaluate_tick(db: &Db, bus: &Bus) -> Result<()> {
 
     // — Engagements arrivant à échéance (<24 h) —
     let soon = now() + 86_400;
-    let commitments: Vec<(String, String)> = db.with(|c| {
+    let commitments: Vec<(String, String)> = db.read(|c| {
         let mut stmt = c.prepare(
             "SELECT id, text FROM commitments WHERE status='open' AND due IS NOT NULL AND due <= ?1 AND due >= ?2",
         )?;
@@ -243,7 +243,7 @@ pub async fn evaluate_tick(db: &Db, bus: &Bus) -> Result<()> {
     }
 
     // — Événements imminents (<30 min) —
-    let events: Vec<Value> = db.with(|c| {
+    let events: Vec<Value> = db.read(|c| {
         let mut stmt = c.prepare(
             "SELECT title, \"start\" FROM events WHERE \"start\" > ?1 AND \"start\" <= ?2",
         )?;
@@ -277,7 +277,7 @@ pub async fn evaluate_tick(db: &Db, bus: &Bus) -> Result<()> {
     }
 
     // — Déclencheurs issus des Règles (source=rule, threshold reconnus) —
-    let triggers: Vec<(String, String, String, String)> = db.with(|c| {
+    let triggers: Vec<(String, String, String, String)> = db.read(|c| {
         let mut stmt = c.prepare(
             "SELECT id, condition, priority, reason_template FROM triggers WHERE enabled=1 AND type='threshold'",
         )?;
@@ -343,7 +343,7 @@ pub async fn evaluate_tick(db: &Db, bus: &Bus) -> Result<()> {
 }
 
 pub fn list_surfacings(db: &Db, limit: usize) -> Result<Vec<Value>> {
-    db.with(|c| {
+    db.read(|c| {
         let mut stmt = c.prepare(
             "SELECT id, kind, reason, body, priority, surfaced_at, dismissed FROM proactive_log
              ORDER BY surfaced_at DESC LIMIT ?1",

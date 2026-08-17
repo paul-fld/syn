@@ -95,7 +95,7 @@ pub fn upsert_item(db: &Db, it: &Item) -> Result<(String, bool)> {
 }
 
 pub fn item_hash(db: &Db, source: &str, source_ref: &str) -> Result<Option<String>> {
-    db.with(|c| {
+    db.read(|c| {
         c.query_row(
             "SELECT hash FROM items WHERE source=?1 AND source_ref=?2 AND status='active'",
             params![source, source_ref],
@@ -189,7 +189,7 @@ pub fn persist_turn(db: &Db, session_id: &str, role: &str, content: &str) -> Res
 /// Résumé de long terme d'une session : les tours trop anciens pour tenir dans
 /// la fenêtre sont condensés une fois pour toutes (mémoire de travail, doc §13).
 pub fn session_summary(db: &Db, session_id: &str) -> Result<Option<String>> {
-    db.with(|c| {
+    db.read(|c| {
         Ok(c.query_row(
             "SELECT summary FROM sessions WHERE id=?1",
             params![session_id],
@@ -210,7 +210,7 @@ pub fn set_session_summary(db: &Db, session_id: &str, summary: &str) -> Result<(
 }
 
 pub fn turn_count(db: &Db, session_id: &str) -> Result<i64> {
-    db.with(|c| {
+    db.read(|c| {
         Ok(c.query_row(
             "SELECT COUNT(*) FROM conversations WHERE session_id=?1 AND role IN ('user','assistant')",
             params![session_id],
@@ -227,7 +227,7 @@ pub fn older_turns(
     skip_recent: usize,
     cap: usize,
 ) -> Result<Vec<(String, String)>> {
-    db.with(|c| {
+    db.read(|c| {
         let mut stmt = c.prepare(
             "SELECT role, content FROM (
                SELECT role, content, turn FROM conversations
@@ -273,7 +273,7 @@ pub fn project_context(
     session_id: &str,
     limit: usize,
 ) -> Result<Option<(String, String, String)>> {
-    db.with(|c| {
+    db.read(|c| {
         let project: Option<(String, String)> = c
             .query_row(
                 "SELECT p.id, p.name FROM sessions s JOIN projects p ON p.id=s.project_id
@@ -423,7 +423,7 @@ pub fn find_person_by_channel(db: &Db, handle: &str) -> Result<Option<String>> {
         .into_iter()
         .rev()
         .collect();
-    db.with(|c| {
+    db.read(|c| {
         let mut stmt = c.prepare(
             "SELECT id, COALESCE(comm_channels,'') FROM people WHERE comm_channels IS NOT NULL",
         )?;

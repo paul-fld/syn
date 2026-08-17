@@ -47,7 +47,7 @@ pub fn list(db: &Db) -> Result<Vec<ConnectorInfo>> {
         known.insert(1, ("apple", "apple", "connected"));
         known.insert(2, ("messages", "messages", "disconnected"));
     }
-    db.with(|c| {
+    db.read(|c| {
         let mut out = vec![];
         for (id, ty, default_status) in known {
             let row: Option<(String, Option<String>, Option<i64>, Option<String>)> = c
@@ -159,7 +159,7 @@ pub fn is_connected(db: &Db, id: &str) -> bool {
     if id == "apple" && cfg!(target_os = "macos") {
         return true;
     }
-    db.with(|c| {
+    db.read(|c| {
         Ok(c.query_row(
             "SELECT status FROM connectors WHERE id=?1",
             params![id],

@@ -64,6 +64,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             // session & sécurité
             ipc::app_status,
+            ipc::runtime_ready,
             ipc::setup_master,
             ipc::unlock,
             ipc::unlock_with_keychain,

@@ -189,7 +189,7 @@ pub fn log_executed(
 }
 
 pub fn get_action(db: &Db, id: &str) -> Result<ActionRecord> {
-    db.with(|c| {
+    db.read(|c| {
         c.query_row(
             "SELECT tool, input, status, undo_data, session_id FROM actions_log WHERE id = ?1",
             params![id],
@@ -230,7 +230,7 @@ pub fn list_pending(db: &Db) -> Result<Vec<PendingAction>> {
 }
 
 pub fn list_actions(db: &Db, status: Option<&str>, limit: usize) -> Result<Vec<PendingAction>> {
-    db.with(|c| {
+    db.read(|c| {
         let sql = match status {
             Some(_) => {
                 "SELECT id, tool, input, risk_class, status, preview, result, created_at, derived_from_untrusted, session_id,

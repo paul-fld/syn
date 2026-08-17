@@ -20,6 +20,8 @@ pub enum BusEvent {
         path: String,
         reason: String,
     },
+    /// Les modèles sont chargés : l'écran de démarrage peut s'effacer.
+    RuntimeReady,
     /// Fragment de réponse produit au fil de la génération. Sans lui, Syn
     /// attend d'avoir écrit sa réponse ENTIÈRE avant d'afficher le premier mot :
     /// le temps d'attente est le même, mais il est vécu comme un blocage.

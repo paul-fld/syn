@@ -25,6 +25,10 @@ pub struct AppState {
     pub bus: Bus,
     pub egress: Arc<EgressGuard>,
     pub data_dir: PathBuf,
+    /// Les modèles sont-ils chargés en mémoire ? L'écran de démarrage attend
+    /// ce drapeau plutôt qu'un délai arbitraire : on ne fait patienter
+    /// l'utilisateur que le temps réellement nécessaire.
+    pub runtime_ready: Arc<std::sync::atomic::AtomicBool>,
     core: RwLock<Option<Arc<Core>>>,
 }
 
@@ -36,6 +40,7 @@ impl AppState {
             bus: Bus::new(),
             egress: Arc::new(EgressGuard::new()),
             data_dir,
+            runtime_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             core: RwLock::new(None),
         }
     }
@@ -99,7 +104,14 @@ impl AppState {
         // cela, c'est la première question de l'utilisateur qui attend que les
         // poids montent en mémoire — le pire moment possible.
         let warming = core.llm.clone();
-        tauri::async_runtime::spawn(async move { warming.warm_up().await });
+        let ready_flag = self.runtime_ready.clone();
+        let ready_bus = self.bus.clone();
+        ready_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+        tauri::async_runtime::spawn(async move {
+            warming.warm_up().await;
+            ready_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            ready_bus.emit(crate::bus::BusEvent::RuntimeReady);
+        });
         // Aucun rescan au démarrage : Indexer rejoue FSEvents depuis le point
         // de contrôle persistant et ne demande un catalogue de secours que si
         // macOS déclare l'historique purgé ou invalide.

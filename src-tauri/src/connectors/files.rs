@@ -696,7 +696,7 @@ impl Indexer {
     }
 
     pub fn status(&self, db: &Db) -> Result<IndexStatus> {
-        let (items_count, pending, sensitive, unreadable) = db.with(|c| {
+        let (items_count, pending, sensitive, unreadable) = db.read(|c| {
             let items: i64 = c.query_row(
                 "SELECT COUNT(*) FROM items WHERE source='files' AND status='active'",
                 [],
@@ -717,7 +717,7 @@ impl Indexer {
             )?;
             Ok((items, pending, sensitive, unreadable))
         })?;
-        let folders = db.with(|c| {
+        let folders = db.read(|c| {
             let mut stmt = c.prepare(
                 "SELECT path, last_indexed FROM folders WHERE status='active' ORDER BY path",
             )?;
@@ -737,7 +737,7 @@ impl Indexer {
         let catalog_ready =
             !folders.is_empty() && folders.iter().all(|folder| folder.last_indexed.is_some());
         let (eligible, embedded, lexical, coverage_pct, high_water) = coverage(db)?;
-        let (replay_count, replayed_events, fallback_count, full_scan_count) = db.with(|c| {
+        let (replay_count, replayed_events, fallback_count, full_scan_count) = db.read(|c| {
             c.query_row(
                 "SELECT COALESCE(SUM(replay_count),0),COALESCE(SUM(replayed_events),0),
                         COALESCE(SUM(fallback_count),0),COALESCE(SUM(full_scan_count),0)
@@ -782,7 +782,7 @@ impl Indexer {
 }
 
 fn reconcile_missing_files(db: &Db, folders: &[String]) -> Result<usize> {
-    let indexed: Vec<String> = db.with(|c| {
+    let indexed: Vec<String> = db.read(|c| {
         let mut stmt =
             c.prepare("SELECT source_ref FROM items WHERE source='files' AND status='active'")?;
         let rows = stmt.query_map([], |row| row.get(0))?;
@@ -874,7 +874,7 @@ fn replay_fsevents(db: &Db) -> Vec<FsRecovery> {
     let mut recoveries = Vec::new();
     for root in roots {
         let since = db
-            .with(|connection| {
+            .read(|connection| {
                 Ok(connection
                     .query_row(
                         "SELECT last_event_id FROM fs_journal_state WHERE root=?1",
@@ -999,7 +999,7 @@ pub fn ensure_full_access_scope(db: &Db) -> Result<(String, bool)> {
         .unwrap_or(home)
         .to_string_lossy()
         .to_string();
-    let existed = db.with(|c| {
+    let existed = db.read(|c| {
         Ok(c.query_row(
             "SELECT status='active' FROM folders WHERE path=?1",
             rusqlite::params![root],
@@ -1219,7 +1219,7 @@ fn prioritize_paths(db: &Db, paths: &[PathBuf]) -> Result<()> {
 }
 
 fn next_enrichment_jobs(db: &Db, limit: usize) -> Result<Vec<(String, String, String)>> {
-    db.with(|connection| {
+    db.read(|connection| {
         let mut statement = connection.prepare(
             "SELECT item_id,source,source_ref FROM enrichment_queue
              WHERE state IN ('pending','error')
@@ -1250,7 +1250,7 @@ fn mark_enrichment_started(db: &Db, item_id: &str) -> Result<()> {
 }
 
 fn finish_enrichment(db: &Db, item_id: &str, error: Option<&crate::error::AppError>) -> Result<()> {
-    let (has_body, has_vector): (bool, bool) = db.with(|connection| {
+    let (has_body, has_vector): (bool, bool) = db.read(|connection| {
         let body = connection
             .query_row(
                 "SELECT COALESCE(length(body),0)>0 FROM items WHERE id=?1",
@@ -1294,7 +1294,7 @@ fn finish_enrichment(db: &Db, item_id: &str, error: Option<&crate::error::AppErr
 }
 
 fn coverage(db: &Db) -> Result<(i64, i64, i64, f64, f64)> {
-    db.with(|connection| {
+    db.read(|connection| {
         let (eligible, embedded, lexical): (i64, i64, i64) = connection.query_row(
             "SELECT COUNT(*),COALESCE(SUM(embedding_ready),0),COALESCE(SUM(lexical_ready),0)
              FROM enrichment_queue WHERE state NOT IN ('ineligible','removed')",
@@ -1451,7 +1451,7 @@ pub(crate) async fn index_file(
     path: &Path,
 ) -> Result<()> {
     let source_ref = path.to_string_lossy().to_string();
-    let ignored = db.with(|c| {
+    let ignored = db.read(|c| {
         Ok(c.query_row(
             "SELECT 1 FROM ignored_items WHERE source='files' AND source_ref=?1",
             rusqlite::params![source_ref],
@@ -1474,7 +1474,7 @@ pub(crate) async fn index_file(
         .await
         .map_err(|error| crate::error::AppError::Other(format!("hash interrompu : {error}")))?;
     let consent: bool = db
-        .with(|c| {
+        .read(|c| {
             Ok(c.query_row(
                 "SELECT value FROM settings WHERE key='sensitive_consent'",
                 [],
@@ -1484,7 +1484,7 @@ pub(crate) async fn index_file(
             .unwrap_or(false))
         })
         .unwrap_or(false);
-    let was_sensitive_metadata_only = db.with(|c| {
+    let was_sensitive_metadata_only = db.read(|c| {
         Ok(c.query_row(
             "SELECT type='sensible_non_lu' FROM items WHERE source='files' AND source_ref=?1",
             rusqlite::params![source_ref],
@@ -1571,7 +1571,7 @@ async fn index_project(
     dir: &Path,
 ) -> Result<()> {
     let source_ref = dir.to_string_lossy().to_string();
-    let ignored = db.with(|c| {
+    let ignored = db.read(|c| {
         Ok(c.query_row(
             "SELECT 1 FROM ignored_items WHERE source='files' AND source_ref=?1",
             rusqlite::params![source_ref],
@@ -1811,7 +1811,7 @@ mod tests {
         assert!(
             matches!(recovery, FsRecovery::Delta { paths, current: 44, .. } if paths.len() == 1)
         );
-        let counters: (i64, i64, i64, i64) = db.with(|connection| {
+        let counters: (i64, i64, i64, i64) = db.read(|connection| {
             connection.query_row(
                 "SELECT replay_count,replayed_events,full_scan_count,last_event_id FROM fs_journal_state WHERE root=?1",
                 [&root],
@@ -1825,7 +1825,7 @@ mod tests {
         );
         set_fsevents_checkpoint(&db, &root, 44).unwrap();
         let stored: i64 = db
-            .with(|connection| {
+            .read(|connection| {
                 connection
                     .query_row(
                         "SELECT last_event_id FROM fs_journal_state WHERE root=?1",
@@ -1864,7 +1864,7 @@ mod tests {
             .await
             .unwrap();
         let state: (String, bool) = db
-            .with(|connection| {
+            .read(|connection| {
                 connection
                     .query_row(
                         "SELECT state,embedding_ready FROM enrichment_queue",

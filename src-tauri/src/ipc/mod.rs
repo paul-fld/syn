@@ -39,6 +39,14 @@ pub fn app_status(state: State<'_, AppState>) -> Value {
     })
 }
 
+/// Les modèles locaux sont-ils chargés ? L'écran de démarrage s'appuie dessus.
+/// Répond aussi `true` quand le moteur est absent : mieux vaut entrer dans une
+/// application dégradée que rester bloqué sur un écran d'attente.
+#[tauri::command]
+pub fn runtime_ready(state: State<'_, AppState>) -> bool {
+    state.runtime_ready.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 #[tauri::command]
 pub fn setup_master(
     state: State<'_, AppState>,
@@ -148,7 +156,7 @@ pub async fn query(
 #[tauri::command]
 pub fn list_sessions(state: State<'_, AppState>) -> Result<Vec<Value>> {
     let core = state.core()?;
-    core.db.with(|c| {
+    core.db.read(|c| {
         let mut stmt = c.prepare(
             "SELECT s.id, s.title, s.created_at, s.updated_at, s.project_id, p.name
              FROM sessions s LEFT JOIN projects p ON p.id = s.project_id
@@ -218,7 +226,7 @@ pub fn delete_session(state: State<'_, AppState>, session_id: String) -> Result<
 #[tauri::command]
 pub fn list_projects(state: State<'_, AppState>) -> Result<Vec<Value>> {
     let core = state.core()?;
-    core.db.with(|c| {
+    core.db.read(|c| {
         let mut stmt = c.prepare(
             "SELECT p.id, p.name, p.created_at, p.updated_at, COUNT(s.id)
              FROM projects p LEFT JOIN sessions s ON s.project_id=p.id
@@ -301,7 +309,7 @@ pub fn move_session_to_project(
 #[tauri::command]
 pub fn get_conversation(state: State<'_, AppState>, session_id: String) -> Result<Vec<Value>> {
     let core = state.core()?;
-    core.db.with(|c| {
+    core.db.read(|c| {
         let mut stmt = c.prepare(
             "SELECT role, content, created_at FROM conversations
              WHERE session_id = ?1 AND role IN ('user','assistant') ORDER BY turn",
@@ -727,7 +735,7 @@ pub fn set_settings(
     }
     crate::settings::save(&core.db, &new_settings)?;
     if current.sensitive_consent && !new_settings.sensitive_consent {
-        let sensitive_ids: Vec<String> = core.db.with(|c| {
+        let sensitive_ids: Vec<String> = core.db.read(|c| {
             let mut stmt =
                 c.prepare("SELECT id, path FROM items WHERE source='files' AND status='active'")?;
             let rows = stmt.query_map([], |r| {
@@ -758,7 +766,7 @@ pub fn set_settings(
             Ok(())
         })?;
     } else if !current.sensitive_consent && new_settings.sensitive_consent {
-        let paths = core.db.with(|c| {
+        let paths = core.db.read(|c| {
             let mut statement = c.prepare(
                 "SELECT source_ref FROM items WHERE source='files'
                  AND type='sensible_non_lu' AND status='active'",
@@ -875,7 +883,7 @@ pub fn files_activate_full_access(state: State<'_, AppState>) -> Result<Value> {
             .tx
             .send(files::IndexJob::FullScan(Some(root.clone().into())));
     } else if sensitive_was_disabled {
-        let paths = core.db.with(|c| {
+        let paths = core.db.read(|c| {
             let mut statement = c.prepare(
                 "SELECT source_ref FROM items WHERE source='files'
                  AND type='sensible_non_lu' AND status='active'",
@@ -984,7 +992,7 @@ pub async fn search_memory(
 #[tauri::command]
 pub fn knowledge_stats(state: State<'_, AppState>) -> Result<Value> {
     let core = state.core()?;
-    core.db.with(|c| {
+    core.db.read(|c| {
         let mut stmt = c.prepare(
             "SELECT source, type, COUNT(*) FROM items WHERE status='active' GROUP BY source, type",
         )?;
@@ -1010,7 +1018,7 @@ pub fn knowledge_file_groups(state: State<'_, AppState>) -> Result<Vec<Value>> {
 
     let core = state.core()?;
     let home = dirs::home_dir();
-    core.db.with(|c| {
+    core.db.read(|c| {
         let mut stmt = c.prepare(
             "SELECT type, title, path, ingested_at FROM items
              WHERE source='files' AND status='active' ORDER BY ingested_at DESC",
@@ -1085,7 +1093,7 @@ pub fn list_knowledge(
     limit: Option<i64>,
 ) -> Result<Vec<Value>> {
     let core = state.core()?;
-    core.db.with(|c| {
+    core.db.read(|c| {
         let sql = "SELECT id, source, source_ref, type, title, path, size, mtime, ingested_at FROM items
                    WHERE status='active'
                    AND (?1 IS NULL OR source = ?1)
@@ -1285,7 +1293,7 @@ pub fn dismiss_surfacing(state: State<'_, AppState>, id: String) -> Result<()> {
 #[tauri::command]
 pub fn list_triggers(state: State<'_, AppState>) -> Result<Vec<Value>> {
     let core = state.core()?;
-    core.db.with(|c| {
+    core.db.read(|c| {
         let mut stmt = c.prepare(
             "SELECT t.id, t.type, t.condition, t.priority, t.reason_template, t.action, t.source, t.enabled, t.last_fired, r.text
              FROM triggers t LEFT JOIN rules r ON r.id = t.rule_id ORDER BY t.rowid DESC",
@@ -1340,7 +1348,7 @@ pub fn system_snapshot(state: State<'_, AppState>) -> Result<Value> {
 #[tauri::command]
 pub fn access_log_list(state: State<'_, AppState>, limit: Option<usize>) -> Result<Vec<Value>> {
     let core = state.core()?;
-    core.db.with(|c| {
+    core.db.read(|c| {
         let mut stmt = c.prepare(
             "SELECT connector, operation, item_ref, created_at FROM access_log ORDER BY created_at DESC LIMIT ?1",
         )?;
@@ -1387,7 +1395,7 @@ pub fn storage_stats(state: State<'_, AppState>) -> Result<Value> {
     let db_size = std::fs::metadata(state.db_path())
         .map(|m| m.len())
         .unwrap_or(0);
-    let (items, embeddings): (i64, i64) = core.db.with(|c| {
+    let (items, embeddings): (i64, i64) = core.db.read(|c| {
         Ok((
             c.query_row("SELECT COUNT(*) FROM items", [], |r| r.get(0))?,
             c.query_row("SELECT COUNT(*) FROM embeddings", [], |r| r.get(0))?,
@@ -1453,7 +1461,7 @@ pub fn open_source(
     // Garde de périmètre (audit §2) : on n'ouvre que ce que Syn connaît —
     // un chemin indexé ou couvert par un dossier suivi. source_ref provient
     // de l'UI, donc indirectement du contenu indexé.
-    let known: bool = core.db.with(|c| {
+    let known: bool = core.db.read(|c| {
         Ok(c.query_row(
             "SELECT 1 FROM items WHERE source_ref=?1 OR path=?1 LIMIT 1",
             rusqlite::params![source_ref],

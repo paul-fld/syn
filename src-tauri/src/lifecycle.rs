@@ -184,6 +184,7 @@ pub fn forward_bus(app: &AppHandle) {
                 BusEvent::ItemIngested { .. } => "item_ingested",
                 BusEvent::IngestionStatus { .. } => "ingestion_status",
                 BusEvent::FilesError { .. } => "files_error",
+                BusEvent::RuntimeReady => "runtime_ready",
                 BusEvent::AnswerDelta { .. } => "answer_delta",
                 BusEvent::SemanticResults { .. } => "semantic_results",
                 BusEvent::SyncProgress { .. } => "sync_progress",

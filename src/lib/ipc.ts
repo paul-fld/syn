@@ -395,6 +395,7 @@ export const ipc = {
   // données & divers
   storageStats: () => invoke<any>("storage_stats"),
   dataDirPath: () => invoke<string>("data_dir_path"),
+  runtimeReady: () => invoke<boolean>("runtime_ready"),
   purgeAllData: (password: string) => invoke<void>("purge_all_data", { password }),
   onboardingComplete: () => invoke<void>("onboarding_complete"),
   openSource: (sourceRef: string) => invoke<void>("open_source", { sourceRef }),

@@ -316,8 +316,14 @@ function App(): JSX.Element {
   return (
     <>
       <Show when={screen() === "loading"}>
-        <div class="lock-shell">
+        <div class="lock-shell boot-shell">
           <SynGlyph size={54} />
+          {/* Le chargement n'est signalé que tant qu'il dure réellement : pas de
+              temporisation cosmétique, et rien qui tourne si une erreur est
+              survenue — l'utilisateur aurait attendu pour rien. */}
+          <Show when={!loadError()}>
+            <div class="boot-spinner" role="status" aria-label="Préparation de Syn" />
+          </Show>
           <Show when={loadError()}>
             <div class="empty-note" style={{ "margin-top": "14px", "max-width": "360px", "text-align": "center" }}>
               Syn n'a pas pu démarrer : {loadError()}

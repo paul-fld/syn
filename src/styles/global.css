@@ -1886,3 +1886,26 @@ select.select {
     transform: none;
   }
 }
+
+/* ————— Écran de démarrage (maquette « Loading ») —————
+   Glyphe centré et anneau de progression, sur le fond de l'application. Le
+   fond est peint explicitement : sans lui, la fenêtre laisse voir le bureau
+   pendant la première frame. */
+.boot-shell {
+  background: var(--bg-window);
+  gap: 22px;
+}
+.boot-spinner {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-right-color: transparent;
+  opacity: 0.7;
+  animation: syn-boot-spin 0.8s linear infinite;
+}
+@keyframes syn-boot-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .boot-spinner { animation-duration: 2.4s; }
+}

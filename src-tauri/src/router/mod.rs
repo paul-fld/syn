@@ -2,6 +2,37 @@
 //! observe → respond, orchestrée en Rust. Le modèle n'orchestre pas — il est
 //! appelé À L'INTÉRIEUR de la boucle. La confirmation est un point d'arrêt
 //! DANS la boucle (plancher humain), pas une couche UI par-dessus.
+//!
+//! # Le modèle comprend, le déterministe garantit
+//!
+//! Cette ligne de partage n'est pas un principe abstrait : chaque fois qu'elle
+//! a été franchie, un défaut est apparu. Elle s'énonce en deux règles.
+//!
+//! **Comprendre est le travail du modèle.** De quoi l'utilisateur parle, ce
+//! qu'il veut, si sa réponse est un accord ou une correction, quel compte il
+//! désigne : tout cela relève du sens, et le sens ne se lit pas dans une liste
+//! de mots. « Demande-lui s'il est d'accord » n'est pas un accord ; « tu peux
+//! envoyer un courriel à Julie » n'est pas une confirmation d'envoi. Les
+//! fonctions à mots-clés de ce fichier ne servent plus qu'à DEUX choses : tenir
+//! le service quand le modèle est arrêté (`intent::Source::Fallback`), et
+//! reconnaître des noms propres d'un inventaire fermé (Gmail, OneDrive…).
+//! Aucune ne doit décider à la place d'une compréhension disponible.
+//!
+//! **Garantir est le travail du code.** La légitimité d'un destinataire, le
+//! plancher de confirmation, la vérification qu'un envoi affirmé a bien eu
+//! lieu, la provenance d'une action dérivée d'un contenu observé : ce sont des
+//! garanties, pas des interprétations. Elles ne passent jamais par le modèle,
+//! et une compréhension erronée ne doit jamais pouvoir les contourner.
+//!
+//! Corollaire de conception : rien d'irréversible ne dépend d'une
+//! compréhension. Au pire, une erreur de sens produit un échange maladroit —
+//! jamais une action non voulue. C'est ce qui rend acceptable de confier le
+//! sens à un modèle local faillible.
+//!
+//! Les deux mesures qui tiennent cette ligne vivante :
+//! `mesure_du_taux_derreur_avec_comprehension` (aiguillage) et
+//! `mesure_des_reponses_en_cours_de_parcours` (réponses en cours de parcours).
+//! Toutes deux exigent `--test-threads=1`.
 
 #[cfg(test)]
 pub mod eval;
@@ -68,17 +99,9 @@ pub async fn handle_query_with_context(
     // 1. PERCEVOIR — continuité de conversation.
     memory::ensure_session(db, session_id, user_text)?;
     memory::persist_turn(db, session_id, "user", user_text)?;
-    if let Some(answer) =
-        confirm_pending_mail_from_chat(core, session_id, user_text, &settings).await?
-    {
-        return Ok(answer);
-    }
-    // Une étape d'envoi en cours (relecture du texte, choix du compte) se
-    // résout sans le modèle : « oui » ne doit ni coûter une inférence, ni
-    // risquer d'être reformulé en autre chose.
-    if let Some(answer) = mail_flow::handle_user_reply(core, session_id, user_text, &settings)? {
-        return Ok(answer);
-    }
+    // L'étape que Syn attend, s'il en attend une. Elle part AVEC la question au
+    // modèle : « oui » n'a de sens que rapporté à ce qui vient d'être demandé.
+    let etape = mail_flow::pending_step(db, session_id)?;
     let convo = memory::recent_turns(db, session_id, 12)?;
     // Copie de la parole utilisateur avant ajout éventuel du contexte d'écran :
     // elle sert à vérifier qu'un destinataire vient bien d'un canal fiable.
@@ -100,6 +123,7 @@ pub async fn handle_query_with_context(
         // Le tour courant est déjà persisté : on ne le remet pas en contexte
         // de lui-même.
         convo.split_last().map(|(_, avant)| avant).unwrap_or(&[]),
+        etape,
         intent::fallback(
             user_text,
             keyword_request.clone(),
@@ -117,28 +141,68 @@ pub async fn handle_query_with_context(
     )
     .await;
 
-    // Une correction (« ces fichiers n'ont rien à voir ») reste traitée par la
-    // continuité de conversation : elle porte sur la recherche précédente, pas
-    // sur une intention nouvelle.
+    // Une étape en cours se résout avec ce que le modèle a compris de la
+    // réponse — accord, correction, compte désigné. Les listes de mots ne
+    // servent plus que si le modèle n'a rien pu dire (arrêté, ou dépassé).
+    let lecture = etape.map(|etape| {
+        mail_flow::read_reply(
+            etape,
+            understood.reply,
+            user_text,
+            &crate::connectors::mail::available_channels(db),
+        )
+    });
+    if let (Some(etape), Some(lecture)) = (etape, lecture) {
+        // Confirmer un envoi par le fil de conversation : c'est le geste le plus
+        // conséquent du parcours, et il dépendait d'une liste de mots capable de
+        // faire partir un mail sur « tu peux envoyer un courriel à Julie… ».
+        if etape == intent::Step::SendConfirmation {
+            if lecture == intent::Reply::Accord {
+                if let Some(answer) =
+                    confirm_pending_mail_from_chat(core, session_id, &settings).await?
+                {
+                    return Ok(answer);
+                }
+            }
+        } else if let Some(answer) =
+            mail_flow::handle_user_reply(core, session_id, etape, lecture, &settings)?
+        {
+            return Ok(answer);
+        }
+    }
+
+    // Une correction (« ces fichiers n'ont rien à voir ») porte sur la recherche
+    // précédente, pas sur une intention nouvelle : elle reprend le sujet du
+    // tour d'avant. Mais elle ne PRIME plus sur la compréhension — un « ça n'a
+    // rien à voir » lâché en pleine rédaction de mail rejouait une recherche de
+    // documents, quoi que le modèle ait compris.
     let correction = keyword_request
         .as_ref()
         .filter(|(_, is_correction)| *is_correction)
         .cloned();
-    let file_request = match (&correction, understood.kind) {
-        (Some(correction), _) => Some(correction.clone()),
-        (None, intent::Kind::FileSearch) => Some((
-            understood
-                .subject
-                .clone()
-                .unwrap_or_else(|| requested_document_query(user_text)),
-            false,
-        )),
+    let file_request = match understood.kind {
+        intent::Kind::FileSearch => Some(match &correction {
+            Some(correction) => correction.clone(),
+            None => (
+                understood
+                    .subject
+                    .clone()
+                    .unwrap_or_else(|| requested_document_query(user_text)),
+                false,
+            ),
+        }),
+        // Hors ligne, la compréhension retombe sur les mots-clés : une
+        // correction reconnue reste alors le seul indice disponible.
+        _ if understood.source == intent::Source::Fallback => correction.clone(),
         _ => None,
     };
     let device_only = understood.kind == intent::Kind::DeviceDiagnostic;
     let file_search = file_request.is_some();
+    // L'intention comprise fait foi. Le repli à mots-clés ne sert plus qu'à
+    // rattraper le cas où le modèle n'a rien pu dire.
     let mail_composition = understood.kind == intent::Kind::MailCompose
-        || (is_mail_content_followup(user_text)
+        || (understood.source == intent::Source::Fallback
+            && is_mail_content_followup(user_text)
             && trusted_user_history.lines().any(is_mail_composition_query));
     emit_progress(
         core,
@@ -235,9 +299,10 @@ pub async fn handle_query_with_context(
     // modèle par un appel d'outil ne marchait pas — il écrivait le mail dans sa
     // réponse, puis prétendait l'avoir envoyé sans qu'aucun outil ait tourné.
     if mail_composition && destinataire_connu {
-        // Un texte en attente de relecture + une réponse qui n'est pas un
-        // accord (`handle_user_reply` aurait répondu) = une correction demandée.
-        let correction_demandee = composition_en_cours.awaits_approval();
+        // Réécrire, mais seulement si l'utilisateur l'a demandé. Se fier à
+        // « un texte attend une relecture » suffisait à faire réécrire le mail
+        // sur une phrase qui parlait d'autre chose.
+        let correction_demandee = lecture == Some(intent::Reply::Correction);
         let premiere_redaction = composition_en_cours.body.is_empty()
             && mail_content_expressed(user_text, &understood);
         if correction_demandee || premiere_redaction {
@@ -2204,15 +2269,17 @@ fn is_mail_content_followup(text: &str) -> bool {
     .any(|term| text.contains(term))
 }
 
+/// Exécute un envoi déjà préparé, quand l'utilisateur vient d'y consentir dans
+/// le fil plutôt qu'en cliquant la carte.
+///
+/// Le CONSENTEMENT est compris en amont (`Step::SendConfirmation`) ; cette
+/// fonction ne juge plus rien, elle agit — et seulement s'il n'y a aucune
+/// ambiguïté sur l'action visée.
 async fn confirm_pending_mail_from_chat(
     core: &Core,
     session_id: &str,
-    user_text: &str,
     settings: &crate::settings::Settings,
 ) -> Result<Option<Answer>> {
-    if !is_explicit_chat_confirmation(user_text) {
-        return Ok(None);
-    }
     let matching: Vec<_> = actions::list_pending(&core.db)?
         .into_iter()
         .filter(|action| {
@@ -3290,11 +3357,12 @@ mod routing_eval {
                 &llm,
                 suite.dernier,
                 &contexte,
+                None,
                 super::intent::Intent {
                     kind: super::intent::Kind::Conversation,
                     scope: super::intent::Scope::Any,
                     subject: None,
-                    source: super::intent::Source::Fallback,
+                    reply: None,                    source: super::intent::Source::Fallback,
                 },
             )
             .await;
@@ -3348,13 +3416,14 @@ mod routing_eval {
             kind: intent::Kind::Conversation,
             scope: intent::Scope::Any,
             subject: None,
+            reply: None,
             source: intent::Source::Fallback,
         };
         // Chauffe.
-        let _ = intent::classify(&llm, "gmail", &contexte, vide.clone()).await;
+        let _ = intent::classify(&llm, "gmail", &contexte, None, vide.clone()).await;
 
         let t = std::time::Instant::now();
-        let _ = intent::classify(&llm, "gmail", &contexte, vide.clone()).await;
+        let _ = intent::classify(&llm, "gmail", &contexte, None, vide.clone()).await;
         println!("\n  1. compréhension de l'intention : {:?}", t.elapsed());
 
         let t = std::time::Instant::now();
@@ -3374,6 +3443,95 @@ mod routing_eval {
         println!("  3. une itération agentique      : {:?}", t.elapsed());
         println!("     (la boucle peut en enchaîner jusqu'à {})\n", MAX_TOOL_ITERATIONS);
     }
+    /// Mesure les réponses données EN COURS de parcours — accord, correction,
+    /// choix de compte, changement de sujet.
+    ///
+    /// Deux mesures dans le même passage : le secours à mots-clés d'abord, la
+    /// compréhension du modèle ensuite. C'est l'écart entre les deux qui dit si
+    /// confier ces décisions au modèle vaut la peine — et le jour où il se
+    /// dégrade, on le verra ici plutôt que dans une conversation de Paul.
+    #[tokio::test]
+    async fn mesure_des_reponses_en_cours_de_parcours() {
+        use super::eval::TURNS;
+        let mots_cles: Vec<&super::eval::TurnCase> = TURNS
+            .iter()
+            .filter(|cas| super::mail_flow::reply_fallback(cas.step, cas.text) != cas.expected)
+            .collect();
+        println!("\n╭─ Réponses en cours de parcours : {} cas", TURNS.len());
+        println!(
+            "│  secours à mots-clés  : {} erreurs ({:.0} %)",
+            mots_cles.len(),
+            100.0 * mots_cles.len() as f64 / TURNS.len() as f64
+        );
+
+        let llm: std::sync::Arc<dyn crate::llm::LlmClient> =
+            std::sync::Arc::new(crate::llm::ollama::OllamaClient::new(
+                "http://127.0.0.1:11434",
+                "llama3.1:latest",
+                "nomic-embed-text",
+                std::sync::Arc::new(crate::security::egress::EgressGuard::new()),
+            ));
+        if !llm.status().await.chat_model_ready {
+            println!("╰─ modèle absent : compréhension non mesurée\n");
+            return;
+        }
+        super::intent::preheat(&llm).await;
+        let mut ratees = Vec::new();
+        for cas in TURNS {
+            let comprise = super::intent::classify(
+                &llm,
+                cas.text,
+                &[(
+                    "assistant".to_string(),
+                    match cas.step {
+                        super::intent::Step::DraftReview => {
+                            "Voici ce que je te propose d'envoyer. Tu valides ?".to_string()
+                        }
+                        super::intent::Step::AccountChoice => {
+                            "Depuis quel compte souhaites-tu envoyer le mail ?".to_string()
+                        }
+                        super::intent::Step::SendConfirmation => {
+                            "Ce mail est prêt : il attend ta confirmation.".to_string()
+                        }
+                    },
+                )],
+                Some(cas.step),
+                super::intent::Intent {
+                    kind: super::intent::Kind::Conversation,
+                    scope: super::intent::Scope::Any,
+                    subject: None,
+                    reply: None,
+                    source: super::intent::Source::Fallback,
+                },
+            )
+            .await;
+            let decision = super::mail_flow::read_reply(
+                cas.step,
+                comprise.reply,
+                cas.text,
+                &[("apple", "Apple Mail"), ("google", "Gmail"), ("microsoft", "Outlook")],
+            );
+            if decision != cas.expected {
+                ratees.push((cas, Some(decision)));
+            }
+        }
+        println!(
+            "╰─ compréhension       : {} erreurs ({:.0} %)",
+            ratees.len(),
+            100.0 * ratees.len() as f64 / TURNS.len() as f64
+        );
+        for (cas, obtenue) in &ratees {
+            println!(
+                "   ✗ {:?} au lieu de {:?}  « {} »  [{}]",
+                obtenue, cas.expected, cas.text, cas.note
+            );
+        }
+        for cas in &mots_cles {
+            println!("   ~ mots-clés se trompent sur « {} »  [{}]", cas.text, cas.note);
+        }
+        println!();
+    }
+
     /// Mesure la compréhension du modèle local sur le même corpus. Ignoré si
     /// Ollama n'est pas joignable : le secours déterministe reste mesuré par le
     /// test ci-dessus, et le contrat produit suppose le modèle disponible.
@@ -3399,11 +3557,12 @@ mod routing_eval {
                 &llm,
                 case.text,
                 &[],
+                None,
                 super::intent::Intent {
                     kind: super::intent::Kind::Conversation,
                     scope: super::intent::Scope::Any,
                     subject: None,
-                    source: super::intent::Source::Fallback,
+                    reply: None,                    source: super::intent::Source::Fallback,
                 },
             )
             .await;
@@ -3623,7 +3782,7 @@ mod composition_tests {
             kind: intent::Kind::MailCompose,
             scope: intent::Scope::Any,
             subject: None,
-            source: intent::Source::Understood,
+            reply: None,            source: intent::Source::Understood,
         };
         for demande in [
             "Envoie un mail à Camille pour la remercier de son aide",
@@ -3678,13 +3837,13 @@ mod composition_tests {
             kind,
             scope: intent::Scope::Any,
             subject: None,
-            source: intent::Source::Understood,
+            reply: None,            source: intent::Source::Understood,
         };
         let avec_sujet = |sujet: &str| intent::Intent {
             kind: intent::Kind::MailCompose,
             scope: intent::Scope::Any,
             subject: Some(sujet.to_string()),
-            source: intent::Source::Understood,
+            reply: None,            source: intent::Source::Understood,
         };
 
         assert!(!mail_content_expressed(

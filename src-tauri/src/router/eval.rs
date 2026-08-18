@@ -30,6 +30,96 @@ pub enum Route {
     Conversation,
 }
 
+/// Une réponse courte donnée EN COURS de parcours, avec la situation qui lui
+/// donne son sens.
+///
+/// Le corpus d'intentions ne mesure que l'aiguillage du premier message. Les
+/// décisions prises ensuite — est-ce un accord ? une correction ? un compte ?
+/// — n'étaient mesurées nulle part, et c'est là que sont nés les défauts du
+/// 18/08 : « demande-lui s'il est d'accord » compté comme une validation,
+/// « tu peux envoyer un courriel à Julie » comme une confirmation d'envoi.
+pub struct TurnCase {
+    pub step: super::intent::Step,
+    pub text: &'static str,
+    pub expected: super::intent::Reply,
+    pub note: &'static str,
+}
+
+const fn turn(
+    step: super::intent::Step,
+    text: &'static str,
+    expected: super::intent::Reply,
+    note: &'static str,
+) -> TurnCase {
+    TurnCase {
+        step,
+        text,
+        expected,
+        note,
+    }
+}
+
+pub const TURNS: &[TurnCase] = {
+    use super::intent::Reply::{Accord, Autre, Compte, Correction};
+    use super::intent::Step::{AccountChoice, DraftReview, SendConfirmation};
+    &[
+        // ——— Accords, dans des formes qui n'ont pas de mot commun ———
+        turn(DraftReview, "Oui", Accord, "accord minimal"),
+        turn(DraftReview, "c'est parfait, envoie", Accord, "accord + ordre d'envoi"),
+        turn(DraftReview, "ça me va 👍", Accord, "emoji comme validation"),
+        turn(DraftReview, "nickel", Accord, "registre familier, aucun mot d'accord"),
+        turn(DraftReview, "impec, tu peux y aller", Accord, "élision et familiarité"),
+        turn(DraftReview, "va pour celui-là", Accord, "tournure indirecte"),
+        turn(DraftReview, "yes, send it", Accord, "anglais"),
+        turn(DraftReview, "aucune remarque", Accord, "accord exprimé par l'absence d'objection"),
+        turn(DraftReview, "c'est très bien comme ça", Accord, "accord développé"),
+        // ——— Corrections : elles contiennent souvent des mots d'accord ———
+        turn(
+            DraftReview,
+            "demande-lui plutôt s'il est d'accord pour la colocation",
+            Correction,
+            "« d'accord » à l'intérieur d'une consigne de rédaction",
+        ),
+        turn(DraftReview, "oui mais fais plus court", Correction, "commence par oui"),
+        turn(DraftReview, "enlève la dernière phrase", Correction, "retrait demandé"),
+        turn(DraftReview, "ajoute que je passerai samedi", Correction, "ajout demandé"),
+        turn(DraftReview, "trop formel", Correction, "jugement sans verbe"),
+        turn(DraftReview, "tutoie-le", Correction, "consigne de ton"),
+        turn(DraftReview, "il manque l'heure du rendez-vous", Correction, "manque signalé"),
+        turn(DraftReview, "make it shorter", Correction, "anglais"),
+        turn(DraftReview, "attends, je réfléchis", Correction, "ni accord ni consigne : rien ne part"),
+        // ——— Le compte d'envoi, nommé de plusieurs façons ———
+        turn(AccountChoice, "gmail", Compte("google"), "nom de service"),
+        turn(AccountChoice, "avec mon compte Google", Compte("google"), "nom d'éditeur"),
+        turn(AccountChoice, "Outlook", Compte("microsoft"), "nom de service"),
+        turn(AccountChoice, "depuis ma boîte pro Microsoft", Compte("microsoft"), "périphrase"),
+        turn(AccountChoice, "Apple Mail stp", Compte("apple"), "application native"),
+        turn(AccountChoice, "celui de Google", Compte("google"), "désignation indirecte"),
+        // ——— Autre chose : l'étape n'est pas la réponse ———
+        turn(
+            DraftReview,
+            "attends, tu peux me retrouver la quittance de loyer ?",
+            Autre,
+            "changement de sujet en plein parcours",
+        ),
+        turn(DraftReview, "il fait quel temps demain ?", Autre, "question sans rapport"),
+        turn(AccountChoice, "en fait annule, je le ferai moi-même", Autre, "abandon"),
+        turn(AccountChoice, "c'est quoi la différence entre les deux ?", Autre, "question sur le choix"),
+        turn(DraftReview, "à qui tu l'envoies déjà ?", Autre, "question sur l'état, pas une réponse"),
+        // ——— Confirmer un envoi déjà préparé : le geste le plus conséquent ———
+        turn(SendConfirmation, "oui envoie", Accord, "consentement direct"),
+        turn(SendConfirmation, "c'est parti", Accord, "consentement idiomatique"),
+        turn(
+            SendConfirmation,
+            "tu peux envoyer un courriel à Julie pour lui dire que je serai en retard ?",
+            Autre,
+            "demande NEUVE qui commence comme un accord : ne doit pas envoyer le mail préparé",
+        ),
+        turn(SendConfirmation, "attends, je relis", Autre, "temporisation"),
+        turn(SendConfirmation, "non finalement laisse tomber", Autre, "refus"),
+    ]
+};
+
 pub struct Case {
     pub text: &'static str,
     pub expected: Route,

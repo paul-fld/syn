@@ -10,7 +10,7 @@
 //! Ce module ne fait jamais partir un mail : il prépare, il demande, il attend.
 //! L'envoi reste derrière la porte d'action (plancher humain, Sécurité §3.2).
 
-use super::{emit_progress, mail_send_preflight, Answer, PendingRef};
+use super::{emit_progress, intent, mail_send_preflight, Answer, PendingRef};
 use crate::actions;
 use crate::bus::BusEvent;
 use crate::connectors::mail;
@@ -251,49 +251,135 @@ pub fn advance(
 /// Réponse de l'utilisateur à une étape en cours (relecture, choix du compte
 /// tapé au clavier plutôt que cliqué). Traité avant le modèle : « oui » ne doit
 /// pas coûter un aller-retour d'inférence, ni risquer une reformulation.
+/// L'étape que Syn attend de l'utilisateur, s'il en attend une.
+///
+/// C'est elle qui donne son sens à « oui » : la même réponse vaut validation
+/// d'un texte ou choix d'un compte selon le moment. Elle est calculée sur
+/// l'ÉTAT d'envoi, jamais sur les mots du dernier message.
+pub fn pending_step(db: &crate::db::Db, session_id: &str) -> Result<Option<intent::Step>> {
+    // Un envoi déjà préparé attend un accord : c'est l'étape la plus
+    // conséquente, et c'était la seule encore décidée par une liste de mots —
+    // une liste qui pouvait faire PARTIR un mail.
+    let envoi_en_attente = actions::list_pending(db)?.into_iter().any(|action| {
+        action.tool == "mail.send" && action.session_id.as_deref() == Some(session_id)
+    });
+    if envoi_en_attente {
+        return Ok(Some(intent::Step::SendConfirmation));
+    }
+    let composition = mail::composition(db, session_id)?;
+    if composition.recipient.is_empty() || composition.body.is_empty() {
+        return Ok(None);
+    }
+    if composition.awaits_approval() {
+        return Ok(Some(intent::Step::DraftReview));
+    }
+    if composition.via.is_empty() && mail::available_channels(db).len() > 1 {
+        return Ok(Some(intent::Step::AccountChoice));
+    }
+    Ok(None)
+}
+
+/// La décision effective sur une réponse en cours de parcours.
+///
+/// Ce que le modèle a compris fait foi. Il est complété sur un seul point, et
+/// seulement à l'étape du compte : la reconnaissance des NOMS PROPRES des
+/// messageries configurées. Nommer une de ses trois boîtes au moment précis où
+/// Syn demande laquelle n'est pas une devinette de langage — c'est un
+/// inventaire fermé, comme reconnaître « OneDrive » dans une portée.
+pub fn read_reply(
+    step: intent::Step,
+    understood: Option<intent::Reply>,
+    text: &str,
+    channels: &[(&'static str, &'static str)],
+) -> intent::Reply {
+    if step == intent::Step::AccountChoice {
+        if let Some(intent::Reply::Compte(via)) = understood {
+            return intent::Reply::Compte(via);
+        }
+        if let Some(via) = match_typed_channel(text, channels) {
+            return intent::Reply::Compte(via);
+        }
+    }
+    understood.unwrap_or_else(|| reply_fallback(step, text))
+}
+
+/// Lecture de secours d'une réponse en cours de parcours.
+///
+/// Elle ne s'applique QUE si le modèle n'a rien pu dire — arrêté, ou au-delà de
+/// son budget. C'est une dégradation annoncée : elle ne reconnaît que les
+/// formes les plus explicites, et se trompe sur tout le reste. Ce n'est plus
+/// elle qui décide en fonctionnement normal.
+pub fn reply_fallback(step: intent::Step, text: &str) -> intent::Reply {
+    match step {
+        intent::Step::SendConfirmation => {
+            if super::is_explicit_chat_confirmation(text) {
+                intent::Reply::Accord
+            } else {
+                intent::Reply::Autre
+            }
+        }
+        intent::Step::DraftReview => {
+            if is_draft_approval(text) {
+                intent::Reply::Accord
+            } else {
+                intent::Reply::Correction
+            }
+        }
+        intent::Step::AccountChoice => {
+            match match_typed_channel(text, &[("apple", ""), ("google", ""), ("microsoft", "")]) {
+                Some(via) => intent::Reply::Compte(via),
+                None => intent::Reply::Autre,
+            }
+        }
+    }
+}
+
+/// Fait avancer le parcours avec ce que l'utilisateur vient de répondre.
+///
+/// Le sens de sa réponse est COMPRIS (par le modèle, ou par le secours) ; ce
+/// qui est fait de ce sens est déterministe. Une correction rend la main au
+/// modèle pour réécrire ; un accord ou un compte font avancer l'état.
 pub fn handle_user_reply(
     core: &Core,
     session_id: &str,
-    user_text: &str,
+    step: intent::Step,
+    reply: intent::Reply,
     settings: &Settings,
 ) -> Result<Option<Answer>> {
     let db = &core.db;
     let composition = mail::composition(db, session_id)?;
-    // Aucun envoi en construction : ce tour ne regarde pas le parcours.
     if composition.recipient.is_empty() || composition.body.is_empty() {
         return Ok(None);
     }
+    match (step, reply) {
+        // Le texte proposé est accepté : l'étape suivante s'enchaîne.
+        (intent::Step::DraftReview, intent::Reply::Accord) => {
+            mail::approve_body(db, session_id)?;
+        }
+        // Un compte désigné, à l'étape où on l'attend.
+        (intent::Step::AccountChoice, intent::Reply::Compte(via)) => {
+            if !mail::available_channels(db)
+                .iter()
+                .any(|(id, _)| *id == via)
+            {
+                return Ok(None);
+            }
+            mail::remember_composition(db, session_id, &json!({ "via": via }))?;
+        }
+        // Une correction est une demande de réécriture : elle appartient au
+        // modèle, pas au parcours.
+        (_, intent::Reply::Correction) => return Ok(None),
+        // Tout le reste — une autre demande, un compte cité hors de son étape —
+        // ne fait pas avancer l'envoi.
+        _ => return Ok(None),
+    }
+
     let history = memory::recent_turns(db, session_id, 12)?
         .iter()
         .filter(|(role, _)| role == "user")
         .map(|(_, content)| content.as_str())
         .collect::<Vec<_>>()
         .join("\n");
-    let approves = is_draft_approval(user_text);
-
-    if composition.awaits_approval() {
-        // Un « oui » vaut accord ; tout le reste (« plutôt plus court », « ajoute
-        // une phrase ») est une demande de réécriture, donc l'affaire du modèle.
-        if !approves {
-            return Ok(None);
-        }
-        mail::approve_body(db, session_id)?;
-    } else if composition.via.is_empty() {
-        match match_typed_channel(user_text, &mail::available_channels(db)) {
-            Some(via) => {
-                mail::remember_composition(db, session_id, &json!({ "via": via }))?;
-            }
-            // Ni un compte, ni une relance : la question reste posée.
-            None if !approves => return Ok(None),
-            None => {}
-        }
-    } else if !approves {
-        return Ok(None);
-    }
-
-    // L'utilisateur vient de répondre à une étape du parcours. Syn enchaîne — et
-    // surtout, il ne laisse pas la demande repartir ailleurs : un simple
-    // « Envoie » avait déclenché une recherche de documents en plein envoi.
     match advance(core, session_id, settings, &history)? {
         Some(answer) => Ok(Some(answer)),
         None => Ok(Some(explain_blockage(

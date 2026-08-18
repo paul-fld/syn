@@ -59,12 +59,62 @@ pub enum Source {
     Fallback,
 }
 
+/// L'étape en cours d'un parcours, quand il y en a une.
+///
+/// Sans elle, « oui » n'est interprétable par personne : ni par une liste de
+/// mots, ni par le modèle. C'est la situation qui donne son sens à la réponse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Step {
+    /// Un texte de mail est proposé ; l'utilisateur doit le relire.
+    DraftReview,
+    /// Syn demande depuis quel compte envoyer.
+    AccountChoice,
+    /// Un mail est prêt et attend la confirmation de son envoi.
+    SendConfirmation,
+}
+
+impl Step {
+    /// La situation décrite au modèle, dans les mots de l'échange.
+    fn describe(&self) -> &'static str {
+        match self {
+            Step::DraftReview => {
+                "Tu viens de proposer à l'utilisateur le texte d'un mail, et tu lui as demandé s'il le valide."
+            }
+            Step::AccountChoice => {
+                "Tu viens de demander à l'utilisateur depuis quel compte envoyer le mail (Gmail, Outlook ou Apple Mail)."
+            }
+            Step::SendConfirmation => {
+                "Un mail est prêt et attend que l'utilisateur confirme son envoi."
+            }
+        }
+    }
+}
+
+/// Ce que l'utilisateur vient de faire, quand une étape attend sa réponse.
+///
+/// Ces quatre décisions étaient prises par des listes de mots — « demande-lui
+/// s'il est d'accord » comptait comme un accord, « tu peux envoyer un courriel
+/// à Julie » comme une confirmation. Elles relèvent de la compréhension.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reply {
+    /// Il valide ce qui lui est proposé.
+    Accord,
+    /// Il demande une modification de ce qui lui est proposé.
+    Correction,
+    /// Il désigne un compte d'envoi.
+    Compte(&'static str),
+    /// Il parle d'autre chose : l'étape n'est pas sa réponse.
+    Autre,
+}
+
 #[derive(Debug, Clone)]
 pub struct Intent {
     pub kind: Kind,
     pub scope: Scope,
     /// Ce que l'utilisateur cherche ou veut produire, dans ses propres mots.
     pub subject: Option<String>,
+    /// Sa réponse à l'étape en cours, s'il y en avait une.
+    pub reply: Option<Reply>,
     pub source: Source,
 }
 
@@ -74,6 +124,7 @@ impl Intent {
             kind: Kind::Conversation,
             scope: Scope::Any,
             subject: None,
+            reply: None,
             source,
         }
     }
@@ -154,6 +205,67 @@ Ne traduis rien. Ne commente pas. JSON seul."#;
 /// d'évaluation** (`router/eval.rs`). Sans cette disjonction, le taux d'erreur
 /// mesurerait la mémoire du prompt, pas la capacité à comprendre une demande
 /// jamais vue.
+/// Consignes ajoutées au prompt UNIQUEMENT quand une étape attend une réponse.
+///
+/// Les garder en permanence coûtait cher : mesuré, le jeu de validation passait
+/// de 4,3 % à 17,4 % d'erreur d'intention. Un modèle de 8 milliards de
+/// paramètres ne trie pas les consignes qui ne s'appliquent pas — il s'en
+/// encombre. On ne lui donne donc que ce dont il a besoin, au moment où il en a
+/// besoin.
+const STEP_CALIBRATION: &[(&str, &str)] = &[
+    (
+        "Étape en cours : Tu viens de proposer à l'utilisateur le texte d'un mail, et tu lui as demandé s'il le valide.\n\nDemande à classer :\nok pour moi",
+        r#"{"intent":"mail_compose","scope":"any","subject":"","reponse":"accord"}"#,
+    ),
+    (
+        "Étape en cours : Tu viens de proposer à l'utilisateur le texte d'un mail, et tu lui as demandé s'il le valide.\n\nDemande à classer :\nreformule le début, c'est trop sec",
+        r#"{"intent":"mail_compose","scope":"any","subject":"","reponse":"correction"}"#,
+    ),
+    (
+        "Étape en cours : Tu viens de demander à l'utilisateur depuis quel compte envoyer le mail (Gmail, Outlook ou Apple Mail).\n\nDemande à classer :\nsur ma boîte Gmail",
+        r#"{"intent":"mail_compose","scope":"any","subject":"","reponse":"gmail"}"#,
+    ),
+    (
+        "Étape en cours : Tu viens de proposer à l'utilisateur le texte d'un mail, et tu lui as demandé s'il le valide.\n\nDemande à classer :\nau fait, tu as retrouvé mon relevé de janvier ?",
+        r#"{"intent":"mail_search","scope":"any","subject":"relevé de janvier","reponse":"autre"}"#,
+    ),
+    // Une consigne d'écriture porte sur le texte proposé : c'est une correction,
+    // même sans un mot de refus.
+    (
+        "Étape en cours : Tu viens de proposer à l'utilisateur le texte d'un mail, et tu lui as demandé s'il le valide.\n\nDemande à classer :\nsigne-le de mon prénom",
+        r#"{"intent":"mail_compose","scope":"any","subject":"","reponse":"correction"}"#,
+    ),
+    // Une question qui ne porte pas sur le texte n'est pas une correction.
+    (
+        "Étape en cours : Tu viens de proposer à l'utilisateur le texte d'un mail, et tu lui as demandé s'il le valide.\n\nDemande à classer :\nil est quelle heure ?",
+        r#"{"intent":"conversation","scope":"any","subject":"","reponse":"autre"}"#,
+    ),
+    // Le compte peut être désigné sans être nommé exactement.
+    (
+        "Étape en cours : Tu viens de demander à l'utilisateur depuis quel compte envoyer le mail (Gmail, Outlook ou Apple Mail).\n\nDemande à classer :\nprends celui de Microsoft",
+        r#"{"intent":"mail_compose","scope":"any","subject":"","reponse":"outlook"}"#,
+    ),
+    // Un compte donné en UN SEUL MOT, sans phrase autour : la forme la plus
+    // courante, et celle qui manquait au calibrage.
+    (
+        "Étape en cours : Tu viens de demander à l'utilisateur depuis quel compte envoyer le mail (Gmail, Outlook ou Apple Mail).\n\nDemande à classer :\nhotmail",
+        r#"{"intent":"mail_compose","scope":"any","subject":"","reponse":"outlook"}"#,
+    ),
+];
+
+const STEP_INSTRUCTIONS: &str = r#"
+
+Une « Étape en cours » t'est indiquée : le JSON doit OBLIGATOIREMENT contenir un
+quatrième champ "reponse", qui dit ce que l'utilisateur vient de faire de cette
+étape. Aucune exception, même si sa phrase ressemble à une consigne, à une
+question ou à une demande nouvelle.
+  "accord"     — il valide ce que tu lui proposes, sans rien demander de plus ;
+  "correction" — il veut une modification, un ajout, un retrait, un autre ton,
+                 ou il n'est pas prêt. Une consigne de rédaction est une
+                 correction, même si elle contient un mot d'accord ;
+  "gmail" / "outlook" / "apple" — il désigne un compte d'envoi ;
+  "autre"      — il parle d'autre chose : sa phrase ne répond pas à l'étape."#;
+
 const CALIBRATION: &[(&str, &str)] = &[
     (
         "tu retrouves le devis de la cuisine ?",
@@ -230,6 +342,23 @@ fn parse_kind(value: &str) -> Option<Kind> {
     }
 }
 
+/// Le champ tel que le modèle l'a rendu. La tolérance porte ici sur SON
+/// vocabulaire — « validation » pour « accord » —, jamais sur celui de
+/// l'utilisateur : ce serait revenir à une liste de mots.
+fn parse_reply(value: Option<&str>) -> Option<Reply> {
+    let value = value?.trim().to_ascii_lowercase();
+    let value = value.trim_matches(|c: char| !c.is_alphanumeric());
+    match value {
+        "accord" | "validation" | "valide" | "oui" | "ok" => Some(Reply::Accord),
+        "correction" | "modification" | "changement" | "retouche" => Some(Reply::Correction),
+        "gmail" | "google" => Some(Reply::Compte("google")),
+        "outlook" | "microsoft" | "hotmail" => Some(Reply::Compte("microsoft")),
+        "apple" | "apple mail" | "applemail" | "mail" => Some(Reply::Compte("apple")),
+        "autre" | "aucune" | "rien" => Some(Reply::Autre),
+        _ => None,
+    }
+}
+
 fn parse_scope(value: &str) -> Scope {
     match value.trim().to_ascii_lowercase().as_str() {
         "google" => Scope::Google,
@@ -259,7 +388,10 @@ fn extract_json(content: &str) -> Option<Value> {
 /// donc systématiquement au secours déterministe. Une fois le préfixe traité,
 /// le modèle le retrouve en cache et répond en 1 à 2 s.
 pub async fn preheat(llm: &Arc<dyn LlmClient>) {
-    let _ = ask_model(llm, "bonjour", &[]).await;
+    let _ = ask_model(llm, "bonjour", &[], None).await;
+    // Le prompt d'étape est un préfixe DIFFÉRENT : sans ce second passage, la
+    // première réponse donnée en cours de parcours repartirait au secours.
+    let _ = ask_model(llm, "oui", &[], Some(Step::DraftReview)).await;
 }
 
 /// Classe la demande. Ne renvoie jamais d'erreur : une compréhension impossible
@@ -275,9 +407,10 @@ pub async fn classify(
     llm: &Arc<dyn LlmClient>,
     text: &str,
     context: &[(String, String)],
+    step: Option<Step>,
     fallback: Intent,
 ) -> Intent {
-    match tokio::time::timeout(BUDGET, ask_model(llm, text, context)).await {
+    match tokio::time::timeout(BUDGET, ask_model(llm, text, context, step)).await {
         Ok(Ok(Some(intent))) => intent,
         // Modèle absent, lent, ou réponse inexploitable : on garde le service.
         _ => fallback,
@@ -286,17 +419,24 @@ pub async fn classify(
 
 /// Met la demande en situation : les échanges précédents d'abord, la phrase à
 /// classer ensuite, clairement séparés.
-fn situated(text: &str, context: &[(String, String)]) -> String {
-    if context.is_empty() {
+fn situated(text: &str, context: &[(String, String)], step: Option<Step>) -> String {
+    if context.is_empty() && step.is_none() {
         return text.to_string();
     }
-    let mut prompt = String::from("Échanges précédents :\n");
-    for (role, content) in context.iter().rev().take(6).rev() {
-        let who = if role == "user" { "utilisateur" } else { "assistant" };
-        let extrait: String = content.chars().take(240).collect();
-        prompt.push_str(&format!("{who} : {extrait}\n"));
+    let mut prompt = String::new();
+    if let Some(step) = step {
+        prompt.push_str(&format!("Étape en cours : {}\n\n", step.describe()));
     }
-    prompt.push_str("\nDemande à classer :\n");
+    if !context.is_empty() {
+        prompt.push_str("Échanges précédents :\n");
+        for (role, content) in context.iter().rev().take(6).rev() {
+            let who = if role == "user" { "utilisateur" } else { "assistant" };
+            let extrait: String = content.chars().take(240).collect();
+            prompt.push_str(&format!("{who} : {extrait}\n"));
+        }
+        prompt.push('\n');
+    }
+    prompt.push_str("Demande à classer :\n");
     prompt.push_str(text);
     prompt
 }
@@ -305,9 +445,16 @@ async fn ask_model(
     llm: &Arc<dyn LlmClient>,
     text: &str,
     context: &[(String, String)],
+    step: Option<Step>,
 ) -> Result<Option<Intent>> {
-    let mut messages = Vec::with_capacity(CALIBRATION.len() * 2 + 1);
-    for (demande, verdict) in CALIBRATION {
+    // Les exemples de l'étape ne sont donnés qu'à l'étape : hors parcours, ils
+    // n'apprennent rien et brouillent l'aiguillage (mesuré).
+    let exemples: Vec<&(&str, &str)> = CALIBRATION
+        .iter()
+        .chain(step.iter().flat_map(|_| STEP_CALIBRATION.iter()))
+        .collect();
+    let mut messages = Vec::with_capacity(exemples.len() * 2 + 1);
+    for (demande, verdict) in exemples {
         messages.push(ChatMessage::user(*demande));
         messages.push(ChatMessage {
             role: "assistant".into(),
@@ -316,10 +463,14 @@ async fn ask_model(
             tool_name: None,
         });
     }
-    messages.push(ChatMessage::user(situated(text, context)));
+    messages.push(ChatMessage::user(situated(text, context, step)));
+    let consignes = match step {
+        Some(_) => std::borrow::Cow::Owned(format!("{SYSTEM}{STEP_INSTRUCTIONS}")),
+        None => std::borrow::Cow::Borrowed(SYSTEM),
+    };
     let response = llm
         .generate(
-            SYSTEM,
+            &consignes,
             &messages,
             &[],
             GenParams {
@@ -338,10 +489,29 @@ async fn ask_model(
     let Some(kind) = value["intent"].as_str().and_then(parse_kind) else {
         return Ok(None);
     };
+    let scope = validated_scope(parse_scope(value["scope"].as_str().unwrap_or("any")), text);
     Ok(Some(Intent {
         kind,
-        scope: validated_scope(parse_scope(value["scope"].as_str().unwrap_or("any")), text),
+        scope,
         subject: validated_subject(value["subject"].as_str(), text),
+        // Le champ manque parfois : plutôt que de renoncer, on lit ce que le
+        // modèle a compris par ailleurs. C'est encore de la compréhension —
+        // ses propres sorties —, jamais une liste de mots de l'utilisateur.
+        reply: step.map(|step| {
+            parse_reply(value["reponse"].as_str()).unwrap_or_else(|| match (step, scope) {
+                // « gmail » seul : le modèle le range en PORTÉE plutôt qu'en
+                // réponse. À l'étape du compte, une portée nommée EST la réponse.
+                (Step::AccountChoice, Scope::Google) => Reply::Compte("google"),
+                (Step::AccountChoice, Scope::Microsoft) => Reply::Compte("microsoft"),
+                // Il maintient l'intention du parcours : la phrase porte sur le
+                // texte proposé, donc elle en demande la retouche. Cela n'a de
+                // sens qu'à la relecture — devant une confirmation d'envoi,
+                // tout ce qui n'est pas un accord franc doit rester « autre »,
+                // car seul un accord y déclenche quelque chose.
+                (Step::DraftReview, _) if kind == Kind::MailCompose => Reply::Correction,
+                _ => Reply::Autre,
+            })
+        }),
         source: Source::Understood,
     }))
 }
@@ -426,6 +596,7 @@ pub fn fallback(
             kind: Kind::MailSearch,
             scope: keyword_scope,
             subject: keyword_file_search.map(|(subject, _)| subject),
+            reply: None,
             source: Source::Fallback,
         };
     }
@@ -434,6 +605,7 @@ pub fn fallback(
             kind: Kind::DeviceDiagnostic,
             scope: Scope::Any,
             subject: None,
+            reply: None,
             source: Source::Fallback,
         };
     }
@@ -442,6 +614,7 @@ pub fn fallback(
             kind: Kind::FileSearch,
             scope: keyword_scope,
             subject: Some(subject),
+            reply: None,
             source: Source::Fallback,
         };
     }
@@ -450,6 +623,7 @@ pub fn fallback(
             kind: Kind::MailCompose,
             scope: Scope::Any,
             subject: None,
+            reply: None,
             source: Source::Fallback,
         };
     }

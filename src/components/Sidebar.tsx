@@ -1,5 +1,5 @@
 // Sidebar (maquette App desktop) : Accueil … Déconnexion.
-import { For, type JSX } from "solid-js";
+import { For, Show, type JSX } from "solid-js";
 import { Icon } from "./Icon";
 import { Logo } from "./Logo";
 import {
@@ -12,6 +12,7 @@ import {
   type PageId,
 } from "../lib/state";
 import { ipc } from "../lib/ipc";
+import { runningSessions, unreadSessions } from "../lib/conversations";
 
 const MAIN_ITEMS: { id: PageId; label: string; icon: string }[] = [
   { id: "accueil", label: "Accueil", icon: "home" },
@@ -56,6 +57,20 @@ export function Sidebar(): JSX.Element {
           >
             <Icon name={item.icon} size={15} />
             {item.label}
+            {/* Depuis une autre page, c'est le seul signe que Syn travaille
+                encore — puis qu'une réponse attend d'être lue. */}
+            <Show when={item.id === "conversations" && runningSessions().length > 0}>
+              <span class="convo-working" role="status" aria-label="Syn travaille sur une conversation" />
+            </Show>
+            <Show
+              when={
+                item.id === "conversations" &&
+                runningSessions().length === 0 &&
+                unreadSessions().length > 0
+              }
+            >
+              <span class="convo-unread" role="status" aria-label="Réponse non lue" />
+            </Show>
           </button>
         )}
       </For>

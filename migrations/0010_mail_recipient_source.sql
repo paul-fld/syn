@@ -1,0 +1,11 @@
+-- Le contrôle anti-adresse-inventée n'acceptait qu'une adresse ÉCRITE par
+-- l'utilisateur, ou déjà liée dans le carnet à un nom qu'il venait de citer.
+-- Il refusait donc l'adresse que Syn avait lui-même trouvée avec
+-- people.resolve_email et fait confirmer à l'utilisateur — c'est-à-dire le
+-- parcours normal des maquettes. Le mail restait bloqué sans que rien ne le
+-- dise, et le modèle reprenait la main pour improviser.
+--
+-- `recipient_source` note d'où vient le destinataire :
+--   'resolved' — sorti du carnet d'adresses de l'utilisateur (people.resolve_email) ;
+--   'model'    — écrit dans un appel d'outil, donc à vérifier comme avant.
+ALTER TABLE mail_compositions ADD COLUMN recipient_source TEXT NOT NULL DEFAULT 'model';

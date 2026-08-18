@@ -36,6 +36,8 @@ fn main() {
             "CoreServices",
             "Foundation",
             "Vision",
+            "Speech",
+            "AVFoundation",
         ] {
             println!("cargo:rustc-link-lib=framework={framework}");
         }

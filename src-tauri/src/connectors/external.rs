@@ -1066,15 +1066,35 @@ pub async fn live_search_provider(kind: &str, query: &str, provider: &str) -> Re
 
 async fn live_google_mail(query: &str, token: &str) -> Result<Vec<Value>> {
     let client = reqwest::Client::new();
-    let list = get_json(
-        &client,
-        &format!(
-            "https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=10&q={}",
-            urlencoding(query)
-        ),
-        token,
-    )
-    .await?;
+    // Gmail cherche TOUS les mots de `q` : lui passer la phrase de l'utilisateur
+    // ne ramenait jamais rien. On interroge avec les mots porteurs, puis on
+    // élargit au plus distinctif si la recherche stricte ne donne rien.
+    let terms = search_terms(query);
+    let mut tentatives = Vec::new();
+    if !terms.is_empty() {
+        tentatives.push(terms.join(" "));
+        if terms.len() > 1 {
+            tentatives.push(format!("{{{}}}", terms.join(" ")));
+        }
+    }
+    if tentatives.is_empty() {
+        tentatives.push(query.trim().to_string());
+    }
+    let mut list = Value::Null;
+    for tentative in &tentatives {
+        list = get_json(
+            &client,
+            &format!(
+                "https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=10&q={}",
+                urlencoding(tentative)
+            ),
+            token,
+        )
+        .await?;
+        if list["messages"].as_array().is_some_and(|found| !found.is_empty()) {
+            break;
+        }
+    }
     let requests = list["messages"]
         .as_array()
         .cloned()
@@ -1087,7 +1107,7 @@ async fn live_google_mail(query: &str, token: &str) -> Result<Vec<Value>> {
             async move {
                 let value = get_json(
                     &client,
-                    &format!("https://gmail.googleapis.com/gmail/v1/users/me/messages/{id}?format=metadata&metadataHeaders=Subject&metadataHeaders=From"),
+                    &format!("https://gmail.googleapis.com/gmail/v1/users/me/messages/{id}?format=metadata&metadataHeaders=Subject&metadataHeaders=From&metadataHeaders=Date"),
                     token,
                 )
                 .await?;
@@ -1107,6 +1127,8 @@ async fn live_google_mail(query: &str, token: &str) -> Result<Vec<Value>> {
             "title": gmail_header(&value["payload"], "Subject"),
             "path": format!("https://mail.google.com/mail/u/0/#all/{id}"),
             "snippet": value["snippet"].as_str().unwrap_or_default(),
+            "from": gmail_header(&value["payload"], "From"),
+            "date": gmail_header(&value["payload"], "Date"),
             "provider": "google",
             "live": true,
         }));
@@ -1179,6 +1201,13 @@ fn is_noise(word: &str) -> bool {
 /// un token court qui contient un chiffre (« Q3 », « T2 ») est au contraire le
 /// plus discriminant de la demande — la limite de trois caractères ne s'y
 /// applique pas.
+/// Les mots porteurs d'une demande, pour interroger un fournisseur. Une phrase
+/// entière passée à Gmail (« Tu peux me retrouver un mail de Liverpool qui
+/// concerne ma réservation… ») ne ramène rien : l'API cherche TOUS les mots.
+pub fn query_terms(query: &str) -> Vec<String> {
+    search_terms(query)
+}
+
 fn search_terms(query: &str) -> Vec<String> {
     query
         .split_whitespace()
@@ -1302,7 +1331,14 @@ fn sort_by_score(values: &mut [Value]) {
 
 async fn live_ms_mail(query: &str, token: &str) -> Result<Vec<Value>> {
     let client = reqwest::Client::new();
-    let search = urlencoding(&format!("\"{query}\""));
+    // Même raison que pour Gmail : la phrase entière ne correspond à rien.
+    let terms = search_terms(query);
+    let keywords = if terms.is_empty() {
+        query.trim().to_string()
+    } else {
+        terms.join(" ")
+    };
+    let search = urlencoding(&format!("\"{keywords}\""));
     let value = get_json(
         &client,
         &format!("https://graph.microsoft.com/v1.0/me/messages?$search={search}&$top=10&$select=id,subject,from,receivedDateTime,bodyPreview,webLink"),
@@ -1323,6 +1359,11 @@ async fn live_ms_mail(query: &str, token: &str) -> Result<Vec<Value>> {
                 "title": mail["subject"],
                 "path": mail["webLink"],
                 "snippet": mail["bodyPreview"],
+                "from": mail["from"]["emailAddress"]["name"]
+                    .as_str()
+                    .or_else(|| mail["from"]["emailAddress"]["address"].as_str())
+                    .unwrap_or_default(),
+                "date": mail["receivedDateTime"],
                 "provider": "microsoft",
                 "live": true,
             }))
@@ -1455,22 +1496,39 @@ pub async fn remember_live_result(
     let Some(source_ref) = value["source_ref"].as_str() else {
         return Ok(());
     };
-    let title = value["title"].as_str().unwrap_or("Document cloud").to_string();
-    let provider = if source_ref.starts_with("microsoft:") {
-        "OneDrive"
-    } else {
-        "Google Drive"
-    };
+    let is_mail = value["source"].as_str() == Some("mail");
+    let title = value["title"]
+        .as_str()
+        .unwrap_or(if is_mail { "Message" } else { "Document cloud" })
+        .to_string();
+    let microsoft = source_ref.starts_with("microsoft:");
     let snippet = value["snippet"].as_str().unwrap_or_default();
-    let body = format!("Nom : {title}\nEmplacement cloud : {provider}\n\n{snippet}");
+    // Un mail retrouvé en direct doit devenir un item connu de Syn : c'est ce
+    // qui rend son lien ouvrable (la garde de périmètre n'ouvre que ce que Syn
+    // connaît) et ce qui le laisse retrouvable hors ligne.
+    let (source, kind, body) = if is_mail {
+        let boite = if microsoft { "Outlook" } else { "Gmail" };
+        (
+            "mail",
+            "email",
+            format!("Objet : {title}\nMessagerie : {boite}\n\n{snippet}"),
+        )
+    } else {
+        let emplacement = if microsoft { "OneDrive" } else { "Google Drive" };
+        (
+            "cloud",
+            "document",
+            format!("Nom : {title}\nEmplacement cloud : {emplacement}\n\n{snippet}"),
+        )
+    };
     ingest(
         db,
         llm,
         bus,
         embed_model,
-        "cloud",
+        source,
         source_ref.to_string(),
-        "document",
+        kind,
         title,
         body,
         None,

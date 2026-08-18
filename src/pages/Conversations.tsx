@@ -1,17 +1,24 @@
 // Conversations : historique + fil sourcé + confirmations d'actions dans le fil.
-import { createEffect, createResource, createSignal, For, Show, onCleanup, onMount, type JSX } from "solid-js";
+import { createEffect, createResource, createSignal, For, Show, type JSX } from "solid-js";
 import { AskBar } from "../components/AskBar";
 import { ActionCard } from "../components/ActionCard";
 import { Icon } from "../components/Icon";
-import { ipc, on, type AgentProgress, type Answer, type Retrieved, type PendingAction, type ScreenContext, type ConversationSession } from "../lib/ipc";
+import { ipc, type AccountChoice, type Retrieved, type PendingAction, type ScreenContext, type ConversationSession } from "../lib/ipc";
 import { barQuery, setBarQuery, refreshPending, pendingActions, sessionsVersion, settings } from "../lib/state";
-
-interface Msg {
-  role: "user" | "assistant";
-  content: string;
-  sources?: Retrieved[];
-  degraded?: boolean;
-}
+import {
+  activeSession,
+  chooseMailAccount,
+  conversation,
+  forgetConversation,
+  isRunning,
+  isUnread,
+  markRead,
+  openConversation,
+  retryLastTurn,
+  sendMessage,
+  startNewConversation,
+  type ConvoMsg,
+} from "../lib/conversations";
 
 type ConversationDialog = {
   kind: "rename" | "new-project" | "create-project" | "delete";
@@ -80,6 +87,19 @@ function MessageContent(props: { content: string; sources?: Retrieved[] }): JSX.
     <div class="msg-content">
       <For each={props.content.split("\n")}>
         {(raw) => {
+          // Un bloc cité — le corps d'un mail que Syn propose — se lit comme
+          // une lettre, détaché du reste de la phrase.
+          const quoted = /^>\s?/.test(raw);
+          if (quoted) {
+            const text = raw.replace(/^>\s?/, "");
+            return (
+              <div class="msg-line quote" classList={{ empty: !text }}>
+                <Show when={text} fallback={<br />}>
+                  <InlineMessage text={text} />
+                </Show>
+              </div>
+            );
+          }
           const bullet = /^\s*[*-]\s+/.test(raw);
           const numbered = /^\s*\d+[.)]\s+/.test(raw);
           const text = raw.replace(/^\s*(?:[*-]|\d+[.)])\s+/, "");
@@ -103,12 +123,6 @@ function MessageContent(props: { content: string; sources?: Retrieved[] }): JSX.
 export function Conversations(): JSX.Element {
   const [sessions, { refetch: refetchSessions }] = createResource(sessionsVersion, () => ipc.listSessions());
   const [projects, { refetch: refetchProjects }] = createResource(() => ipc.listProjects());
-  const [sessionId, setSessionId] = createSignal<string | null>(null);
-  const [messages, setMessages] = createSignal<Msg[]>([]);
-  const [thinking, setThinking] = createSignal(false);
-  /// Réponse en cours d'écriture, affichée avant que le tour soit terminé.
-  const [streaming, setStreaming] = createSignal("");
-  const [progress, setProgress] = createSignal<AgentProgress[]>([]);
   const [openMenu, setOpenMenu] = createSignal<string | null>(null);
   const [moveMenu, setMoveMenu] = createSignal<string | null>(null);
   const [dialog, setDialog] = createSignal<ConversationDialog | null>(null);
@@ -116,104 +130,52 @@ export function Conversations(): JSX.Element {
   const [dialogError, setDialogError] = createSignal("");
   let threadEl: HTMLDivElement | undefined;
 
-  const scrollDown = () => setTimeout(() => threadEl?.scrollTo({ top: threadEl.scrollHeight }), 30);
+  // La page ne détient plus rien : elle regarde l'état de la conversation
+  // affichée. Elle peut donc être démontée — changer d'onglet, aller ailleurs —
+  // sans interrompre quoi que ce soit.
+  const sessionId = activeSession;
+  const current = () => conversation(sessionId());
+  const messages = (): ConvoMsg[] => current().messages;
+  const thinking = () => current().running;
+  const streaming = () => current().streaming;
+  const progress = () => current().progress;
 
-  const openSession = async (id: string) => {
-    setSessionId(id);
-    const turns = await ipc.getConversation(id);
-    setMessages(turns.map((t: any) => ({ role: t.role, content: t.content })));
+  // Revenir sur la page — sans forcément cliquer sur la conversation — vaut
+  // lecture : la pastille s'efface.
+  createEffect(() => {
+    const id = sessionId();
+    if (id) markRead(id);
+  });
+
+  const scrollDown = () => setTimeout(() => threadEl?.scrollTo({ top: threadEl.scrollHeight }), 30);
+  // Le fil défile quand son contenu bouge, y compris pendant l'écriture.
+  createEffect(() => {
+    messages().length;
+    streaming();
+    progress().length;
     scrollDown();
+  });
+
+  const chooseAccount = async (choice: AccountChoice) => {
+    const sid = sessionId();
+    if (!sid || thinking()) return;
+    await chooseMailAccount(sid, choice.via);
   };
 
-  const send = async (text: string, screenContext?: ScreenContext | null) => {
-    const sid = sessionId() ?? crypto.randomUUID();
-    setSessionId(sid);
-    setProgress([]);
-    setStreaming("");
-    setMessages((m) => [...m, { role: "user", content: text }]);
-    setThinking(true);
-    scrollDown();
-    try {
-      const answer: Answer = await ipc.query(sid, text, screenContext);
-      setSessionId(answer.session_id);
-      setMessages((m) => [
-        ...m,
-        { role: "assistant", content: answer.text, sources: answer.sources, degraded: answer.degraded },
-      ]);
-      refetchSessions();
-      refreshPending();
-    } catch (e: any) {
-      setMessages((m) => [...m, { role: "assistant", content: `⚠ ${e?.message ?? e}`, degraded: true }]);
-    } finally {
-      setThinking(false);
-      setStreaming("");
-      scrollDown();
-    }
+  const openSession = (id: string) => {
+    void openConversation(id);
+  };
+
+  const send = (text: string, screenContext?: ScreenContext | null) => {
+    void sendMessage(sessionId(), text, screenContext);
   };
 
   // Requête venue de la barre d'interaction ou de l'Accueil.
-  onMount(() => {
-    let unlistenProgress: (() => void) | undefined;
-    let unlistenResolved: (() => void) | undefined;
-    let unlistenSemantic: (() => void) | undefined;
-    let unlistenDelta: (() => void) | undefined;
-    void on("agent_progress", (raw) => {
-      const event = (raw?.payload ?? raw) as AgentProgress;
-      if (event.session_id !== sessionId()) return;
-      setProgress((steps) => [...steps, event].slice(-20));
-      scrollDown();
-    }).then((fn) => (unlistenProgress = fn));
-    // Réponse en cours d'écriture : on affiche les fragments dès qu'ils
-    // arrivent au lieu d'attendre le bloc final. Le message est remplacé par la
-    // version définitive quand `ipc.query` rend la main — les sources et le
-    // texte canonique viennent de là.
-    void on("answer_delta", (raw) => {
-      const event = (raw?.payload ?? raw) as { session_id: string; delta: string };
-      if (event.session_id !== sessionId() || !event.delta) return;
-      setStreaming((current) => current + event.delta);
-      scrollDown();
-    }).then((fn) => (unlistenDelta = fn));
-    void on("semantic_results", (raw) => {
-      const event = (raw?.payload ?? raw) as { session_id: string; results: Retrieved[] };
-      if (event.session_id !== sessionId() || !event.results?.length) return;
-      setMessages((current) => {
-        const index = current.findLastIndex((message) => message.role === "assistant");
-        if (index < 0) return current;
-        const next = [...current];
-        const existing = next[index].sources ?? [];
-        const seen = new Set(existing.map((source) => source.item_id));
-        next[index] = {
-          ...next[index],
-          sources: [...existing, ...event.results.filter((source) => !seen.has(source.item_id))],
-        };
-        return next;
-      });
-      scrollDown();
-    }).then((fn) => (unlistenSemantic = fn));
-    void on("action_resolved", async () => {
-      const active = sessionId();
-      if (!active) return;
-      const turns = await ipc.getConversation(active).catch(() => null);
-      if (turns) {
-        setMessages(turns.map((turn: any) => ({ role: turn.role, content: turn.content })));
-        scrollDown();
-      }
-    }).then((fn) => (unlistenResolved = fn));
-    onCleanup(() => {
-      unlistenProgress?.();
-      unlistenResolved?.();
-      unlistenSemantic?.();
-      unlistenDelta?.();
-    });
-  });
-  // Requête venue de la barre ou de l'Accueil (l'effet couvre aussi le montage).
   createEffect(() => {
     const q = barQuery();
     if (q) {
       setBarQuery(null);
-      setSessionId(null);
-      setMessages([]);
-      send(q.text, q.screenContext);
+      void sendMessage(null, q.text, q.screenContext);
     }
   });
 
@@ -246,10 +208,7 @@ export function Conversations(): JSX.Element {
       } else {
         await ipc.deleteSession(current.session!.id);
         await refreshPending();
-        if (sessionId() === current.session!.id) {
-          setSessionId(null);
-          setMessages([]);
-        }
+        forgetConversation(current.session!.id);
       }
       setDialog(null);
       setOpenMenu(null);
@@ -265,6 +224,16 @@ export function Conversations(): JSX.Element {
       <button class="convo-list-item" onClick={() => openSession(s.id)} title={s.title || "Sans titre"}>
         {s.title || "Sans titre"}
       </button>
+      {/* Syn travaille sur cette conversation, même si elle n'est pas ouverte —
+          puis, une fois la réponse écrite, une pastille la signale tant qu'elle
+          n'a pas été lue. Un anneau qui s'éteint sans rien laisser ne se
+          remarque pas. */}
+      <Show when={isRunning(s.id)}>
+        <span class="convo-working" role="status" aria-label="Syn travaille sur cette conversation" />
+      </Show>
+      <Show when={!isRunning(s.id) && isUnread(s.id)}>
+        <span class="convo-unread" role="status" aria-label="Réponse non lue" />
+      </Show>
       <button
         class="convo-more"
         title="Actions sur la conversation"
@@ -322,10 +291,7 @@ export function Conversations(): JSX.Element {
       <div class="convo-list">
         <button
           class="convo-list-item"
-          onClick={() => {
-            setSessionId(null);
-            setMessages([]);
-          }}
+          onClick={startNewConversation}
         >
           ＋ Nouvelle conversation
         </button>
@@ -364,8 +330,28 @@ export function Conversations(): JSX.Element {
           </Show>
           <For each={messages()}>
             {(m) => (
+              <Show
+                when={m.role !== "note"}
+                fallback={<div class="msg-note fade-in">{m.content}</div>}
+              >
               <div class="msg fade-in" classList={{ user: m.role === "user", assistant: m.role === "assistant" }}>
                 <MessageContent content={m.content} sources={m.sources} />
+                <Show when={m.choices?.length}>
+                  <div class="msg-choices">
+                    <For each={m.choices}>
+                      {(choice) => (
+                        <button
+                          class="choice-chip"
+                          disabled={thinking()}
+                          onClick={() => chooseAccount(choice)}
+                        >
+                          <Icon name={choice.icon} size={16} />
+                          {choice.label}
+                        </button>
+                      )}
+                    </For>
+                  </div>
+                </Show>
                 <Show when={m.role === "assistant" && settings()?.voice_output_enabled && m.content}>
                   <button
                     class="source-pill"
@@ -394,6 +380,7 @@ export function Conversations(): JSX.Element {
                   </div>
                 </Show>
               </div>
+              </Show>
             )}
           </For>
           <Show when={sessionPending().length > 0}>
@@ -407,7 +394,6 @@ export function Conversations(): JSX.Element {
           <Show when={thinking()}>
             <details class="agent-progress is-working" open>
               <summary>
-                <span class="dot" />
                 <span class="agent-progress-title">
                   {progress()[progress().length - 1]?.title ?? "Syn analyse la demande…"}
                 </span>
@@ -429,6 +415,16 @@ export function Conversations(): JSX.Element {
           </Show>
         </div>
         <div class="convo-input-zone">
+          {/* Un tour laissé sans réponse : l'application a été quittée pendant
+              la réflexion. Syn le dit et propose de relancer, plutôt que de
+              refaire partir la demande sans prévenir. */}
+          <Show when={current().interrupted}>
+            <div class="convo-interrupted">
+              <Icon name="badge-alert" size={14} />
+              <span>Cette demande est restée sans réponse : Syn a été fermé pendant sa réflexion.</span>
+              <button class="btn" onClick={() => void retryLastTurn(sessionId()!)}>Relancer</button>
+            </div>
+          </Show>
           <AskBar onSubmit={send} disabled={thinking()} autofocus />
         </div>
       </div>

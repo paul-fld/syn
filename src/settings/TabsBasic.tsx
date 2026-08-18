@@ -209,11 +209,13 @@ export function TabAccessibilite(): JSX.Element {
         <span class="pill-status">⌥ Espace</span>
       </SettingRow>
 
-      <SettingRow label="Dictée" desc="Dicte tes demandes à Syn. Bientôt disponible.">
+      <SettingRow
+        label="Dictée"
+        desc="Dicte tes demandes à Syn. La reconnaissance se fait sur l'appareil : ta voix ne quitte pas le Mac."
+      >
         <Toggle
-          checked={false}
-          disabled
-          onChange={() => {}}
+          checked={settings()?.voice_input_enabled ?? false}
+          onChange={(v) => patch({ voice_input_enabled: v })}
         />
       </SettingRow>
 

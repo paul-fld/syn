@@ -18,6 +18,8 @@ pub enum Route {
     FileSearchGoogle,
     FileSearchMicrosoft,
     FileSearchLocal,
+    /// Retrouver un message reçu dans une messagerie.
+    MailSearch,
     /// Composer un message à une personne.
     MailCompose,
     /// Lire l'état de la machine.
@@ -44,6 +46,29 @@ const fn case(text: &'static str, expected: Route, note: &'static str) -> Case {
 }
 
 pub const CORPUS: &[Case] = &[
+    // ——— Retrouver un MESSAGE REÇU : le canal décide, pas le dossier ———
+    // Cas réel du 18/08 : ces demandes partaient dans l'index de fichiers et
+    // ressortaient des images dont le nom contenait « mail » ou « maillot ».
+    case(
+        "Tu peux me retrouver un mail de Liverpool qui concerne ma réservation de tickets ?",
+        Route::MailSearch,
+        "un expéditeur nommé, une chose arrivée par message",
+    ),
+    case(
+        "j'ai reçu la confirmation de commande de Decathlon, tu la retrouves ?",
+        Route::MailSearch,
+        "confirmation arrivée dans une boîte mail",
+    ),
+    case(
+        "où est le message du syndic à propos des charges ?",
+        Route::MailSearch,
+        "« où est » appliqué à un message, pas à un fichier",
+    ),
+    case(
+        "retrouve-moi le courriel d'Orange avec la facture d'août",
+        Route::MailSearch,
+        "une facture reçue par mail n'est pas un document rangé",
+    ),
     // ——— Recherche documentaire, français, sans verbe de recherche ———
     case(
         "Le Jeu de la Vie, tu l'as quelque part ?",
@@ -278,4 +303,69 @@ pub const VALIDATION: &[Case] = &[
     case("bon, on verra demain", Route::Conversation, "clôture floue"),
     case("how do you store my data?", Route::Conversation, "méta, anglais"),
     case("resume ce qu'on a dit", Route::Conversation, "résumé oral, pas de fichier demandé"),
+];
+
+/// Suites d'échanges : chaque cas est une conversation, et c'est le DERNIER
+/// message qui doit être classé. Isolés, « gmail » ou « envoie » ne veulent
+/// rien dire — c'est exactement ce qui faisait dérailler Syn en plein envoi de
+/// mail vers une recherche de documents.
+pub struct Suite {
+    pub echanges: &'static [(&'static str, &'static str)],
+    pub dernier: &'static str,
+    pub expected: Route,
+}
+
+pub const SUITES: &[Suite] = &[
+    Suite {
+        echanges: &[
+            ("user", "Tu pourrais envoyer un mail à paul flaud ?"),
+            ("assistant", "Que voulez-vous dire dans ce mail ?"),
+            ("user", "Dis-lui « Bonjour, ceci est un test »"),
+            ("assistant", "Quel compte d'envoi souhaitez-vous utiliser ?"),
+        ],
+        dernier: "gmail",
+        expected: Route::MailCompose,
+    },
+    Suite {
+        echanges: &[
+            ("user", "Tu pourrais envoyer un mail à paul flaud ?"),
+            ("assistant", "Quel compte d'envoi souhaitez-vous utiliser ?"),
+            ("user", "gmail"),
+            ("assistant", "Je prépare le message."),
+        ],
+        dernier: "Envoie « Bonjour, ceci est un test » je te l'avais déjà dis",
+        expected: Route::MailCompose,
+    },
+    Suite {
+        echanges: &[
+            ("user", "Tu peux me retrouver le bail de l'appartement ?"),
+            ("assistant", "J'ai trouvé deux documents."),
+        ],
+        dernier: "le deuxième",
+        expected: Route::FileSearch,
+    },
+    Suite {
+        echanges: &[
+            ("user", "Mon Mac chauffe beaucoup"),
+            ("assistant", "Le processeur est à 82 %."),
+        ],
+        dernier: "et la batterie ?",
+        expected: Route::DeviceDiagnostic,
+    },
+    Suite {
+        echanges: &[
+            ("user", "Écris un compte rendu de notre échange"),
+            ("assistant", "Où veux-tu que je l'enregistre ?"),
+        ],
+        dernier: "sur le Mac",
+        expected: Route::DocumentCreate,
+    },
+    Suite {
+        echanges: &[
+            ("user", "Préviens Nadia que je serai en retard"),
+            ("assistant", "Depuis quel compte ?"),
+        ],
+        dernier: "outlook",
+        expected: Route::MailCompose,
+    },
 ];

@@ -7,6 +7,7 @@
 
 use crate::bus::Bus;
 use crate::db::{now, Db};
+use rusqlite::params;
 use crate::error::{AppError, Result};
 use crate::ingestion;
 use crate::llm::LlmClient;
@@ -31,6 +32,27 @@ pub fn native_available() -> bool {
         Some(dir) => std::fs::read_dir(&dir).is_ok(),
         None => false,
     }
+}
+
+/// Canaux d'envoi réellement utilisables, avec leur libellé.
+///
+/// Le défaut historique était « Apple Mail », choisi sans vérifier qu'il soit
+/// disponible : sur une application non signée, ou sans autorisation
+/// d'automatisation, l'envoi échouait alors que des comptes Google et Microsoft
+/// étaient connectés et prêts. Une adresse d'expéditeur n'est pas un détail
+/// technique — c'est l'utilisateur qui la choisit.
+pub fn available_channels(db: &Db) -> Vec<(&'static str, &'static str)> {
+    let mut channels = Vec::new();
+    if cfg!(target_os = "macos") && native_available() {
+        channels.push(("apple", "Apple Mail"));
+    }
+    if super::is_connected(db, "google") {
+        channels.push(("google", "Gmail"));
+    }
+    if super::is_connected(db, "microsoft") {
+        channels.push(("microsoft", "Outlook"));
+    }
+    channels
 }
 
 /// Parse un .emlx : première ligne = longueur du message RFC822, puis le message,
@@ -277,4 +299,232 @@ mod tests {
         let html = "<p>Échéance : décembre</p><script>faux TODO</script><div>À bientôt 👋</div>";
         assert_eq!(strip_html(html), "Échéance : décembre À bientôt 👋");
     }
+}
+
+/// Envoi en cours de construction, accumulé sur plusieurs tours.
+///
+/// Le modèle oublie : après avoir demandé le compte d'envoi, il redemandait le
+/// contenu que l'utilisateur venait de donner deux tours plus tôt. Ce n'est pas
+/// une faiblesse qu'on corrige par une consigne — on la corrige en tenant l'état
+/// hors du modèle. Seuls des ARGUMENTS D'OUTIL structurés entrent ici, jamais
+/// une phrase interprétée.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Composition {
+    pub recipient: String,
+    pub subject: String,
+    pub body: String,
+    pub via: String,
+    /// « validated » quand le texte vient de l'utilisateur ou qu'il l'a relu,
+    /// « draft » quand Syn vient de le rédiger et attend son accord.
+    pub body_state: String,
+    /// « resolved » quand l'adresse sort du carnet d'adresses de l'utilisateur,
+    /// « model » quand elle vient d'un appel d'outil — donc à vérifier.
+    pub recipient_source: String,
+}
+
+impl Default for Composition {
+    fn default() -> Self {
+        Composition {
+            recipient: String::new(),
+            subject: String::new(),
+            body: String::new(),
+            via: String::new(),
+            body_state: "validated".into(),
+            recipient_source: "model".into(),
+        }
+    }
+}
+
+impl Composition {
+    pub fn is_empty(&self) -> bool {
+        self.recipient.is_empty()
+            && self.subject.is_empty()
+            && self.body.is_empty()
+            && self.via.is_empty()
+    }
+
+    /// Le texte proposé attend-il la relecture de l'utilisateur ?
+    pub fn awaits_approval(&self) -> bool {
+        !self.body.is_empty() && self.body_state == "draft"
+    }
+
+    /// L'adresse a-t-elle été trouvée par Syn dans le carnet de l'utilisateur ?
+    /// Elle est alors légitime par construction : elle ne vient ni du modèle,
+    /// ni d'un contenu observé.
+    pub fn recipient_is_resolved(&self) -> bool {
+        !self.recipient.is_empty() && self.recipient_source == "resolved"
+    }
+
+    /// Ce qu'il reste à savoir avant de pouvoir proposer l'envoi.
+    pub fn missing(&self) -> Vec<&'static str> {
+        let mut missing = Vec::new();
+        if self.recipient.is_empty() {
+            missing.push("destinataire");
+        }
+        if self.body.is_empty() {
+            missing.push("contenu");
+        }
+        missing
+    }
+}
+
+pub fn composition(db: &Db, session_id: &str) -> Result<Composition> {
+    db.read(|c| {
+        Ok(c.query_row(
+            "SELECT COALESCE(recipient,''),COALESCE(subject,''),COALESCE(body,''),COALESCE(via,''),
+                    COALESCE(body_state,'validated'),COALESCE(recipient_source,'model')
+             FROM mail_compositions WHERE session_id=?1",
+            params![session_id],
+            |row| {
+                Ok(Composition {
+                    recipient: row.get(0)?,
+                    subject: row.get(1)?,
+                    body: row.get(2)?,
+                    via: row.get(3)?,
+                    body_state: row.get(4)?,
+                    recipient_source: row.get(5)?,
+                })
+            },
+        )
+        .unwrap_or_default())
+    })
+}
+
+/// Combien de messages sont déjà indexés localement (Apple Mail, messages déjà
+/// vus). Sert à savoir si une recherche a la moindre chance d'aboutir hors
+/// connecteur — et donc à ne promettre que ce que Syn peut tenir.
+pub fn indexed_count(db: &Db) -> Result<i64> {
+    db.read(|c| {
+        Ok(c.query_row(
+            "SELECT COUNT(*) FROM items WHERE source='mail' AND status='active'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0))
+    })
+}
+
+/// Libellé d'un compte d'envoi, tel que l'utilisateur le nomme.
+pub fn channel_label(via: &str) -> &'static str {
+    match via {
+        "google" => "Gmail",
+        "microsoft" => "Outlook",
+        _ => "Apple Mail",
+    }
+}
+
+/// Le texte proposé vient d'être relu et accepté : plus rien ne le retient.
+pub fn approve_body(db: &Db, session_id: &str) -> Result<Composition> {
+    db.with(|c| {
+        c.execute(
+            "UPDATE mail_compositions SET body_state='validated', updated_at=?2 WHERE session_id=?1",
+            params![session_id, now()],
+        )?;
+        Ok(())
+    })?;
+    composition(db, session_id)
+}
+
+/// Fusionne les champs non vides d'un appel d'outil dans l'état de la session.
+/// Un champ vide n'efface jamais un champ déjà connu : le modèle qui rappelle
+/// `mail.send` sans le corps ne doit pas faire disparaître le corps.
+pub fn remember_composition(db: &Db, session_id: &str, args: &serde_json::Value) -> Result<Composition> {
+    let current = composition(db, session_id)?;
+    let field = |key: &str, previous: &str| -> String {
+        let value = args[key].as_str().unwrap_or("").trim();
+        if value.is_empty() {
+            previous.to_string()
+        } else {
+            value.to_string()
+        }
+    };
+    let body = field("body", &current.body);
+    // Un texte que Syn vient d'écrire n'a pas encore été lu par l'utilisateur :
+    // il attend sa relecture. Tant que le corps ne bouge pas, l'accord déjà
+    // donné tient — sinon la question « tu valides ? » se reposerait sans fin.
+    let body_state = if body == current.body {
+        current.body_state.clone()
+    } else {
+        "draft".to_string()
+    };
+    let recipient = field("to", &current.recipient);
+    // Une adresse réécrite par un appel d'outil retombe sous contrôle : seule
+    // celle que Syn a lui-même résolue garde sa provenance de confiance.
+    let recipient_source = if recipient.eq_ignore_ascii_case(&current.recipient) {
+        current.recipient_source.clone()
+    } else {
+        "model".to_string()
+    };
+    let merged = Composition {
+        recipient,
+        subject: field("subject", &current.subject),
+        body,
+        via: field("via", &current.via),
+        body_state,
+        recipient_source,
+    };
+    if merged == current {
+        return Ok(merged);
+    }
+    save(db, session_id, &merged)?;
+    Ok(merged)
+}
+
+/// L'adresse trouvée par `people.resolve_email` dans le carnet de l'utilisateur.
+///
+/// Elle entre par une porte différente de celle des arguments d'outil, et c'est
+/// tout l'intérêt : elle ne vient ni du modèle, ni d'un contenu observé, mais
+/// des données de l'utilisateur, pour un nom qu'il a lui-même écrit.
+pub fn remember_resolved_recipient(db: &Db, session_id: &str, email: &str) -> Result<Composition> {
+    let email = email.trim();
+    if !(email.contains('@') && email.contains('.')) {
+        return composition(db, session_id);
+    }
+    let current = composition(db, session_id)?;
+    let merged = Composition {
+        recipient: email.to_string(),
+        recipient_source: "resolved".into(),
+        ..current.clone()
+    };
+    if merged == current {
+        return Ok(merged);
+    }
+    save(db, session_id, &merged)?;
+    Ok(merged)
+}
+
+fn save(db: &Db, session_id: &str, state: &Composition) -> Result<()> {
+    db.with(|c| {
+        c.execute(
+            "INSERT INTO mail_compositions(session_id,recipient,subject,body,via,body_state,recipient_source,updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+             ON CONFLICT(session_id) DO UPDATE SET recipient=excluded.recipient,
+               subject=excluded.subject, body=excluded.body, via=excluded.via,
+               body_state=excluded.body_state, recipient_source=excluded.recipient_source,
+               updated_at=excluded.updated_at",
+            params![
+                session_id,
+                state.recipient,
+                state.subject,
+                state.body,
+                state.via,
+                state.body_state,
+                state.recipient_source,
+                now()
+            ],
+        )?;
+        Ok(())
+    })
+}
+
+/// Le mail est parti : l'état n'a plus lieu d'être. Le garder ferait resurgir
+/// un vieux brouillon à la demande suivante.
+pub fn clear_composition(db: &Db, session_id: &str) -> Result<()> {
+    db.with(|c| {
+        c.execute(
+            "DELETE FROM mail_compositions WHERE session_id=?1",
+            params![session_id],
+        )?;
+        Ok(())
+    })
 }

@@ -14,6 +14,19 @@ use std::sync::Arc;
 /// personnel qu'on sollicite par à-coups, et où chaque rechargement se voit.
 const KEEP_ALIVE: &str = "30m";
 
+/// Fenêtre de contexte demandée au runtime.
+///
+/// **C'était la cause des attentes d'une minute.** Le défaut d'Ollama est de
+/// 4096 jetons ; un tour réel de Syn (consigne système, fragments de documents,
+/// historique de conversation, schémas d'outils) en occupe environ 4080. À la
+/// limite, le cache de contexte ne peut plus être réutilisé et le modèle RELIT
+/// l'intégralité du prompt à chaque tour : 26,8 s de lecture contre 0,07 s
+/// quand la fenêtre est assez large. Mesuré, pas supposé.
+///
+/// 8192 laisse une marge confortable au-dessus du budget de contexte de
+/// `retrieval` (9000 caractères) sans alourdir inutilement la mémoire.
+const CONTEXT_WINDOW: u32 = 8192;
+
 pub struct OllamaClient {
     base: String,
     chat_model: String,
@@ -83,7 +96,10 @@ impl OllamaClient {
             // assistant qu'on interroge quelques fois par heure paierait ce
             // prix à CHAQUE fois.
             "keep_alive": KEEP_ALIVE,
-            "options": { "temperature": params.temperature }
+            "options": {
+                "temperature": params.temperature,
+                "num_ctx": CONTEXT_WINDOW,
+            }
         });
         if let Some(mt) = params.max_tokens {
             body["options"]["num_predict"] = json!(mt);
@@ -208,12 +224,18 @@ impl LlmClient for OllamaClient {
                 // On ne diffuse qu'une fois certain qu'il s'agit bien d'une
                 // réponse et non du préambule d'un appel d'outil : afficher
                 // puis effacer serait pire que d'attendre un instant.
-                if tool_calls.is_empty() && pending.chars().count() >= 24 {
+                // Un modèle écrit parfois son appel d'outil en texte : c'est du
+                // JSON, jamais une réponse à montrer. On ne diffuse donc rien
+                // tant que le début du contenu ressemble à une structure.
+                if tool_calls.is_empty()
+                    && !crate::llm::looks_structured(&content)
+                    && pending.chars().count() >= 24
+                {
                     let _ = sink.send(std::mem::take(&mut pending));
                 }
             }
         }
-        if tool_calls.is_empty() && !pending.is_empty() {
+        if tool_calls.is_empty() && !pending.is_empty() && !crate::llm::looks_structured(&content) {
             let _ = sink.send(std::mem::take(&mut pending));
         }
         Ok(LlmResponse {
@@ -275,7 +297,10 @@ impl LlmClient for OllamaClient {
                         "messages": [],
                         "stream": false,
                         "keep_alive": KEEP_ALIVE,
-                        "options": {"num_predict": 0},
+                        // MÊME fenêtre que les appels réels : sans cela le
+                        // modèle est chargé en 4096, puis rechargé au premier
+                        // vrai appel — et ce rechargement se paie comptant.
+                        "options": {"num_predict": 0, "num_ctx": CONTEXT_WINDOW},
                     }))
                     .send()
                     .await;

@@ -35,7 +35,8 @@ pub fn classify(tool: &str, args: &Value) -> RiskClass {
     match tool {
         // Lectures
         "memory.query" | "files.search" | "mail.search" | "cloud.search" | "calendar.list" | "tasks.list"
-        | "commitments.list" | "people.context" | "photos.search" | "system.diagnose"
+        | "commitments.list" | "people.context" | "people.resolve_email" | "photos.search"
+        | "system.diagnose"
         | "document.open" /* affiche un document déjà connu : ne modifie rien */
         | "files.reorganize" /* dry-run : produit un PLAN, ne déplace rien */ => RiskClass::Read,
 
@@ -44,6 +45,7 @@ pub fn classify(tool: &str, args: &Value) -> RiskClass {
         | "tasks.create"
         | "tasks.complete"
         | "memory.remember"
+        | "people.link_email"
         | "files.move"
         | "files.create_folder_and_move"
         // Écriture de document : annulable (suppression du fichier créé,
@@ -99,6 +101,14 @@ pub fn needs_confirmation(
     }
     // Le rangement suit le modèle « confiance → plan → revue unique » (Média §B6).
     if tool == "files.apply_reorganize_plan" {
+        return true;
+    }
+    // Mémoriser une information personnelle que Syn a déduite SEUL se confirme
+    // toujours. Une mémoire qui se remplit sans accord devient un fouillis que
+    // personne n'a choisi — et l'utilisateur perd de vue ce que Syn sait de lui.
+    // Note : `memory.remember` n'est pas concerné, l'utilisateur l'a demandé
+    // explicitement ; lui reposer la question serait du bruit.
+    if tool == "people.link_email" {
         return true;
     }
     match risk {
@@ -395,6 +405,39 @@ pub fn apply_undo(db: &Db, undo: &Value) -> Result<String> {
             })?;
             Ok(format!("Document supprimé : {path}."))
         }
+        "unlink_person_email" => {
+            let person_id = undo["person_id"].as_str().unwrap_or_default();
+            let email = undo["email"].as_str().unwrap_or_default().to_lowercase();
+            db.with(|c| {
+                let channels: Option<String> = c
+                    .query_row(
+                        "SELECT comm_channels FROM people WHERE id=?1",
+                        params![person_id],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(None);
+                let mut value: Value = channels
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_str(raw).ok())
+                    .unwrap_or_else(|| serde_json::json!({"emails": [], "phones": []}));
+                if let Some(emails) = value["emails"].as_array_mut() {
+                    emails.retain(|entry| entry.as_str().unwrap_or_default() != email);
+                }
+                // Une fiche créée pour cette seule adresse disparaît avec elle.
+                let orphan = value["emails"].as_array().is_none_or(|list| list.is_empty())
+                    && value["phones"].as_array().is_none_or(|list| list.is_empty());
+                if orphan {
+                    c.execute("DELETE FROM people WHERE id=?1", params![person_id])?;
+                } else {
+                    c.execute(
+                        "UPDATE people SET comm_channels=?2 WHERE id=?1",
+                        params![person_id, value.to_string()],
+                    )?;
+                }
+                Ok(())
+            })?;
+            Ok(format!("Association oubliée : {email}."))
+        }
         "restore_text_file" => {
             let path = undo["path"]
                 .as_str()
@@ -465,5 +508,33 @@ mod tests {
             false,
             "files.search"
         ));
+    }
+}
+
+#[cfg(test)]
+mod classification_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Un outil absent de `classify` retombe sur « inconnu → plancher » et
+    /// réclame une confirmation. Pour une LECTURE, c'est un blocage net :
+    /// `people.resolve_email` demandait à l'utilisateur d'autoriser Syn à
+    /// consulter son propre carnet d'adresses, au milieu d'un envoi de mail.
+    ///
+    /// Cette garde vérifie que tout outil déclaré en lecture dans le catalogue
+    /// est bien classé en lecture — aujourd'hui et pour ceux qu'on ajoutera.
+    #[test]
+    fn tout_outil_de_lecture_du_catalogue_est_classe_en_lecture() {
+        for spec in crate::tools::catalog() {
+            if !matches!(spec.side_effect, crate::llm::SideEffect::Read) {
+                continue;
+            }
+            assert_eq!(
+                classify(&spec.name, &json!({})),
+                RiskClass::Read,
+                "l'outil « {} » est une lecture mais exige une confirmation",
+                spec.name
+            );
+        }
     }
 }

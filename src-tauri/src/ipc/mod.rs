@@ -153,6 +153,19 @@ pub async fn query(
     crate::router::handle_query_with_context(&core, &sid, &text, screen_context.as_ref()).await
 }
 
+/// Le compte d'envoi choisi d'un clic sur la proposition affichée dans le fil.
+/// Aucun appel au modèle : le choix est un fait, pas une phrase à interpréter.
+#[tauri::command]
+pub fn choose_mail_account(
+    state: State<'_, AppState>,
+    session_id: String,
+    via: String,
+) -> Result<crate::router::Answer> {
+    let core = state.core()?;
+    let settings = crate::settings::load(&core.db)?;
+    crate::router::mail_flow::choose_account(&core, &session_id, &via, &settings)
+}
+
 #[tauri::command]
 pub fn list_sessions(state: State<'_, AppState>) -> Result<Vec<Value>> {
     let core = state.core()?;
@@ -312,7 +325,7 @@ pub fn get_conversation(state: State<'_, AppState>, session_id: String) -> Resul
     core.db.read(|c| {
         let mut stmt = c.prepare(
             "SELECT role, content, created_at FROM conversations
-             WHERE session_id = ?1 AND role IN ('user','assistant') ORDER BY turn",
+             WHERE session_id = ?1 AND role IN ('user','assistant','note') ORDER BY turn",
         )?;
         let rows = stmt.query_map(params![session_id], |r| {
             Ok(json!({
@@ -375,8 +388,21 @@ pub async fn confirm_action(state: State<'_, AppState>, action_id: String) -> Re
         db: core.db.clone(),
         llm: core.llm.clone(),
         bus: core.bus.clone(),
-        settings,
+        settings: settings.clone(),
     };
+    // Accusé discret avant l'exécution : dans le fil, l'utilisateur voit que
+    // c'est bien LUI qui a déclenché l'envoi.
+    if action.tool == "mail.send" {
+        if let Some(sid) = &action.session_id {
+            crate::router::mail_flow::note(
+                &core,
+                sid,
+                settings
+                    .voice
+                    .pick("Tu as confirmé l'envoi", "Vous avez confirmé l'envoi"),
+            )?;
+        }
+    }
     if let Some(sid) = &action.session_id {
         core.bus.emit(BusEvent::AgentProgress {
             session_id: sid.clone(),
@@ -390,7 +416,6 @@ pub async fn confirm_action(state: State<'_, AppState>, action_id: String) -> Re
     }
     match crate::tools::execute(&ctx, &action.tool, &action.input).await {
         Ok(outcome) => {
-            let result_text = outcome.result.to_string();
             actions::set_action_result(
                 &core.db,
                 &action_id,
@@ -405,17 +430,23 @@ pub async fn confirm_action(state: State<'_, AppState>, action_id: String) -> Re
                 ),
                 outcome.undo.as_ref(),
             )?;
+            if action.tool == "mail.send" {
+                if let Some(sid) = &action.session_id {
+                    crate::connectors::mail::clear_composition(&core.db, sid)?;
+                }
+            }
             if let Some(sid) = &action.session_id {
-                let human_result = outcome.result["display_report"]
-                    .as_str()
-                    .or_else(|| outcome.result["report"].as_str())
-                    .unwrap_or(&result_text);
-                crate::memory::persist_turn(&core.db, sid, "assistant", human_result)?;
+                let human_result = crate::tools::outcome_summary(
+                    &action.tool,
+                    &outcome.result,
+                    settings.voice.vouvoie(),
+                );
+                crate::memory::persist_turn(&core.db, sid, "assistant", &human_result)?;
                 core.bus.emit(BusEvent::AgentProgress {
                     session_id: sid.clone(),
                     stage: "complete".into(),
                     title: "Action terminée et vérifiée".into(),
-                    detail: Some(human_result.into()),
+                    detail: Some(human_result.clone()),
                     current: 5,
                     total: 5,
                     status: "done".into(),
@@ -443,7 +474,23 @@ pub async fn confirm_action(state: State<'_, AppState>, action_id: String) -> Re
 #[tauri::command]
 pub fn reject_action(state: State<'_, AppState>, action_id: String) -> Result<()> {
     let core = state.core()?;
+    let action = actions::get_action(&core.db, &action_id)?;
     actions::set_action_result(&core.db, &action_id, "rejected", None, None)?;
+    // Un envoi refusé est un envoi abandonné : sans cet effacement, le parcours
+    // reproposait la même carte au tour suivant.
+    if action.tool == "mail.send" {
+        if let Some(sid) = &action.session_id {
+            crate::connectors::mail::clear_composition(&core.db, sid)?;
+            let settings = crate::settings::load(&core.db)?;
+            crate::router::mail_flow::note(
+                &core,
+                sid,
+                settings
+                    .voice
+                    .pick("Tu as refusé l'envoi", "Vous avez refusé l'envoi"),
+            )?;
+        }
+    }
     core.bus.emit(BusEvent::ActionResolved {
         action_id,
         status: "rejected".into(),
@@ -1501,6 +1548,54 @@ pub fn open_source(
         .open_path(source_ref, None::<String>)
         .map_err(|e| AppError::Other(e.to_string()))?;
     Ok(())
+}
+
+// ————————————————— Dictée et commande vocale —————————————————
+
+/// État de la dictée : autorisation et écoute en cours. L'interface s'appuie
+/// dessus pour savoir si le micro peut être proposé.
+#[tauri::command]
+pub fn dictation_status() -> Value {
+    json!({
+        "authorization": connectors::native::speech::authorization(),
+        "listening": connectors::native::speech::running(),
+        "supported": cfg!(target_os = "macos"),
+    })
+}
+
+#[tauri::command]
+pub fn dictation_request_permission() -> Value {
+    connectors::native::speech::request_authorization();
+    json!({"authorization": connectors::native::speech::authorization()})
+}
+
+/// Démarre l'écoute. La transcription se lit ensuite par `dictation_transcript`.
+#[tauri::command]
+pub fn dictation_start(state: State<'_, AppState>, locale: Option<String>) -> Result<()> {
+    let core = state.core()?;
+    let settings = crate::settings::load(&core.db)?;
+    if !settings.voice_input_enabled {
+        return Err(AppError::Invalid(
+            "La dictée est désactivée dans Réglages ▸ Général.".into(),
+        ));
+    }
+    // La voix est une donnée personnelle : son usage se journalise comme les
+    // autres accès, même si rien ne sort de la machine.
+    crate::security::log_access(&core.db, "micro", "dictation_start", None);
+    connectors::native::speech::start(locale.as_deref().unwrap_or("fr-FR"))
+}
+
+#[tauri::command]
+pub fn dictation_transcript() -> Value {
+    json!({
+        "text": connectors::native::speech::transcript(),
+        "listening": connectors::native::speech::running(),
+    })
+}
+
+#[tauri::command]
+pub fn dictation_stop() -> String {
+    connectors::native::speech::stop()
 }
 
 #[tauri::command]

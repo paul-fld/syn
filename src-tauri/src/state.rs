@@ -111,6 +111,12 @@ impl AppState {
             warming.warm_up().await;
             ready_flag.store(true, std::sync::atomic::Ordering::SeqCst);
             ready_bus.emit(crate::bus::BusEvent::RuntimeReady);
+            // Puis le prompt de compréhension d'intention : ses consignes et ses
+            // exemples coûtent une vingtaine de secondes à évaluer la première
+            // fois. Les traiter maintenant, plutôt que sur la première question
+            // de l'utilisateur, est la différence entre une demande comprise et
+            // une demande devinée par mots-clés.
+            crate::router::intent::preheat(&warming).await;
         });
         // Aucun rescan au démarrage : Indexer rejoue FSEvents depuis le point
         // de contrôle persistant et ne demande un catalogue de secours que si

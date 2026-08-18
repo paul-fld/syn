@@ -30,6 +30,18 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0007_progressive_indexing",
         include_str!("../../migrations/0007_progressive_indexing.sql"),
     ),
+    (
+        "0008_mail_compositions",
+        include_str!("../../migrations/0008_mail_compositions.sql"),
+    ),
+    (
+        "0009_mail_draft_validation",
+        include_str!("../../migrations/0009_mail_draft_validation.sql"),
+    ),
+    (
+        "0010_mail_recipient_source",
+        include_str!("../../migrations/0010_mail_recipient_source.sql"),
+    ),
 ];
 
 /// Normalisation de recherche : minuscules + suppression des diacritiques

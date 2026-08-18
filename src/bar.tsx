@@ -122,7 +122,6 @@ function Bar(): JSX.Element {
           <Show when={thinking()}>
             <details class="agent-progress compact is-working" open>
               <summary>
-                <span class="dot" />
                 <span class="agent-progress-title">{progress()[progress().length - 1]?.title ?? "Syn analyse la demande…"}</span>
               </summary>
               <div class="agent-progress-list">

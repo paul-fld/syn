@@ -88,8 +88,17 @@ export interface Answer {
   text: string;
   sources: Retrieved[];
   pending_actions: PendingRef[];
+  /// Questions fermées posées par Syn (compte d'envoi d'un mail) : elles
+  /// s'affichent en boutons sous le message, elles ne se tapent pas.
+  choices: AccountChoice[];
   session_id: string;
   degraded: boolean;
+}
+
+export interface AccountChoice {
+  via: string;
+  label: string;
+  icon: string;
 }
 
 export interface BriefItem {
@@ -298,6 +307,8 @@ export const ipc = {
   createProject: (name: string) => invoke<ConversationProject>("create_project", { name }),
   moveSessionToProject: (sessionId: string, projectId: string | null) =>
     invoke<void>("move_session_to_project", { sessionId, projectId }),
+  chooseMailAccount: (sessionId: string, via: string) =>
+    invoke<Answer>("choose_mail_account", { sessionId, via }),
 
   // briefs
   getStartupBrief: () => invoke<Brief>("get_startup_brief"),
@@ -396,6 +407,11 @@ export const ipc = {
   storageStats: () => invoke<any>("storage_stats"),
   dataDirPath: () => invoke<string>("data_dir_path"),
   runtimeReady: () => invoke<boolean>("runtime_ready"),
+  dictationStatus: () => invoke<{ authorization: string; listening: boolean; supported: boolean }>("dictation_status"),
+  dictationRequestPermission: () => invoke<{ authorization: string }>("dictation_request_permission"),
+  dictationStart: (locale?: string) => invoke<void>("dictation_start", { locale }),
+  dictationTranscript: () => invoke<{ text: string; listening: boolean }>("dictation_transcript"),
+  dictationStop: () => invoke<string>("dictation_stop"),
   purgeAllData: (password: string) => invoke<void>("purge_all_data", { password }),
   onboardingComplete: () => invoke<void>("onboarding_complete"),
   openSource: (sourceRef: string) => invoke<void>("open_source", { sourceRef }),

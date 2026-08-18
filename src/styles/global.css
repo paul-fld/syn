@@ -812,15 +812,6 @@ button {
   gap: 7px;
 }
 .agent-progress summary::-webkit-details-marker { display: none; }
-.agent-progress .dot {
-  width: 6px;
-  height: 6px;
-  flex: 0 0 auto;
-  border-radius: 50%;
-  background: var(--accent);
-  box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 45%, transparent);
-  animation: syn-thinking-pulse 1.4s ease-out infinite;
-}
 .agent-progress.is-working .agent-progress-title,
 .action-working-shimmer span {
   color: transparent;
@@ -886,6 +877,140 @@ button {
 .convo-input-zone {
   padding: 14px 34px 20px;
 }
+
+/* ——— Conversation en tâche de fond ——— */
+
+/* Anneau de travail : dit qu'une réflexion continue sur une conversation qu'on
+   ne regarde pas. Discret — c'est un signe, pas une alarme. */
+.convo-working {
+  flex: none;
+  width: 12px;
+  height: 12px;
+  margin-left: auto;
+  margin-right: 3px;
+  border-radius: 50%;
+  border: 1.5px solid color-mix(in srgb, var(--text-primary) 22%, transparent);
+  border-top-color: var(--text-primary);
+  animation: convo-spin 0.9s linear infinite;
+}
+@keyframes convo-spin {
+  to { transform: rotate(360deg); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .convo-working { animation-duration: 3s; }
+}
+
+/* Réponse écrite pendant que l'utilisateur regardait ailleurs : la pastille
+   prend le relais de l'anneau et ne s'efface qu'une fois la conversation vue. */
+.convo-unread {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  margin-left: auto;
+  margin-right: 3px;
+  border-radius: 50%;
+  background: #0088ff;
+}
+
+/* Un tour resté sans réponse parce que Syn a été fermé pendant sa réflexion. */
+.convo-interrupted {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin-bottom: 8px;
+  padding: 8px 12px;
+  border-radius: var(--radius-s);
+  box-shadow: inset 0 0 0 1px var(--border-strong);
+  background: var(--bg-card);
+  color: var(--text-secondary);
+  font-size: 12.5px;
+}
+.convo-interrupted .btn { margin-left: auto; }
+
+/* ——— Parcours d'envoi d'un mail ——— */
+
+/* Le texte que Syn propose se lit comme une lettre : italique, à demi-teinte,
+   pour qu'on distingue au premier coup d'œil le MESSAGE de ce que Syn en dit
+   (maquettes « Conv mail »). */
+.msg-line.quote {
+  font-style: italic;
+  color: color-mix(in srgb, var(--text-primary) 50%, transparent);
+}
+.msg-line.quote.empty { line-height: 0.9; }
+
+/* Accusé du fil : « Vous avez choisi Gmail », « Vous avez confirmé l'envoi ».
+   Aligné côté utilisateur, mais visiblement plus discret qu'une bulle. */
+.msg-note {
+  align-self: flex-end;
+  max-width: 78%;
+  font-size: 12px;
+  font-style: italic;
+  color: var(--text-secondary);
+  user-select: text;
+}
+
+/* Une question fermée se clique : les comptes d'envoi disponibles, avec leur
+   logo, plutôt qu'un nom à taper au clavier. */
+.msg-choices {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  margin-top: 10px;
+}
+.choice-chip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 168px;
+  padding: 7px 12px;
+  border: 0;
+  border-radius: var(--radius-s);
+  box-shadow: inset 0 0 0 1px var(--border-strong);
+  background: var(--bg-card);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+.choice-chip:hover:not(:disabled) { background: var(--bg-selected); }
+.choice-chip:disabled { opacity: 0.55; cursor: default; }
+
+.mail-preview {
+  margin-bottom: 12px;
+  font-size: 12.5px;
+}
+.mail-preview-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+.mail-preview-account {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 9px;
+  border-radius: var(--radius-s);
+  box-shadow: inset 0 0 0 1px var(--border-strong);
+}
+.mail-preview-to { color: var(--text-secondary); }
+.mail-preview-subject {
+  margin-bottom: 8px;
+  font-weight: 600;
+}
+/* Le corps entier, avec ses paragraphes : on ne confirme pas un envoi sur un
+   extrait tronqué. */
+.mail-preview-body {
+  line-height: 1.5;
+  font-style: italic;
+  color: color-mix(in srgb, var(--text-primary) 50%, transparent);
+  max-height: 320px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+}
+.mail-preview-body .empty { line-height: 0.7; }
 
 /* ——— Cartes de confirmation (plancher) ——— */
 
@@ -995,7 +1120,6 @@ button {
 .archive-action + .archive-action { border-top: 1px solid var(--border); }
 
 @media (prefers-reduced-motion: reduce) {
-  .agent-progress .dot,
   .agent-progress.is-working .agent-progress-title,
   .action-working-shimmer span,
   .agent-progress-step.running {
@@ -1908,4 +2032,23 @@ select.select {
 @keyframes syn-boot-spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) {
   .boot-spinner { animation-duration: 2.4s; }
+}
+
+/* ————— Dictée et commande vocale —————
+   L'écoute doit se voir sans ambiguïté : le champ prend la teinte d'accent et
+   le bouton actif pulse. Un micro qui écoute sans le dire serait un défaut de
+   confiance, pas seulement d'ergonomie. */
+.askbar.listening {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
+}
+.askbar button.active .icon {
+  animation: syn-listening 1.5s ease-in-out infinite;
+}
+@keyframes syn-listening {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .askbar button.active .icon { animation: none; }
 }

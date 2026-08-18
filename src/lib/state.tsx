@@ -1,6 +1,7 @@
 // Store global de l'app (SolidJS) : statut, réglages, événements backend.
 import { createSignal } from "solid-js";
 import { ipc, on, type AppStatus, type Settings, type PendingAction, type ScreenContext, type SynNotification } from "./ipc";
+import { wireConversationEvents } from "./conversations";
 
 export type Screen = "loading" | "onboarding" | "locked" | "app";
 export type PageId =
@@ -107,6 +108,10 @@ let wired = false;
 export async function wireEvents() {
   if (wired) return;
   wired = true;
+  // Les événements de conversation sont écoutés au niveau de l'application :
+  // attachés à la page, ils disparaissaient dès qu'on la quittait, et la
+  // réflexion en cours perdait sa progression et son texte.
+  await wireConversationEvents();
   await on("voice_profile_changed", () => refreshSettings());
   await on("action_awaiting_confirmation", () => refreshPending());
   await on("action_resolved", () => refreshPending());

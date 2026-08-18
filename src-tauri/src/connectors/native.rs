@@ -30,6 +30,124 @@ unsafe extern "C" {
         root: *const std::os::raw::c_char,
         since_id: u64,
     ) -> *mut std::os::raw::c_char;
+    fn syn_native_speech_authorization() -> i32;
+    fn syn_native_speech_request_authorization();
+    fn syn_native_speech_start(locale: *const std::os::raw::c_char) -> i32;
+    fn syn_native_speech_text() -> *mut std::os::raw::c_char;
+    fn syn_native_speech_error() -> *mut std::os::raw::c_char;
+    fn syn_native_speech_running() -> i32;
+    fn syn_native_speech_stop() -> *mut std::os::raw::c_char;
+}
+
+/// Dictée locale (Speech framework, reconnaissance sur l'appareil).
+///
+/// Toute la reconnaissance se fait hors ligne : la voix ne quitte jamais la
+/// machine. Si le modèle hors-ligne n'est pas installé pour la langue, on
+/// refuse plutôt que de basculer silencieusement vers les serveurs d'Apple —
+/// ce serait contraire à la promesse de Syn.
+pub mod speech {
+    use super::*;
+
+    /// `granted` | `denied` | `undetermined` | `unsupported`
+    pub fn authorization() -> &'static str {
+        #[cfg(target_os = "macos")]
+        {
+            match unsafe { syn_native_speech_authorization() } {
+                0 => "granted",
+                2 => "undetermined",
+                _ => "denied",
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            "unsupported"
+        }
+    }
+
+    pub fn request_authorization() {
+        #[cfg(target_os = "macos")]
+        unsafe {
+            syn_native_speech_request_authorization()
+        }
+    }
+
+    /// Récupère et libère une chaîne rendue par le pont natif.
+    #[cfg(target_os = "macos")]
+    fn take_native_string(raw: *mut std::os::raw::c_char) -> Option<String> {
+        if raw.is_null() {
+            return None;
+        }
+        let value = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+        unsafe { syn_native_free(raw) };
+        Some(value)
+    }
+
+    fn last_error() -> Option<String> {
+        #[cfg(target_os = "macos")]
+        {
+            take_native_string(unsafe { syn_native_speech_error() })
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            None
+        }
+    }
+
+    pub fn start(locale: &str) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        {
+            let locale = CString::new(locale).map_err(|_| AppError::Invalid("langue".into()))?;
+            if unsafe { syn_native_speech_start(locale.as_ptr()) } == 0 {
+                Ok(())
+            } else {
+                Err(AppError::Invalid(
+                    last_error().unwrap_or_else(|| "dictée indisponible".into()),
+                ))
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = locale;
+            Err(AppError::Invalid(
+                "la dictée n'est disponible que sur macOS".into(),
+            ))
+        }
+    }
+
+    /// Transcription courante (partielle pendant l'écoute).
+    pub fn transcript() -> String {
+        #[cfg(target_os = "macos")]
+        {
+            take_native_string(unsafe { syn_native_speech_text() }).unwrap_or_default()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            String::new()
+        }
+    }
+
+    pub fn running() -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            unsafe { syn_native_speech_running() == 1 }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
+    }
+
+    /// Arrête l'écoute et rend la transcription finale.
+    pub fn stop() -> String {
+        #[cfg(target_os = "macos")]
+        {
+            take_native_string(unsafe { syn_native_speech_stop() }).unwrap_or_default()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            String::new()
+        }
+    }
 }
 
 pub fn idle_seconds() -> f64 {

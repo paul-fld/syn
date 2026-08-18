@@ -10,6 +10,10 @@
   <string>Syn utilise vos rappels pour gérer les tâches que vous lui confiez.</string>
   <key>NSPhotoLibraryUsageDescription</key>
   <string>Syn utilise les photos que vous autorisez pour les retrouver et les organiser à votre demande.</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Syn utilise le micro uniquement lorsque vous lancez la dictée ou une commande vocale.</string>
+  <key>NSSpeechRecognitionUsageDescription</key>
+  <string>Syn transcrit votre voix sur l’appareil, hors ligne : l’enregistrement ne quitte jamais votre Mac.</string>
   <key>NSAppleEventsUsageDescription</key>
   <string>Syn utilise l’automatisation uniquement pour les applications et actions que vous autorisez.</string>
 </dict>

@@ -7,6 +7,8 @@
 #import <CoreGraphics/CoreGraphics.h>
 #import <CoreServices/CoreServices.h>
 #import <Vision/Vision.h>
+#import <Speech/Speech.h>
+#import <AVFoundation/AVFoundation.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -376,4 +378,143 @@ int32_t syn_native_reminder_complete(const char *raw_identifier) {
     reminder.completed = YES;
     NSError *error = nil;
     return [store saveReminder:reminder commit:YES error:&error] && error == nil ? 1 : 0;
+}
+
+// ————————————————— Dictée (Speech framework, sur l'appareil) —————————————————
+//
+// La reconnaissance est forcée EN LOCAL (`requiresOnDeviceRecognition`) : la
+// voix de l'utilisateur ne quitte jamais la machine, comme le reste de Syn.
+// Si le modèle de dictée hors-ligne n'est pas installé pour la langue, on
+// échoue franchement plutôt que de basculer en douce vers les serveurs Apple.
+
+static SFSpeechRecognizer *synSpeechRecognizer = nil;
+static SFSpeechAudioBufferRecognitionRequest *synSpeechRequest = nil;
+static SFSpeechRecognitionTask *synSpeechTask = nil;
+static AVAudioEngine *synSpeechEngine = nil;
+static NSMutableString *synSpeechText = nil;
+static NSString *synSpeechError = nil;
+static BOOL synSpeechRunning = NO;
+
+static void syn_speech_teardown(void) {
+    if (synSpeechEngine) {
+        [synSpeechEngine stop];
+        [synSpeechEngine.inputNode removeTapOnBus:0];
+        synSpeechEngine = nil;
+    }
+    [synSpeechRequest endAudio];
+    synSpeechRequest = nil;
+    [synSpeechTask cancel];
+    synSpeechTask = nil;
+    synSpeechRunning = NO;
+}
+
+/// 0 = accordée, 1 = refusée, 2 = pas encore demandée.
+int32_t syn_native_speech_authorization(void) {
+    switch ([SFSpeechRecognizer authorizationStatus]) {
+        case SFSpeechRecognizerAuthorizationStatusAuthorized: return 0;
+        case SFSpeechRecognizerAuthorizationStatusNotDetermined: return 2;
+        default: return 1;
+    }
+}
+
+/// Demande les deux autorisations nécessaires : reconnaissance et micro.
+/// Ne bloque pas : le résultat se lit ensuite via `syn_native_speech_authorization`.
+void syn_native_speech_request_authorization(void) {
+    [SFSpeechRecognizer requestAuthorization:^(SFSpeechRecognizerAuthorizationStatus status) {
+        (void)status;
+    }];
+    [AVCaptureDevice requestAccessForMediaType:AVMediaTypeAudio
+                             completionHandler:^(BOOL granted) { (void)granted; }];
+}
+
+/// Démarre la dictée. Renvoie 0 si l'écoute a commencé, sinon un code d'erreur
+/// dont le détail est lisible via `syn_native_speech_error`.
+int32_t syn_native_speech_start(const char *raw_locale) {
+    if (synSpeechRunning) return 0;
+    synSpeechError = nil;
+    synSpeechText = [NSMutableString string];
+
+    if ([SFSpeechRecognizer authorizationStatus] != SFSpeechRecognizerAuthorizationStatusAuthorized) {
+        synSpeechError = @"autorisation de dictée refusée";
+        return 1;
+    }
+
+    NSString *identifier = raw_locale ? [NSString stringWithUTF8String:raw_locale] : @"fr-FR";
+    NSLocale *locale = [NSLocale localeWithLocaleIdentifier:identifier];
+    synSpeechRecognizer = [[SFSpeechRecognizer alloc] initWithLocale:locale];
+    if (!synSpeechRecognizer || !synSpeechRecognizer.isAvailable) {
+        synSpeechError = @"reconnaissance vocale indisponible pour cette langue";
+        return 2;
+    }
+    if (!synSpeechRecognizer.supportsOnDeviceRecognition) {
+        // Invariant local-first : pas de repli silencieux vers le cloud.
+        synSpeechError = @"la dictée hors-ligne n'est pas installée pour cette langue "
+                          "(Réglages système ▸ Clavier ▸ Dictée)";
+        return 3;
+    }
+
+    synSpeechRequest = [[SFSpeechAudioBufferRecognitionRequest alloc] init];
+    synSpeechRequest.shouldReportPartialResults = YES;
+    synSpeechRequest.requiresOnDeviceRecognition = YES;
+
+    synSpeechEngine = [[AVAudioEngine alloc] init];
+    AVAudioInputNode *input = synSpeechEngine.inputNode;
+    AVAudioFormat *format = [input outputFormatForBus:0];
+    if (format.sampleRate <= 0 || format.channelCount == 0) {
+        synSpeechError = @"aucune entrée audio disponible";
+        syn_speech_teardown();
+        return 4;
+    }
+
+    synSpeechTask = [synSpeechRecognizer recognitionTaskWithRequest:synSpeechRequest
+        resultHandler:^(SFSpeechRecognitionResult *result, NSError *error) {
+            if (result) {
+                @synchronized (synSpeechText) {
+                    [synSpeechText setString:result.bestTranscription.formattedString];
+                }
+            }
+            if (error) {
+                synSpeechError = error.localizedDescription;
+            }
+        }];
+
+    [input installTapOnBus:0 bufferSize:1024 format:format
+                     block:^(AVAudioPCMBuffer *buffer, AVAudioTime *when) {
+        (void)when;
+        [synSpeechRequest appendAudioPCMBuffer:buffer];
+    }];
+
+    NSError *engineError = nil;
+    [synSpeechEngine prepare];
+    if (![synSpeechEngine startAndReturnError:&engineError]) {
+        synSpeechError = engineError.localizedDescription ?: @"micro indisponible";
+        syn_speech_teardown();
+        return 5;
+    }
+    synSpeechRunning = YES;
+    return 0;
+}
+
+/// Transcription courante (partielle pendant l'écoute). L'appelant libère.
+char *syn_native_speech_text(void) {
+    if (!synSpeechText) return NULL;
+    @synchronized (synSpeechText) {
+        return strdup(synSpeechText.UTF8String ?: "");
+    }
+}
+
+/// Dernière erreur rencontrée, ou NULL. L'appelant libère.
+char *syn_native_speech_error(void) {
+    return synSpeechError ? strdup(synSpeechError.UTF8String) : NULL;
+}
+
+int32_t syn_native_speech_running(void) { return synSpeechRunning ? 1 : 0; }
+
+/// Arrête l'écoute et rend la transcription finale. L'appelant libère.
+char *syn_native_speech_stop(void) {
+    syn_speech_teardown();
+    if (!synSpeechText) return NULL;
+    @synchronized (synSpeechText) {
+        return strdup(synSpeechText.UTF8String ?: "");
+    }
 }

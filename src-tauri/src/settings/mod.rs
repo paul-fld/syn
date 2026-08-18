@@ -21,6 +21,25 @@ pub struct VoiceProfile {
     pub extras: Vec<String>,          // consignes de style (parole de Syn uniquement)
 }
 
+impl VoiceProfile {
+    /// La forme d'adresse choisie par l'utilisateur (Personnalisation) ou
+    /// imposée par une de ses règles — `recompute_voice_profile` fusionne les
+    /// deux dans ce profil. Toute phrase que Syn adresse à l'utilisateur, y
+    /// compris celles écrites en dur côté Rust, passe par ici.
+    pub fn vouvoie(&self) -> bool {
+        self.formality == "vous"
+    }
+
+    /// Choisit entre la variante tutoyée et la variante vouvoyée.
+    pub fn pick<'a>(&self, tu: &'a str, vous: &'a str) -> &'a str {
+        if self.vouvoie() {
+            vous
+        } else {
+            tu
+        }
+    }
+}
+
 impl Default for VoiceProfile {
     fn default() -> Self {
         // Défaut aligné sur les maquettes (vouvoiement).

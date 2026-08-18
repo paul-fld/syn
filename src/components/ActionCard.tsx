@@ -110,6 +110,69 @@ export function ReorganizePlanView(props: { input: unknown; compact?: boolean })
   );
 }
 
+interface MailSend {
+  to: string;
+  subject: string;
+  body: string;
+  via: string;
+}
+
+function mailFromInput(input: unknown): MailSend | null {
+  const mail = input as Partial<MailSend> | null;
+  if (!mail || typeof mail.to !== "string" || typeof mail.body !== "string") return null;
+  return { to: mail.to, subject: mail.subject ?? "", body: mail.body, via: mail.via ?? "apple" };
+}
+
+const ACCOUNT: Record<string, { label: string; icon: string }> = {
+  google: { label: "Gmail", icon: "gmail" },
+  microsoft: { label: "Outlook", icon: "outlook" },
+  apple: { label: "Apple Mail", icon: "apple-mail" },
+};
+
+/// Le mail tel qu'il partira : destinataire, compte, objet, et le texte entier.
+///
+/// L'aperçu générique écrasait le message sur une ligne et le coupait à 500
+/// caractères — on confirmait un envoi sans pouvoir le relire. Ici le corps
+/// garde ses paragraphes.
+function MailSendView(props: { input: unknown }): JSX.Element {
+  const mail = () => mailFromInput(props.input);
+  const account = () => ACCOUNT[mail()?.via ?? "apple"] ?? ACCOUNT.apple;
+  return (
+    <Show when={mail()} keyed>
+      {(current) => (
+        <div class="mail-preview">
+          <div class="mail-preview-head">
+            <span class="mail-preview-account">
+              <Icon name={account().icon} size={15} />
+              {account().label}
+            </span>
+            <span class="mail-preview-to">à {current.to}</span>
+          </div>
+          <Show when={current.subject}>
+            <div class="mail-preview-subject">Objet : {current.subject}</div>
+          </Show>
+          <div class="mail-preview-body">
+            <For each={current.body.split("\n")}>
+              {(line) => <div classList={{ empty: !line.trim() }}>{line || " "}</div>}
+            </For>
+          </div>
+        </div>
+      )}
+    </Show>
+  );
+}
+
+/// Ce que Syn est en train de faire, dit avec les mots de l'action en cours.
+function workingLabel(tool: string): string {
+  if (tool.startsWith("mail.")) return "Syn envoie le message…";
+  if (tool.startsWith("document.")) return "Syn écrit le document…";
+  if (tool.startsWith("calendar.")) return "Syn met l’agenda à jour…";
+  if (tool.startsWith("tasks.")) return "Syn met tes tâches à jour…";
+  if (tool.startsWith("people.")) return "Syn met à jour ce qu’il sait de tes contacts…";
+  if (tool.startsWith("files.")) return "Syn applique et vérifie chaque déplacement…";
+  return "Syn exécute l’action…";
+}
+
 export function ActionCard(props: { action: PendingAction }): JSX.Element {
   const [busy, setBusy] = createSignal(false);
   const [result, setResult] = createSignal<unknown>(null);
@@ -150,22 +213,37 @@ export function ActionCard(props: { action: PendingAction }): JSX.Element {
     }
   };
 
+  const isMail = () => props.action.tool === "mail.send";
+
   return (
-    <div class="action-card fade-in">
-      <div class="risk" classList={{ untrusted: props.action.derived_from_untrusted }}>
-        <Icon name="shield" size={12} />
-        {RISK_LABEL[props.action.risk_class] ?? props.action.risk_class}
-        <Show when={props.action.derived_from_untrusted}>
-          <span>· dérivé de contenu non fiable</span>
-        </Show>
-      </div>
-      <div class="preview">{props.action.preview}</div>
+    <div class="action-card fade-in" classList={{ mail: isMail() }}>
+      {/* Un envoi de mail se relit ; il n'a pas besoin d'un bandeau qui
+          rappelle sa classe de risque. L'avertissement de provenance, lui,
+          reste affiché quoi qu'il arrive. */}
+      <Show when={!isMail() || props.action.derived_from_untrusted}>
+        <div class="risk" classList={{ untrusted: props.action.derived_from_untrusted }}>
+          <Icon name="shield" size={12} />
+          {RISK_LABEL[props.action.risk_class] ?? props.action.risk_class}
+          <Show when={props.action.derived_from_untrusted}>
+            <span>· dérivé de contenu non fiable</span>
+          </Show>
+        </div>
+      </Show>
+      <Show when={!isMail()}>
+        <div class="preview">{props.action.preview}</div>
+      </Show>
+      <Show when={isMail()}>
+        <MailSendView input={props.action.input} />
+      </Show>
       <Show when={props.action.tool === "files.apply_reorganize_plan"}>
         <ReorganizePlanView input={props.action.input} />
       </Show>
       <Show when={busy()}>
         <div class="action-working-shimmer" role="status">
-          <span>Syn applique et vérifie chaque déplacement…</span>
+          {/* Le texte d'attente décrivait un rangement de fichiers, quelle que
+              soit l'action : l'utilisateur voyait « Syn applique et vérifie
+              chaque déplacement… » en envoyant un mail. */}
+          <span>{workingLabel(props.action.tool)}</span>
         </div>
       </Show>
       <Show when={busy() && progress().length > 0}>

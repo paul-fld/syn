@@ -47,6 +47,73 @@ fn spec(
     }
 }
 
+/// Outils utiles à une intention donnée.
+///
+/// Envoyer les 23 outils du catalogue à chaque itération coûtait **18,7 s par
+/// appel** contre 1,15 s sans outil (mesuré sur llama3.1). Avec jusqu'à cinq
+/// itérations, l'utilisateur attendait une minute pour un simple bonjour.
+///
+/// Ce n'est pas qu'une optimisation : proposer `files.reorganize` pendant la
+/// rédaction d'un mail, c'est aussi inviter le modèle à se tromper d'outil.
+/// La table ci-dessous relie une INTENTION à des CAPACITÉS — elle ne dépend
+/// d'aucune formulation.
+pub fn catalog_for(kind: crate::router::intent::Kind) -> Vec<ToolSpec> {
+    use crate::router::intent::Kind;
+    let retenus: &[&str] = match kind {
+        Kind::MailSearch => &["mail.search", "memory.query"],
+        Kind::MailCompose => &[
+            "mail.search",
+            "mail.draft",
+            "mail.send",
+            "people.resolve_email",
+            "people.context",
+            "memory.query",
+        ],
+        Kind::DocumentCreate => &[
+            "document.create",
+            "document.write",
+            "document.open",
+            "files.search",
+            "memory.query",
+        ],
+        Kind::DeviceDiagnostic => &["system.diagnose", "memory.query"],
+        Kind::FileSearch => &[
+            "files.search",
+            "cloud.search",
+            "memory.query",
+            "document.open",
+        ],
+        // Intention indéterminée : on garde de quoi percevoir et agir sur les
+        // gestes courants, sans dérouler tout le catalogue.
+        Kind::Conversation => &[
+            "memory.query",
+            "files.search",
+            "cloud.search",
+            "mail.search",
+            "calendar.list",
+            "calendar.create",
+            "tasks.list",
+            "tasks.create",
+            "tasks.complete",
+            "commitments.list",
+            "people.context",
+            "system.diagnose",
+            "memory.remember",
+            "document.create",
+            "document.open",
+            "files.reorganize",
+        ],
+    };
+    catalog()
+        .into_iter()
+        .filter(|spec| retenus.contains(&spec.name.as_str()))
+        .collect()
+}
+
+/// Outils exécutables mais JAMAIS proposés au modèle : Syn les déclenche
+/// lui-même, sur un constat déterministe. `people.link_email` figurait au
+/// catalogue et le modèle l'appelait sans arguments — d'où la carte « Retenir
+/// que ? utilise l'adresse ? » vue par l'utilisateur.
 pub fn catalog() -> Vec<ToolSpec> {
     vec![
         spec(
@@ -254,6 +321,55 @@ pub fn catalog() -> Vec<ToolSpec> {
     ]
 }
 
+/// Compte rendu lisible d'une action exécutée.
+///
+/// Sans lui, l'interface affichait le résultat BRUT de l'outil dans la
+/// conversation — l'utilisateur a vu `{"status":"envoyé","to":…,"via":"google"}`
+/// s'écrire à la place d'une phrase. Un résultat d'outil est une donnée de
+/// travail, pas une réponse.
+/// `vouvoie` : la forme d'adresse choisie par l'utilisateur (Personnalisation
+/// ou règle). Un compte rendu écrit en dur qui tutoie un utilisateur qui a
+/// demandé le vouvoiement est une petite trahison de sa consigne.
+pub fn outcome_summary(tool: &str, result: &Value, vouvoie: bool) -> String {
+    let field = |key: &str| result[key].as_str().unwrap_or_default().to_string();
+    let pick = |tu: &'static str, vous: &'static str| if vouvoie { vous } else { tu };
+    // Un compte rendu déjà rédigé par l'outil prime toujours.
+    for key in ["display_report", "report"] {
+        if let Some(text) = result[key].as_str().filter(|text| !text.trim().is_empty()) {
+            return text.to_string();
+        }
+    }
+    match tool {
+        "mail.send" => {
+            let service = crate::connectors::mail::channel_label(&field("via"));
+            format!(
+                "C'est fait, le mail a été correctement envoyé. {} dans {} éléments envoyés sur {service}.",
+                pick("Tu peux le retrouver", "Vous pouvez le retrouver"),
+                pick("tes", "vos"),
+            )
+        }
+        "mail.draft" => format!("Brouillon enregistré dans {}.", field("saved_in")),
+        "people.link_email" => format!(
+            "C'est retenu : {} utilise l'adresse {}.",
+            field("name"),
+            field("email")
+        ),
+        "document.create" => format!(
+            "Document créé dans {} : {}.",
+            field("service"),
+            field("name")
+        ),
+        "document.write" => format!("Document {} : {}.", field("mode"), field("path")),
+        "calendar.create" => "Événement ajouté à ton agenda.".into(),
+        "tasks.create" => "Tâche créée.".into(),
+        "tasks.complete" => "Tâche marquée comme faite.".into(),
+        "memory.remember" => "C'est mémorisé.".into(),
+        // Jamais de JSON par défaut : mieux vaut une phrase vague qu'une
+        // structure interne affichée à l'utilisateur.
+        _ => "Action effectuée.".into(),
+    }
+}
+
 /// Aperçu lisible pour la confirmation (les confirmations d'actions graves
 /// doivent être claires, explicites, non pré-cochées — Sécurité §6).
 pub fn preview_for(tool: &str, args: &Value) -> String {
@@ -265,8 +381,13 @@ pub fn preview_for(tool: &str, args: &Value) -> String {
     };
     match tool {
         "mail.send" => format!(
-            "Envoyer un mail à {} — objet : « {} »\n{}",
+            "Envoyer un mail à {} depuis {} — objet : « {} »\n{}",
             s("to"),
+            match args["via"].as_str().unwrap_or("apple") {
+                "google" => "Gmail",
+                "microsoft" => "Outlook",
+                _ => "Apple Mail",
+            },
             s("subject"),
             s("body").chars().take(500).collect::<String>()
         ),
@@ -320,6 +441,11 @@ pub fn preview_for(tool: &str, args: &Value) -> String {
             s("content").chars().take(500).collect::<String>()
         ),
         "document.open" => format!("Ouvrir « {} »", s("target")),
+        "people.link_email" => format!(
+            "Retenir que {} utilise l'adresse {}",
+            s("name"),
+            s("email")
+        ),
         "memory.remember" => format!("Mémoriser : « {} »", s("fact")),
         _ => format!("{tool} {args}"),
     }
@@ -857,10 +983,47 @@ pub async fn execute(ctx: &ToolCtx, tool: &str, args: &Value) -> Result<ToolResu
             })
         }
 
+        "people.link_email" => {
+            let name = args["name"]
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| AppError::Invalid("nom de la personne requis".into()))?;
+            let email = args["email"]
+                .as_str()
+                .map(str::trim)
+                .filter(|value| value.contains('@') && value.contains('.'))
+                .ok_or_else(|| AppError::Invalid("adresse mail invalide".into()))?;
+            let person_id =
+                memory::find_or_create_person(&ctx.db, name, Some(&email.to_lowercase()), None)?;
+            crate::security::log_access(&ctx.db, "people", "link_email", Some(name));
+            Ok(ToolResult {
+                result: json!({
+                    "status": "retenu",
+                    "name": name,
+                    "email": email.to_lowercase(),
+                }),
+                undo: Some(json!({
+                    "kind": "unlink_person_email",
+                    "person_id": person_id,
+                    "email": email.to_lowercase(),
+                })),
+            })
+        }
+
         "people.resolve_email" => {
             let name = args["name"].as_str().unwrap_or("").trim();
             let result = people_conn::resolve_email(&ctx.db, name)?;
-            crate::security::log_access(&ctx.db, "people", "resolve_email", Some(name));
+            // Une résolution INFRUCTUEUSE est notée à part : c'est le nom que
+            // l'utilisateur cherchait sans que Syn le connaisse. Si un envoi
+            // aboutit ensuite, c'est ce nom qu'on proposera d'associer — sans
+            // avoir eu à interpréter une phrase.
+            let operation = if result["resolved"].as_bool() == Some(true) {
+                "resolve_email"
+            } else {
+                "resolve_email_unresolved"
+            };
+            crate::security::log_access(&ctx.db, "people", operation, Some(name));
             Ok(ToolResult { result, undo: None })
         }
 
@@ -1037,4 +1200,90 @@ fn photos_search(db: &Db, query: &str, from: Option<&str>, to: Option<&str>) -> 
         }
         Ok(out)
     })
+}
+
+#[cfg(test)]
+mod catalogue_tests {
+    use super::*;
+    use crate::router::intent::Kind;
+
+    /// Chaque intention doit recevoir de quoi agir, et rien de superflu : le
+    /// catalogue complet coûtait 18,7 s par itération contre 1,15 s sans outil.
+    #[test]
+    fn le_catalogue_est_restreint_a_lintention() {
+        let complet = catalog().len();
+        for (kind, indispensable) in [
+            (Kind::MailCompose, "mail.send"),
+            (Kind::DocumentCreate, "document.create"),
+            (Kind::DeviceDiagnostic, "system.diagnose"),
+            (Kind::FileSearch, "files.search"),
+            (Kind::Conversation, "memory.query"),
+        ] {
+            let restreint = catalog_for(kind);
+            assert!(
+                restreint.iter().any(|spec| spec.name == indispensable),
+                "{indispensable} manque pour {kind:?}"
+            );
+            assert!(
+                restreint.len() < complet,
+                "aucun allègement pour {kind:?}"
+            );
+        }
+        // Rédiger un mail ne doit pas exposer le rangement de fichiers : moins
+        // d'outils, c'est aussi moins d'occasions de se tromper d'outil.
+        assert!(catalog_for(Kind::MailCompose)
+            .iter()
+            .all(|spec| spec.name != "files.reorganize"));
+    }
+
+    /// Toute entrée de la table doit exister : une faute de frappe retirerait
+    /// silencieusement une capacité.
+    #[test]
+    fn aucun_outil_fantome_dans_la_table_des_intentions() {
+        let connus: Vec<String> = catalog().into_iter().map(|spec| spec.name).collect();
+        for kind in [
+            Kind::MailCompose,
+            Kind::DocumentCreate,
+            Kind::DeviceDiagnostic,
+            Kind::FileSearch,
+            Kind::Conversation,
+        ] {
+            for spec in catalog_for(kind) {
+                assert!(connus.contains(&spec.name), "{} inconnu", spec.name);
+            }
+            assert!(!catalog_for(kind).is_empty(), "{kind:?} sans aucun outil");
+        }
+    }
+}
+
+#[cfg(test)]
+mod compte_rendu_tests {
+    use super::*;
+
+    /// Cas réel du 18/08 : après confirmation, l'interface affichait
+    /// `{"status":"envoyé","to":…,"via":"google"}` dans la conversation.
+    /// Un résultat d'outil ne doit jamais atteindre l'utilisateur tel quel.
+    #[test]
+    fn un_resultat_doutil_devient_une_phrase() {
+        let envoi = json!({"status":"envoyé","subject":"Bonjour","to":"paul@exemple.fr","via":"google"});
+        let phrase = outcome_summary("mail.send", &envoi, false);
+        assert_eq!(
+            phrase,
+            "C'est fait, le mail a été correctement envoyé. Tu peux le retrouver dans tes éléments envoyés sur Gmail."
+        );
+        assert!(!phrase.contains('{'), "{phrase}");
+
+        // La forme d'adresse choisie par l'utilisateur vaut aussi pour les
+        // phrases écrites en dur.
+        let vouvoye = outcome_summary("mail.send", &envoi, true);
+        assert!(vouvoye.contains("Vous pouvez le retrouver dans vos éléments"), "{vouvoye}");
+
+        // Un outil sans rendu dédié reste muet sur sa mécanique.
+        let inconnu = outcome_summary("un.outil.futur", &json!({"status":"ok","payload":{"a":1}}), false);
+        assert_eq!(inconnu, "Action effectuée.");
+
+        // Un compte rendu déjà rédigé par l'outil prime.
+        let range = outcome_summary("files.move", &json!({"report":"3 fichiers rangés."}), false);
+        assert_eq!(range, "3 fichiers rangés.");
+    }
 }

@@ -6,6 +6,7 @@
 #[cfg(test)]
 pub mod eval;
 pub mod intent;
+pub mod mail_flow;
 pub mod prompt;
 
 use crate::actions;
@@ -26,6 +27,9 @@ pub struct Answer {
     pub text: String,
     pub sources: Vec<retrieval::Retrieved>,
     pub pending_actions: Vec<PendingRef>,
+    /// Choix proposés avec la réponse (comptes d'envoi d'un mail…). L'interface
+    /// les affiche en boutons : une question fermée ne se tape pas au clavier.
+    pub choices: Vec<mail_flow::AccountChoice>,
     pub session_id: String,
     pub degraded: bool,
 }
@@ -69,6 +73,12 @@ pub async fn handle_query_with_context(
     {
         return Ok(answer);
     }
+    // Une étape d'envoi en cours (relecture du texte, choix du compte) se
+    // résout sans le modèle : « oui » ne doit ni coûter une inférence, ni
+    // risquer d'être reformulé en autre chose.
+    if let Some(answer) = mail_flow::handle_user_reply(core, session_id, user_text, &settings)? {
+        return Ok(answer);
+    }
     let convo = memory::recent_turns(db, session_id, 12)?;
     // Copie de la parole utilisateur avant ajout éventuel du contexte d'écran :
     // elle sert à vérifier qu'un destinataire vient bien d'un canal fiable.
@@ -87,6 +97,9 @@ pub async fn handle_query_with_context(
     let understood = intent::classify(
         &core.llm,
         user_text,
+        // Le tour courant est déjà persisté : on ne le remet pas en contexte
+        // de lui-même.
+        convo.split_last().map(|(_, avant)| avant).unwrap_or(&[]),
         intent::fallback(
             user_text,
             keyword_request.clone(),
@@ -99,6 +112,7 @@ pub async fn handle_query_with_context(
             },
             is_device_diagnostic_query(user_text),
             is_mail_composition_query(user_text),
+            is_mail_search_query(user_text),
         ),
     )
     .await;
@@ -148,6 +162,23 @@ pub async fn handle_query_with_context(
     // modèle n'a pas à décider s'il doit chercher, ni à reformuler librement
     // une liste de résultats : c'est précisément ce qui produisait des README
     // et des fichiers de code hors sujet, puis une réponse générique en anglais.
+    // Retrouver un message reçu est un parcours à part : il se cherche dans les
+    // messageries, pas dans l'index de fichiers.
+    if understood.kind == intent::Kind::MailSearch {
+        let target = understood
+            .subject
+            .clone()
+            .filter(|subject| subject.trim().len() >= 3)
+            .unwrap_or_else(|| user_text.to_string());
+        return answer_mail_search(
+            core,
+            session_id,
+            &target,
+            understood.scope,
+            settings.voice.vouvoie(),
+        )
+        .await;
+    }
     if let Some((query, is_correction)) = file_request {
         return answer_file_search(
             core,
@@ -159,13 +190,26 @@ pub async fn handle_query_with_context(
         )
         .await;
     }
-    if mail_composition && mail_request_missing_content(user_text) {
-        let text = if settings.voice.formality == "vous" {
-            "Que voulez-vous dire dans ce mail ? Je n’ai encore préparé ni envoyé aucun message."
-        } else {
-            "Que veux-tu dire dans ce mail ? Je n’ai encore préparé ni envoyé aucun message."
-        }
-        .to_string();
+    let composition_en_cours = crate::connectors::mail::composition(db, session_id)?;
+    // Une seule question à la fois, et dans l'ordre : à QUI d'abord, QUOI
+    // ensuite. Tant que le destinataire n'est pas établi, le tour revient au
+    // modèle pour qu'il résolve le nom en adresse et la fasse confirmer —
+    // demander le contenu d'un mail dont on ignore le destinataire mettait
+    // l'utilisateur devant une question prématurée.
+    let destinataire_connu =
+        !composition_en_cours.recipient.is_empty() || user_text.contains('@');
+    if mail_composition
+        && destinataire_connu
+        && mail_request_missing_content(user_text)
+        && composition_en_cours.body.is_empty()
+    {
+        let text = settings
+            .voice
+            .pick(
+                "Que veux-tu dire dans ce mail ? Je n’ai encore préparé ni envoyé aucun message.",
+                "Que voulez-vous dire dans ce mail ? Je n’ai encore préparé ni envoyé aucun message.",
+            )
+            .to_string();
         memory::persist_turn(db, session_id, "assistant", &text)?;
         emit_progress(
             core,
@@ -181,9 +225,34 @@ pub async fn handle_query_with_context(
             text,
             sources: vec![],
             pending_actions: vec![],
+            choices: vec![],
             session_id: session_id.into(),
             degraded: false,
         });
+    }
+    // Le destinataire est connu et l'utilisateur a dit ce qu'il veut dire :
+    // Syn rédige LUI-MÊME et enchaîne sur la relecture. Confier cette étape au
+    // modèle par un appel d'outil ne marchait pas — il écrivait le mail dans sa
+    // réponse, puis prétendait l'avoir envoyé sans qu'aucun outil ait tourné.
+    if mail_composition && destinataire_connu {
+        // Un texte en attente de relecture + une réponse qui n'est pas un
+        // accord (`handle_user_reply` aurait répondu) = une correction demandée.
+        let correction_demandee = composition_en_cours.awaits_approval();
+        let premiere_redaction = composition_en_cours.body.is_empty()
+            && mail_content_expressed(user_text, &understood);
+        if correction_demandee || premiere_redaction {
+            if let Some(answer) = mail_flow::compose(
+                core,
+                session_id,
+                user_text,
+                &trusted_user_history,
+                &settings,
+            )
+            .await?
+            {
+                return Ok(answer);
+            }
+        }
     }
     // 2. RÉCUPÉRER — retrieval hybride borné et sourcé.
     let mut ctx = if device_only || mail_composition {
@@ -264,7 +333,9 @@ pub async fn handle_query_with_context(
         }
     }
 
-    let catalog = crate::tools::catalog();
+    // Le catalogue est restreint à l'intention comprise : c'est le principal
+    // levier de réactivité de la boucle agentique.
+    let catalog = crate::tools::catalog_for(understood.kind);
     let tool_ctx = crate::tools::ToolCtx {
         db: db.clone(),
         llm: core.llm.clone(),
@@ -314,7 +385,11 @@ pub async fn handle_query_with_context(
                 &catalog,
                 GenParams {
                     temperature: 0.3,
-                    max_tokens: Some(1200),
+                    // Le modèle écrit à une vingtaine de jetons par seconde :
+                    // 1200 jetons autorisaient une minute d'écriture pour UNE
+                    // réponse. Un assistant qui répond en trois phrases n'en a
+                    // jamais besoin, et le plafond protège contre les tirades.
+                    max_tokens: Some(500),
                     json: false,
                 },
                 sink,
@@ -332,7 +407,29 @@ pub async fn handle_query_with_context(
             }
         };
 
+        // Un appel d'outil écrit en texte reste un appel d'outil : l'exécuter
+        // plutôt que d'afficher son JSON à l'utilisateur.
+        let mut resp = resp;
         if resp.tool_calls.is_empty() {
+            if let Some(recovered) = crate::llm::tool_call_from_text(&resp.content) {
+                resp.tool_calls.push(recovered);
+                resp.content.clear();
+            }
+        }
+        if resp.tool_calls.is_empty() {
+            // Reste-t-il du JSON non récupérable ? Ne jamais le montrer : on
+            // relance une fois en demandant une phrase, puis on renonce
+            // proprement.
+            if crate::llm::looks_structured(&resp.content) {
+                messages.push(ChatMessage {
+                    role: "user".into(),
+                    content: "Réponds à l'utilisateur en une phrase, sans JSON ni appel d'outil."
+                        .into(),
+                    tool_calls: None,
+                    tool_name: None,
+                });
+                continue;
+            }
             final_text = resp.content;
             break;
         }
@@ -364,17 +461,93 @@ pub async fn handle_query_with_context(
             let untrusted =
                 provenance::args_derived_from_untrusted(&args_text, user_text, &all_untrusted);
 
+            // Un envoi se construit sur plusieurs tours. On accumule les
+            // arguments STRUCTURÉS déjà fournis et on complète l'appel courant :
+            // le modèle n'a plus besoin de se souvenir de tout, et l'utilisateur
+            // n'a plus à répéter ce qu'il a déjà dit.
+            let mut verified_arguments = call.arguments.clone();
+            if matches!(call.name.as_str(), "mail.send" | "mail.draft") {
+                let known =
+                    crate::connectors::mail::remember_composition(db, session_id, &call.arguments)?;
+                for (key, value) in [
+                    ("to", &known.recipient),
+                    ("subject", &known.subject),
+                    ("body", &known.body),
+                    ("via", &known.via),
+                ] {
+                    if verified_arguments[key].as_str().unwrap_or("").trim().is_empty()
+                        && !value.is_empty()
+                    {
+                        verified_arguments[key] = json!(value);
+                    }
+                }
+            }
+            let composition_state =
+                crate::connectors::mail::composition(db, session_id).unwrap_or_default();
             let mail_preflight = if call.name == "mail.send" {
-                mail_send_preflight(db, &call.arguments, user_text, &trusted_user_history)
+                let to = verified_arguments["to"].as_str().unwrap_or("").trim();
+                mail_send_preflight(
+                    db,
+                    &verified_arguments,
+                    user_text,
+                    &trusted_user_history,
+                    !composition_state.body.is_empty(),
+                    // L'adresse sortie du carnet d'adresses de l'utilisateur est
+                    // légitime par construction : c'est le parcours normal, et
+                    // le contrôle la refusait.
+                    composition_state.recipient_is_resolved()
+                        && composition_state.recipient.eq_ignore_ascii_case(to),
+                )
             } else {
                 None
             };
-            let mut verified_arguments = call.arguments.clone();
+            // Le modèle rédige parfois le mail avec mail.draft au lieu de
+            // mail.send, puis demande en prose « je l'envoie ou tu le modifies ? ».
+            // L'utilisateur n'a alors jamais vu son texte. Un brouillon ne se
+            // crée que s'il l'a demandé : sinon c'est une rédaction, et la suite
+            // appartient au parcours.
+            if call.name == "mail.draft"
+                && understood.kind == intent::Kind::MailCompose
+                && !asked_for_draft(user_text)
+                && !asked_for_draft(&trusted_user_history)
+            {
+                if let Some(answer) =
+                    mail_flow::advance(core, session_id, &settings, &trusted_user_history)?
+                {
+                    return Ok(answer);
+                }
+            }
+            // Le modèle a fait sa part (destinataire, objet, corps). La suite —
+            // relecture, compte d'envoi, carte de confirmation — est un parcours
+            // fixe : Syn le mène lui-même, dans l'ordre des maquettes.
+            if call.name == "mail.send"
+                && matches!(
+                    mail_preflight
+                        .as_ref()
+                        .map(|reason| reason["status"].as_str().unwrap_or_default()),
+                    None | Some("compte_a_choisir")
+                )
+            {
+                if let Some(answer) =
+                    mail_flow::advance(core, session_id, &settings, &trusted_user_history)?
+                {
+                    return Ok(answer);
+                }
+            }
             if call.name == "mail.send" && mail_preflight.is_none() {
                 // Marqueur interne ajouté uniquement après les contrôles ci-dessus.
                 // Les anciennes actions en attente (créées avant ce correctif)
                 // ne peuvent ainsi pas envoyer une adresse inventée au clic.
                 verified_arguments["_syn_preflight_v1"] = json!(true);
+                // Un seul compte disponible : inutile de demander, mais le
+                // choix devient explicite dans l'aperçu de confirmation.
+                if verified_arguments["via"].as_str().unwrap_or("").trim().is_empty() {
+                    if let Some((id, _)) =
+                        crate::connectors::mail::available_channels(db).first().copied()
+                    {
+                        verified_arguments["via"] = json!(id);
+                    }
+                }
             }
 
             let observation = if let Some(reason) = mail_preflight {
@@ -411,8 +584,12 @@ pub async fn handle_query_with_context(
                     preview,
                     risk_class: risk.as_str().into(),
                 });
-                json!({"status": "en_attente_de_confirmation", "action_id": action_id,
-                       "note": "L'utilisateur doit confirmer cette action avant exécution."})
+                // L'identifiant reste interne : donné au modèle, il finissait
+                // recopié dans la réponse (« appelez files.cancel avec
+                // l'action_id … »). L'interface gère la confirmation, le modèle
+                // n'a qu'à annoncer l'attente.
+                json!({"status": "en_attente_de_confirmation",
+                       "note": "L'utilisateur doit confirmer cette action dans l'interface. Dis-le-lui en une phrase, sans identifiant ni nom d'outil."})
             } else {
                 match crate::tools::execute(&tool_ctx, &call.name, &verified_arguments).await {
                     Ok(outcome) => {
@@ -435,6 +612,58 @@ pub async fn handle_query_with_context(
                             )?;
                         }
                         let mut result = outcome.result;
+                        if call.name == "mail.send" {
+                            crate::connectors::mail::clear_composition(db, session_id)?;
+                        }
+                        // L'adresse trouvée dans le carnet entre dans l'état
+                        // d'envoi par une porte de confiance, distincte des
+                        // arguments écrits par le modèle.
+                        if call.name == "people.resolve_email"
+                            && understood.kind == intent::Kind::MailCompose
+                            && result["resolved"].as_bool() == Some(true)
+                        {
+                            if let Some(email) = result["matches"][0]["email"].as_str() {
+                                crate::connectors::mail::remember_resolved_recipient(
+                                    db, session_id, email,
+                                )?;
+                            }
+                        }
+                        // Un envoi vers une adresse inconnue est une occasion
+                        // d'apprendre — mais jamais en silence. Syn propose,
+                        // l'utilisateur tranche : une mémoire qui se remplit
+                        // toute seule finit par contenir surtout du bruit.
+                        if matches!(call.name.as_str(), "mail.send" | "mail.draft") {
+                            if let Some((name, email)) =
+                                learnable_contact(db, &verified_arguments)?
+                            {
+                                let link_args = json!({"name": name, "email": email});
+                                let preview = crate::tools::preview_for("people.link_email", &link_args);
+                                let action_id = actions::queue_pending(
+                                    db,
+                                    "people.link_email",
+                                    &link_args,
+                                    actions::classify("people.link_email", &link_args),
+                                    &preview,
+                                    false,
+                                    Some(session_id),
+                                )?;
+                                core.bus.emit(BusEvent::ActionAwaitingConfirmation {
+                                    action_id: action_id.clone(),
+                                    tool: "people.link_email".into(),
+                                    preview: preview.clone(),
+                                    risk_class: actions::RiskClass::ReversibleLocal.as_str().into(),
+                                });
+                                pending.push(PendingRef {
+                                    action_id,
+                                    tool: "people.link_email".into(),
+                                    preview,
+                                    risk_class: actions::RiskClass::ReversibleLocal.as_str().into(),
+                                });
+                                result["memoire_proposee"] = json!({
+                                    "note": "Une association nom/adresse est proposée à l'utilisateur. Mentionne-la en une phrase, sans la présenter comme acquise."
+                                });
+                            }
+                        }
                         // Un plan de rangement est toujours suivi d'une carte de validation
                         // déterministe. Le modèle ne doit pas inventer ni reperdre son plan_id.
                         if call.name == "files.reorganize"
@@ -521,6 +750,52 @@ pub async fn handle_query_with_context(
         }
     }
 
+    // Le modèle annonce parfois l'action au lieu de la faire : « Je vais
+    // envoyer ce mail… », puis plus rien, et l'utilisateur reste devant une
+    // promesse. Quand tout est connu, la suite du parcours ne dépend plus de sa
+    // bonne volonté — Syn la mène lui-même. Rien n'est envoyé pour autant :
+    // l'utilisateur garde le dernier mot.
+    let envoi_deja_en_attente = actions::list_pending(db)?.iter().any(|action| {
+        action.tool == "mail.send" && action.session_id.as_deref() == Some(session_id)
+    });
+    if understood.kind == intent::Kind::MailCompose
+        && !pending.iter().any(|action| action.tool == "mail.send")
+        // Une carte attend déjà : l'utilisateur a la main, on ne recouvre pas
+        // la réponse du modèle par un rappel qu'il a sous les yeux.
+        && !envoi_deja_en_attente
+    {
+        if let Some(answer) = mail_flow::advance(core, session_id, &settings, &trusted_user_history)?
+        {
+            return Ok(answer);
+        }
+    }
+
+    // Un envoi affirmé sans envoi réel est le pire des défauts : l'utilisateur
+    // croit son message parti. Le modèle l'a fait — « Le mail a été envoyé à
+    // … » alors qu'aucun outil n'avait tourné. Une consigne ne suffit pas :
+    // on confronte l'affirmation au journal des actions.
+    if claims_a_sent_mail(&final_text) && !mail_really_sent(db, session_id)? {
+        // On ne se contente pas de démentir : on reprend le parcours là où il en
+        // est réellement — relecture, choix du compte, ou carte de confirmation.
+        let reprise = match mail_flow::advance(core, session_id, &settings, &trusted_user_history)? {
+            Some(answer) => Some(answer),
+            None => {
+                mail_flow::compose(core, session_id, user_text, &trusted_user_history, &settings)
+                    .await?
+            }
+        };
+        if let Some(answer) = reprise {
+            return Ok(answer);
+        }
+        final_text = settings
+            .voice
+            .pick(
+                "Je n'ai encore rien envoyé. Dis-moi ce que le message doit dire et je le prépare.",
+                "Je n'ai encore rien envoyé. Dites-moi ce que le message doit dire et je le prépare.",
+            )
+            .to_string();
+    }
+
     if final_text.trim().is_empty() {
         final_text = if pending.is_empty() {
             "Je n'ai pas réussi à formuler de réponse. Réessaie en reformulant.".into()
@@ -532,6 +807,7 @@ pub async fn handle_query_with_context(
     // La recherche peut examiner plusieurs fragments sans que la réponse les utilise.
     // On ne surface que les sources effectivement citées et on renumérote les
     // citations pour garder les pastilles et le texte parfaitement alignés.
+    final_text = strip_internal_noise(&final_text);
     let (normalized_text, cited_sources) = cited_sources(&final_text, &ctx.sources);
     final_text = normalized_text;
 
@@ -576,6 +852,7 @@ pub async fn handle_query_with_context(
         text: final_text,
         sources: cited_sources,
         pending_actions: pending,
+        choices: vec![],
         session_id: session_id.to_string(),
         degraded,
     })
@@ -1085,6 +1362,7 @@ async fn answer_file_search(
         text,
         sources: results,
         pending_actions,
+        choices: vec![],
         session_id: session_id.into(),
         degraded: false,
     })
@@ -1301,8 +1579,216 @@ async fn answer_federated_file_search(
         text,
         sources: results,
         pending_actions: Vec::new(),
+        choices: vec![],
         session_id: session_id.into(),
         degraded: false,
+    })
+}
+
+/// Retrouver un message REÇU, dans les messageries connectées.
+///
+/// Rien de tout cela ne passait auparavant : « retrouve le mail de Liverpool »
+/// était compris comme une recherche de DOCUMENT, et l'index de fichiers
+/// répondait par des images dont le nom contenait « mail » ou « maillot ». La
+/// capacité existait pourtant — Gmail et Graph savent chercher côté serveur, et
+/// renvoient un lien direct vers le message.
+///
+/// On n'indexe pas des milliers de mails pour cela : la recherche est faite
+/// PAR le fournisseur, à la demande. Seuls les résultats affichés sont retenus,
+/// pour que leur lien soit ouvrable et qu'ils restent consultables hors ligne.
+async fn answer_mail_search(
+    core: &Core,
+    session_id: &str,
+    query: &str,
+    scope: intent::Scope,
+    formal: bool,
+) -> Result<Answer> {
+    let comptes = crate::connectors::mail::available_channels(&core.db);
+    let boites: Vec<&'static str> = comptes
+        .iter()
+        .filter(|(id, _)| *id != "apple")
+        .map(|(id, _)| *id)
+        .collect();
+    let apple_indexe = crate::connectors::mail::indexed_count(&core.db).unwrap_or(0) > 0;
+
+    // Franchise d'abord : sans messagerie connectée, on le dit, on ne cherche
+    // pas pour la forme.
+    if boites.is_empty() && !apple_indexe {
+        let text = if formal {
+            "Désolé, pour l'instant je ne peux pas chercher dans vos messageries : aucun compte mail n'est connecté. Vous pouvez en ajouter un dans Connecteurs. Si vous avez besoin de moi pour autre chose, n'hésitez pas !"
+        } else {
+            "Désolé, pour l'instant je ne peux pas chercher dans tes messageries : aucun compte mail n'est connecté. Tu peux en ajouter un dans Connecteurs. Si tu as besoin de moi pour autre chose, n'hésite pas !"
+        }
+        .to_string();
+        memory::persist_turn(&core.db, session_id, "assistant", &text)?;
+        return Ok(Answer {
+            text,
+            sources: vec![],
+            pending_actions: vec![],
+            choices: vec![],
+            session_id: session_id.into(),
+            degraded: false,
+        });
+    }
+
+    emit_progress(
+        core,
+        session_id,
+        "retrieve",
+        "Recherche dans les messageries",
+        Some(mail_boxes_label(&boites, apple_indexe)),
+        3,
+        5,
+        "running",
+    );
+
+    // Ce qui est déjà indexé localement (Apple Mail, mails déjà vus).
+    let mut results = retrieval::search_lexical_source(&core.db, query, 8, "mail").await?;
+
+    // Puis chez les fournisseurs, en direct. Un compte lent ne fait pas échouer
+    // la réponse : les autres résultats restent affichables.
+    // Une messagerie nommée est une PRÉFÉRENCE, jamais une exclusion : la
+    // compréhension d'intention devine parfois « google » sur un simple mot, et
+    // un message rangé dans l'autre boîte deviendrait introuvable.
+    let mut demandes: Vec<&'static str> = boites.clone();
+    match scope {
+        intent::Scope::Google => demandes.sort_by_key(|p| *p != "google"),
+        intent::Scope::Microsoft => demandes.sort_by_key(|p| *p != "microsoft"),
+        _ => {}
+    }
+    for provider in demandes.iter() {
+        let live = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            crate::connectors::external::live_search_provider("mail", query, provider),
+        )
+        .await;
+        let Ok(Ok(values)) = live else { continue };
+        for value in values {
+            let Some(source_ref) = value["source_ref"].as_str() else {
+                continue;
+            };
+            remember_live_cloud(core, &value).await;
+            if results.iter().any(|result| result.source_ref == source_ref) {
+                continue;
+            }
+            if let Some(result) = retrieved_from_live_mail(&value) {
+                results.push(result);
+            }
+        }
+    }
+    results.truncate(8);
+
+    let text = if results.is_empty() {
+        let ou = mail_boxes_label(&boites, apple_indexe);
+        if formal {
+            format!("Je n'ai trouvé aucun message correspondant dans {ou}. Précisez-moi un expéditeur, un mot de l'objet ou une période, et je relance la recherche.")
+        } else {
+            format!("Je n'ai trouvé aucun message correspondant dans {ou}. Donne-moi un expéditeur, un mot de l'objet ou une période, et je relance la recherche.")
+        }
+    } else {
+        let mut body = format!(
+            "J'ai trouvé {} message{} dans {} :",
+            results.len(),
+            if results.len() > 1 { "s" } else { "" },
+            mail_boxes_label(&boites, apple_indexe)
+        );
+        for (index, result) in results.iter().enumerate() {
+            body.push_str(&format!(
+                "\n{}. **{}** — {}",
+                index + 1,
+                result.title,
+                mail_origin(result)
+            ));
+        }
+        body.push_str(if formal {
+            "\n\nCliquez sur l'objet pour ouvrir le message."
+        } else {
+            "\n\nClique sur l'objet pour ouvrir le message."
+        });
+        body
+    };
+    memory::persist_turn(&core.db, session_id, "assistant", &text)?;
+    emit_progress(
+        core,
+        session_id,
+        "complete",
+        if results.is_empty() {
+            "Recherche de messages terminée sans résultat"
+        } else {
+            "Recherche de messages terminée"
+        },
+        Some(mail_boxes_label(&boites, apple_indexe)),
+        5,
+        5,
+        "done",
+    );
+    Ok(Answer {
+        text,
+        sources: results,
+        pending_actions: vec![],
+        choices: vec![],
+        session_id: session_id.into(),
+        degraded: false,
+    })
+}
+
+/// Où Syn a cherché, dit avec les noms que l'utilisateur connaît.
+fn mail_boxes_label(boites: &[&'static str], apple: bool) -> String {
+    let mut noms: Vec<&str> = Vec::new();
+    if apple {
+        noms.push("Apple Mail");
+    }
+    for boite in boites {
+        noms.push(crate::connectors::mail::channel_label(boite));
+    }
+    match noms.len() {
+        0 => "vos messageries".to_string(),
+        1 => noms[0].to_string(),
+        _ => {
+            let dernier = noms.pop().unwrap();
+            format!("{} et {dernier}", noms.join(", "))
+        }
+    }
+}
+
+/// L'expéditeur et la boîte d'un message, pour que la liste se lise sans avoir
+/// à ouvrir quoi que ce soit.
+fn mail_origin(result: &retrieval::Retrieved) -> String {
+    let boite = if result.source_ref.starts_with("microsoft:") {
+        "Outlook"
+    } else if result.source_ref.starts_with("google:") {
+        "Gmail"
+    } else {
+        "Apple Mail"
+    };
+    let expediteur = result
+        .snippet
+        .lines()
+        .find_map(|line| line.strip_prefix("De : "))
+        .map(str::trim)
+        .filter(|from| !from.is_empty());
+    match expediteur {
+        Some(from) => format!("{from} · {boite}"),
+        None => boite.to_string(),
+    }
+}
+
+fn retrieved_from_live_mail(value: &serde_json::Value) -> Option<retrieval::Retrieved> {
+    let source_ref = value["source_ref"].as_str()?;
+    let expediteur = value["from"].as_str().unwrap_or_default().trim();
+    let snippet = value["snippet"].as_str().unwrap_or_default();
+    Some(retrieval::Retrieved {
+        item_id: value["item_id"].as_str().unwrap_or(source_ref).to_string(),
+        source: "mail".into(),
+        source_ref: source_ref.to_string(),
+        title: value["title"].as_str().unwrap_or("Message").to_string(),
+        path: value["path"].as_str().map(str::to_string),
+        snippet: if expediteur.is_empty() {
+            snippet.to_string()
+        } else {
+            format!("De : {expediteur}\n{snippet}")
+        },
+        score: value["score"].as_f64().unwrap_or(5.0) as f32,
     })
 }
 
@@ -1454,6 +1940,7 @@ async fn answer_cloud_file_search(
         text,
         sources: results,
         pending_actions: Vec::new(),
+        choices: vec![],
         session_id: session_id.into(),
         degraded: false,
     })
@@ -1679,6 +2166,13 @@ fn is_explicit_chat_confirmation(text: &str) -> bool {
     {
         return false;
     }
+    // Une confirmation est une réponse BRÈVE. « Tu peux envoyer un courriel à
+    // Julie pour lui dire que je serai en retard » commence comme un accord et
+    // se termine en demande NOUVELLE : la prendre pour une confirmation ferait
+    // partir le mail précédent à la place.
+    if words.len() > 10 {
+        return false;
+    }
     [
         "je confirme",
         "je valide",
@@ -1767,7 +2261,21 @@ async fn confirm_pending_mail_from_chat(
                 status: "executed".into(),
             });
             let to = outcome.result["to"].as_str().unwrap_or("son destinataire");
-            let text = format!("C’est envoyé à {to}.");
+            // L'envoi est fait : l'état de composition ne doit pas survivre,
+            // sinon le mail suivant hérite du destinataire de celui-ci.
+            crate::connectors::mail::clear_composition(&core.db, session_id)?;
+            mail_flow::note(
+                core,
+                session_id,
+                settings
+                    .voice
+                    .pick("Tu as confirmé l'envoi", "Vous avez confirmé l'envoi"),
+            )?;
+            let text = crate::tools::outcome_summary(
+                "mail.send",
+                &outcome.result,
+                settings.voice.vouvoie(),
+            );
             memory::persist_turn(&core.db, session_id, "assistant", &text)?;
             emit_progress(
                 core,
@@ -1783,6 +2291,7 @@ async fn confirm_pending_mail_from_chat(
                 text,
                 sources: vec![],
                 pending_actions: vec![],
+                choices: vec![],
                 session_id: session_id.into(),
                 degraded: false,
             }))
@@ -1804,6 +2313,88 @@ async fn confirm_pending_mail_from_chat(
     }
 }
 
+/// L'utilisateur a-t-il dit de quoi le mail doit parler ?
+///
+/// Trois signaux, du plus sûr au plus souple : une demande d'envoi qui porte
+/// déjà son contenu, une suite de conversation qui le donne (« dis-lui que… »),
+/// ou un sujet extrait par la compréhension d'intention. Une simple
+/// confirmation d'adresse, elle, ne dit rien du message — la prendre pour un
+/// contenu ferait rédiger un mail sur « c'est correct ».
+fn mail_content_expressed(user_text: &str, understood: &intent::Intent) -> bool {
+    if is_explicit_chat_confirmation(user_text) || mail_flow::is_draft_approval(user_text) {
+        return false;
+    }
+    if is_mail_composition_query(user_text) && !mail_request_missing_content(user_text) {
+        return true;
+    }
+    if is_mail_content_followup(user_text) {
+        return true;
+    }
+    understood
+        .subject
+        .as_deref()
+        .is_some_and(|subject| subject.split_whitespace().count() >= 2)
+}
+
+/// La réponse affirme-t-elle qu'un mail est parti ?
+fn claims_a_sent_mail(text: &str) -> bool {
+    let text = crate::db::fold(text);
+    [
+        "mail a ete envoye",
+        "email a ete envoye",
+        "message a ete envoye",
+        "mail est envoye",
+        "mail envoye a",
+        "j'ai envoye le mail",
+        "j'ai envoye ton mail",
+        "j'ai bien envoye",
+        "je l'ai envoye",
+        "c'est envoye",
+    ]
+    .iter()
+    .any(|claim| text.contains(claim))
+}
+
+/// Un envoi RÉEL, tracé dans le journal des actions de cette conversation.
+/// C'est le journal qui fait foi, jamais la phrase du modèle.
+fn mail_really_sent(db: &crate::db::Db, session_id: &str) -> Result<bool> {
+    Ok(actions::list_actions(db, Some("executed"), 30)?
+        .iter()
+        .any(|action| {
+            action.tool == "mail.send"
+                && action.session_id.as_deref() == Some(session_id)
+                && action.created_at >= crate::db::now() - 3600
+        }))
+}
+
+/// L'utilisateur a-t-il demandé un BROUILLON, et non un envoi ? Sans cette
+/// distinction, « rédige un mail… » produisait un brouillon silencieux dans
+/// Mail au lieu du texte à relire.
+fn asked_for_draft(text: &str) -> bool {
+    let text = crate::db::fold(text);
+    ["brouillon", "draft", "sans l'envoyer", "ne l'envoie pas", "ne pas l'envoyer"]
+        .iter()
+        .any(|term| text.contains(term))
+}
+
+/// Secours déterministe : chercher un message REÇU, quand le modèle local est
+/// arrêté. Le vrai aiguillage est la compréhension d'intention — ceci ne sert
+/// qu'à ne pas rester muet hors ligne.
+fn is_mail_search_query(text: &str) -> bool {
+    let folded = crate::db::fold(text);
+    let mentions_mail = ["mail", "email", "courriel", "message"]
+        .iter()
+        .any(|term| folded.contains(term));
+    let retrouve = [
+        "retrouve", "retrouver", "cherche", "chercher", "recherche", "ou est", "j'ai recu",
+        "recu de", "montre", "affiche",
+    ]
+    .iter()
+    .any(|term| folded.contains(term));
+    // « envoie un mail » et « réponds à ce mail » composent : ils ne cherchent pas.
+    mentions_mail && retrouve && !is_mail_composition_query(text)
+}
+
 fn is_mail_composition_query(text: &str) -> bool {
     let text = crate::db::fold(text);
     let mentions_mail =
@@ -1821,12 +2412,26 @@ fn mail_send_preflight(
     args: &Value,
     current_user_text: &str,
     trusted_user_history: &str,
+    // `content_already_given` : un contenu a-t-il DÉJÀ été donné par
+    // l'utilisateur au fil de la conversation ? Si oui, la garde contre un
+    // contenu inventé par le modèle n'a plus lieu de s'appliquer — elle ferait
+    // redemander une information acquise, l'amnésie constatée le 17/08.
+    content_already_given: bool,
+    // `recipient_from_address_book` : l'adresse a-t-elle été trouvée par Syn
+    // dans le carnet de l'utilisateur (people.resolve_email) ? Elle est alors
+    // légitime par construction. Sans ce chemin, le parcours des maquettes —
+    // Syn trouve l'adresse, l'utilisateur la confirme — était refusé par le
+    // contrôle anti-adresse-inventée, et l'envoi restait bloqué en silence.
+    recipient_from_address_book: bool,
 ) -> Option<Value> {
     let to = args["to"].as_str().unwrap_or("").trim();
     let subject = args["subject"].as_str().unwrap_or("").trim();
     let body = args["body"].as_str().unwrap_or("").trim();
 
-    if mail_request_missing_content(current_user_text) || subject.is_empty() || body.is_empty() {
+    if subject.is_empty()
+        || body.is_empty()
+        || (!content_already_given && mail_request_missing_content(current_user_text))
+    {
         return Some(json!({
             "status": "incomplet",
             "missing": "message",
@@ -1839,22 +2444,60 @@ fn mail_send_preflight(
             "note": "Le destinataire n'est pas une adresse valide. Appelle people.resolve_email avec le nom donné, ou demande l'adresse."
         }));
     }
+    // Ordre volontaire : la LÉGITIMITÉ du destinataire se vérifie avant le
+    // confort du choix de compte. Un compte manquant ne doit jamais masquer une
+    // adresse inventée — l'inverse laisserait passer le contrôle de sécurité
+    // dès qu'aucun connecteur n'est configuré.
     let history_folded = crate::db::fold(trusted_user_history);
-    if history_folded.contains(&crate::db::fold(to)) {
-        return None;
-    }
-    match crate::connectors::people::email_is_known_for_mentioned_person(
-        db,
-        to,
-        trusted_user_history,
-    ) {
-        Ok(true) => None,
-        _ => Some(json!({
+    let recipient_is_legitimate = recipient_from_address_book
+        || history_folded.contains(&crate::db::fold(to))
+        || matches!(
+            crate::connectors::people::email_is_known_for_mentioned_person(
+                db,
+                to,
+                trusted_user_history,
+            ),
+            Ok(true)
+        );
+    if !recipient_is_legitimate {
+        return Some(json!({
             "status": "destinataire_non_resolu",
             "rejected_address": to,
             "note": "Cette adresse n'a été ni donnée par l'utilisateur ni résolue depuis le contact nommé. Ne l'invente pas : appelle people.resolve_email ou demande l'adresse."
-        })),
+        }));
     }
+
+    // Par quel compte ? Le défaut « Apple Mail » était choisi sans vérifier
+    // qu'il fonctionne : sur une application non signée, l'envoi échouait alors
+    // que Gmail et Outlook étaient connectés. Le choix de l'expéditeur revient à
+    // l'utilisateur dès qu'il en a plusieurs.
+    let channels = crate::connectors::mail::available_channels(db);
+    let requested = args["via"].as_str().unwrap_or("").trim();
+    if channels.is_empty() {
+        return Some(json!({
+            "status": "aucun_compte_denvoi",
+            "note": "Aucun compte ne peut envoyer de mail. Propose d'enregistrer un brouillon avec mail.draft, et invite l'utilisateur à connecter Google ou Microsoft dans Connecteurs."
+        }));
+    }
+    if !requested.is_empty() && !channels.iter().any(|(id, _)| *id == requested) {
+        return Some(json!({
+            "status": "compte_indisponible",
+            "demande": requested,
+            "comptes_disponibles": channels.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            "note": "Ce compte n'est pas disponible. Demande à l'utilisateur lequel utiliser parmi les comptes disponibles."
+        }));
+    }
+    if requested.is_empty() && channels.len() > 1 {
+        return Some(json!({
+            "status": "compte_a_choisir",
+            "comptes_disponibles": channels
+                .iter()
+                .map(|(id, label)| json!({"via": id, "libelle": label}))
+                .collect::<Vec<_>>(),
+            "note": "Plusieurs comptes peuvent envoyer ce mail. Demande à l'utilisateur lequel utiliser, puis rappelle mail.send avec le champ `via` renseigné. N'envoie rien avant sa réponse."
+        }));
+    }
+    None
 }
 
 fn mail_request_missing_content(text: &str) -> bool {
@@ -1884,7 +2527,151 @@ fn mail_request_missing_content(text: &str) -> bool {
         || text
             .split_once(',')
             .is_some_and(|(_, tail)| tail.split_whitespace().count() >= 2);
-    !explicit_content && !quoted_or_separated
+    !explicit_content && !quoted_or_separated && !states_an_intent(&text)
+}
+
+/// « Un mail très concis pour lui souhaiter un bon anniversaire » ne contient
+/// pas le texte du mail, mais dit largement de quoi il parle : Syn a de quoi
+/// rédiger une proposition. Redemander « que veux-tu dire ? » à ce moment-là
+/// était une boucle — l'utilisateur venait de répondre.
+fn states_an_intent(folded: &str) -> bool {
+    for lead in [" pour ", " afin de ", " au sujet de ", " a propos de ", " concernant "] {
+        let Some((_, tail)) = folded.split_once(lead) else {
+            continue;
+        };
+        let words: Vec<&str> = tail.split_whitespace().collect();
+        // « pour moi », « pour ce soir » : une précision de circonstance, pas
+        // une intention de message.
+        let first_is_pronoun = words.first().is_some_and(|word| {
+            [
+                "moi", "toi", "nous", "vous", "eux", "ca", "cela", "ce", "cet", "cette", "demain",
+                "aujourd'hui", "hier",
+            ]
+            .contains(word)
+        });
+        if !first_is_pronoun && words.len() >= 2 {
+            return true;
+        }
+    }
+    false
+}
+
+
+
+/// Un contact à retenir après un envoi : l'adresse utilisée n'est encore liée à
+/// personne, et un nom a été cherché sans succès dans les dernières minutes.
+///
+/// Aucune phrase n'est interprétée : le nom vient de l'argument STRUCTURÉ passé
+/// à `people.resolve_email`, l'adresse de celui de `mail.send`. C'est ce qui
+/// rend le déclenchement fiable plutôt que devinatoire.
+fn learnable_contact(db: &crate::db::Db, args: &Value) -> Result<Option<(String, String)>> {
+    let email = args["to"].as_str().unwrap_or("").trim().to_lowercase();
+    if !(email.contains('@') && email.contains('.')) {
+        return Ok(None);
+    }
+    // Déjà connue : il n'y a rien à apprendre.
+    let known: bool = db.read(|c| {
+        Ok(c.query_row(
+            "SELECT 1 FROM people
+             WHERE syn_fold(COALESCE(comm_channels,'')) LIKE '%'||?1||'%' LIMIT 1",
+            rusqlite::params![email],
+            |_| Ok(true),
+        )
+        .unwrap_or(false))
+    })?;
+    if known {
+        return Ok(None);
+    }
+    // Le nom que l'utilisateur cherchait, s'il y en a eu un récemment.
+    let name: Option<String> = db.read(|c| {
+        Ok(c.query_row(
+            "SELECT item_ref FROM access_log
+             WHERE connector='people' AND operation='resolve_email_unresolved'
+               AND item_ref IS NOT NULL AND created_at >= ?1
+             ORDER BY created_at DESC LIMIT 1",
+            rusqlite::params![crate::db::now() - 1800],
+            |row| row.get::<_, String>(0),
+        )
+        .ok())
+    })?;
+    // Sans nom, on ne propose rien : une fiche « paulpro » créée à partir d'une
+    // adresse serait un déchet de plus dans la mémoire.
+    Ok(name
+        .map(|name| name.trim().to_string())
+        .filter(|name| name.len() >= 2)
+        .map(|name| (name, email)))
+}
+
+/// Retire d'une réponse ce qui appartient à la mécanique interne : blocs JSON
+/// recopiés d'un résultat d'outil, et identifiants techniques.
+///
+/// La consigne au modèle l'interdit déjà, mais une consigne n'est pas une
+/// garantie : l'utilisateur a vu `{"matches":[{"email":…}]}` et un `action_id`
+/// s'afficher au milieu d'une phrase. Ce filet est déterministe.
+fn strip_internal_noise(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find('{') {
+        // Un objet équilibré qui contient une clé entre guillemets est une
+        // structure, pas une tournure de phrase.
+        match balanced_span(&rest[start..]) {
+            Some(len) if rest[start..start + len].contains("\":") => {
+                out.push_str(&rest[..start]);
+                rest = &rest[start + len..];
+            }
+            _ => {
+                out.push_str(&rest[..start + 1]);
+                rest = &rest[start + 1..];
+            }
+        }
+    }
+    out.push_str(rest);
+
+    // Identifiants techniques (UUID) : ils n'ont aucun sens pour l'utilisateur.
+    out.lines()
+        .map(|line| {
+            line.split_whitespace()
+                .filter(|word| !is_technical_identifier(word))
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
+fn is_technical_identifier(word: &str) -> bool {
+    let bare = word.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-');
+    bare.len() == 36
+        && bare.chars().filter(|c| *c == '-').count() == 4
+        && bare.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+}
+
+/// Longueur du span `{…}` équilibré au début de `text`, guillemets pris en compte.
+fn balanced_span(text: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (offset, character) in text.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' if in_string => escaped = true,
+            '"' => in_string = !in_string,
+            '{' if !in_string => depth += 1,
+            '}' if !in_string => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(offset + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn cited_sources(
@@ -2312,6 +3099,47 @@ mod intent_tests {
             "Je confirme mais change d'abord l'objet"
         ));
         assert!(!is_explicit_chat_confirmation("N'envoie pas"));
+        // Piège : une demande NEUVE qui commence par une tournure d'accord.
+        // Confirmée par erreur, elle enverrait le mail précédent.
+        assert!(!is_explicit_chat_confirmation(
+            "Tu peux envoyer un courriel à Julie pour lui dire que je serai en retard ?"
+        ));
+    }
+
+    /// Deux comptes connectés : Syn ne doit pas choisir à la place de
+    /// l'utilisateur. C'est le cas réel du 17/08 — Apple Mail indisponible sur
+    /// une application non signée, Gmail et Outlook prêts, et Syn qui échouait
+    /// silencieusement au lieu de demander.
+    #[test]
+    fn avec_plusieurs_comptes_syn_demande_lequel_utiliser() {
+        let dir = std::env::temp_dir().join(format!("syn-mail-via-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("t.db"), &"2".repeat(64)).unwrap();
+        crate::connectors::set_status(&db, "google", "google", "connected").unwrap();
+        crate::connectors::set_status(&db, "microsoft", "microsoft", "connected").unwrap();
+
+        let user = "Envoie un mail à paul@exemple.fr qui dit bonjour";
+        let args = serde_json::json!({
+            "to": "paul@exemple.fr", "subject": "Bonjour", "body": "Bonjour."
+        });
+        let observation = mail_send_preflight(&db, &args, user, user, true, false).unwrap();
+        assert_eq!(observation["status"], "compte_a_choisir");
+        let comptes = observation["comptes_disponibles"].as_array().unwrap();
+        assert!(comptes.len() >= 2, "{observation}");
+
+        // Une fois le compte précisé, plus rien ne bloque.
+        let mut choisi = args.clone();
+        choisi["via"] = serde_json::json!("google");
+        assert!(mail_send_preflight(&db, &choisi, user, user, true, false).is_none());
+
+        // Un compte non connecté est refusé explicitement, pas silencieusement.
+        let mut absent = args.clone();
+        absent["via"] = serde_json::json!("slack");
+        assert_eq!(
+            mail_send_preflight(&db, &absent, user, user, true, false).unwrap()["status"],
+            "compte_indisponible"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -2325,16 +3153,20 @@ mod intent_tests {
             "body": "Je passerai à 18 heures."
         });
         let user = "Envoie un mail à Paul qui dit que je passerai à 18 heures";
-        let rejected = mail_send_preflight(&db, &args, user, user).unwrap();
+        let rejected = mail_send_preflight(&db, &args, user, user, true, false).unwrap();
         assert_eq!(rejected["status"], "destinataire_non_resolu");
 
         crate::memory::find_or_create_person(&db, "Paul", Some("paul@exemple.fr"), None).unwrap();
+        // Un destinataire légitime ne suffit pas : encore faut-il un compte
+        // capable d'envoyer. On en connecte un pour isoler ce que ce test
+        // vérifie — la provenance de l'adresse.
+        crate::connectors::set_status(&db, "google", "google", "connected").unwrap();
         let known = serde_json::json!({
             "to": "paul@exemple.fr",
             "subject": "Bonjour",
             "body": "Je passerai à 18 heures."
         });
-        assert!(mail_send_preflight(&db, &known, user, user).is_none());
+        assert!(mail_send_preflight(&db, &known, user, user, true, false).is_none());
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2356,7 +3188,7 @@ mod intent_tests {
 
 #[cfg(test)]
 mod routing_eval {
-    use super::eval::{Route, CORPUS, VALIDATION};
+    use super::eval::{Route, CORPUS, SUITES, VALIDATION};
     use super::*;
 
     /// Aiguillage tel qu'il est décidé aujourd'hui dans `handle_query_with_context`,
@@ -2390,6 +3222,7 @@ mod routing_eval {
             | Route::FileSearchMicrosoft
             | Route::FileSearchLocal => 0,
             Route::MailCompose => 1,
+            Route::MailSearch => 5,
             Route::DeviceDiagnostic => 2,
             Route::DocumentCreate => 3,
             Route::Conversation => 4,
@@ -2430,6 +3263,117 @@ mod routing_eval {
         println!();
     }
 
+
+    /// Mesure la compréhension EN CONTEXTE : le dernier message d'une suite
+    /// d'échanges doit poursuivre l'intention en cours, pas en ouvrir une autre.
+    #[tokio::test]
+    async fn une_reponse_courte_poursuit_lintention_en_cours() {
+        let llm: std::sync::Arc<dyn crate::llm::LlmClient> =
+            std::sync::Arc::new(crate::llm::ollama::OllamaClient::new(
+                "http://127.0.0.1:11434",
+                "llama3.1:latest",
+                "nomic-embed-text",
+                std::sync::Arc::new(crate::security::egress::EgressGuard::new()),
+            ));
+        if !llm.status().await.chat_model_ready {
+            println!("Modèle absent : mesure ignorée.");
+            return;
+        }
+        let mut ratees = Vec::new();
+        for suite in SUITES {
+            let contexte: Vec<(String, String)> = suite
+                .echanges
+                .iter()
+                .map(|(role, texte)| (role.to_string(), texte.to_string()))
+                .collect();
+            let comprise = super::intent::classify(
+                &llm,
+                suite.dernier,
+                &contexte,
+                super::intent::Intent {
+                    kind: super::intent::Kind::Conversation,
+                    scope: super::intent::Scope::Any,
+                    subject: None,
+                    source: super::intent::Source::Fallback,
+                },
+            )
+            .await;
+            let obtenue = match comprise.kind {
+                super::intent::Kind::FileSearch => Route::FileSearch,
+                super::intent::Kind::MailSearch => Route::MailSearch,
+                super::intent::Kind::MailCompose => Route::MailCompose,
+                super::intent::Kind::DeviceDiagnostic => Route::DeviceDiagnostic,
+                super::intent::Kind::DocumentCreate => Route::DocumentCreate,
+                super::intent::Kind::Conversation => Route::Conversation,
+            };
+            if !meme_famille(obtenue, suite.expected) {
+                ratees.push((suite.dernier, obtenue, suite.expected));
+            }
+        }
+        println!("\n╭─ Suites d'échanges : {} cas", SUITES.len());
+        println!("╰─ erronés : {} ({:.0} %)", ratees.len(),
+                 100.0 * ratees.len() as f64 / SUITES.len() as f64);
+        for (texte, obtenue, attendue) in &ratees {
+            println!("   ✗ {obtenue:?} au lieu de {attendue:?}  « {texte} »");
+        }
+        // Seuil strict, et assumé : sans contexte, ce même jeu échoue. Un seuil
+        // tolérant aurait laissé passer le comportement qu'on vient de corriger.
+        assert!(
+            ratees.is_empty(),
+            "une réponse courte ne doit pas changer d'intention : {ratees:?}"
+        );
+    }
+
+    /// Décompose le temps réellement passé sur un message, avec le prompt et
+    /// les exemples de calibrage tels qu'ils sont en production.
+    #[tokio::test]
+    async fn ou_part_le_temps_dune_reponse() {
+        let llm: std::sync::Arc<dyn crate::llm::LlmClient> =
+            std::sync::Arc::new(crate::llm::ollama::OllamaClient::new(
+                "http://127.0.0.1:11434",
+                "llama3.1:latest",
+                "nomic-embed-text",
+                std::sync::Arc::new(crate::security::egress::EgressGuard::new()),
+            ));
+        if !llm.status().await.chat_model_ready {
+            return;
+        }
+        let contexte: Vec<(String, String)> = vec![
+            ("user".into(), "Tu pourrais envoyer un mail à paul flaud ?".into()),
+            ("assistant".into(), "Que voulez-vous dire dans ce mail ?".into()),
+            ("user".into(), "Dis-lui « Bonjour, ceci est un test »".into()),
+            ("assistant".into(), "Quel compte d'envoi souhaitez-vous utiliser ?".into()),
+        ];
+        let vide = intent::Intent {
+            kind: intent::Kind::Conversation,
+            scope: intent::Scope::Any,
+            subject: None,
+            source: intent::Source::Fallback,
+        };
+        // Chauffe.
+        let _ = intent::classify(&llm, "gmail", &contexte, vide.clone()).await;
+
+        let t = std::time::Instant::now();
+        let _ = intent::classify(&llm, "gmail", &contexte, vide.clone()).await;
+        println!("\n  1. compréhension de l'intention : {:?}", t.elapsed());
+
+        let t = std::time::Instant::now();
+        let _ = llm.embed(&["gmail".to_string()]).await;
+        println!("  2. vectorisation de la demande  : {:?}", t.elapsed());
+
+        let outils = crate::tools::catalog_for(intent::Kind::MailCompose);
+        let t = std::time::Instant::now();
+        let _ = llm
+            .generate(
+                "Tu es Syn, un assistant de vie numérique local-first.",
+                &[crate::llm::ChatMessage::user("gmail")],
+                &outils,
+                crate::llm::GenParams { temperature: 0.3, max_tokens: Some(1200), json: false },
+            )
+            .await;
+        println!("  3. une itération agentique      : {:?}", t.elapsed());
+        println!("     (la boucle peut en enchaîner jusqu'à {})\n", MAX_TOOL_ITERATIONS);
+    }
     /// Mesure la compréhension du modèle local sur le même corpus. Ignoré si
     /// Ollama n'est pas joignable : le secours déterministe reste mesuré par le
     /// test ci-dessus, et le contrat produit suppose le modèle disponible.
@@ -2454,6 +3398,7 @@ mod routing_eval {
             let comprise = super::intent::classify(
                 &llm,
                 case.text,
+                &[],
                 super::intent::Intent {
                     kind: super::intent::Kind::Conversation,
                     scope: super::intent::Scope::Any,
@@ -2467,6 +3412,7 @@ mod routing_eval {
                 (super::intent::Kind::FileSearch, super::intent::Scope::Microsoft) => Route::FileSearchMicrosoft,
                 (super::intent::Kind::FileSearch, super::intent::Scope::Local) => Route::FileSearchLocal,
                 (super::intent::Kind::FileSearch, _) => Route::FileSearch,
+                (super::intent::Kind::MailSearch, _) => Route::MailSearch,
                 (super::intent::Kind::MailCompose, _) => Route::MailCompose,
                 (super::intent::Kind::DeviceDiagnostic, _) => Route::DeviceDiagnostic,
                 (super::intent::Kind::DocumentCreate, _) => Route::DocumentCreate,
@@ -2496,5 +3442,427 @@ mod routing_eval {
         }
         println!();
         }
+    }
+}
+
+#[cfg(test)]
+mod reponse_tests {
+    use super::*;
+
+    /// Cas réel du 17/08/2026 : la réponse affichée contenait le résultat brut
+    /// de `people.resolve_email` et l'identifiant interne de l'action.
+    #[test]
+    fn la_mecanique_interne_natteint_pas_la_conversation() {
+        let brut = "Le mail est en attente de confirmation.\n\n\
+                    Si vous souhaitez annuler, appelez files.cancel avec l'action_id 1e2db97f-1643-4839-9f75-d92f27d7dc2c.\n\n\
+                    {\"matches\":[{\"email\":\"paul@example.com\",\"name\":\"Paul\"}],\"resolved\":true}";
+        let propre = strip_internal_noise(brut);
+        assert!(!propre.contains("matches"), "{propre}");
+        assert!(!propre.contains("1e2db97f"), "{propre}");
+        assert!(propre.contains("en attente de confirmation"), "{propre}");
+    }
+
+
+    #[test]
+    fn le_resultat_dun_envoi_ne_saffiche_pas() {
+        let brut = "Le mail est en attente de confirmation avant d'être envoyé à Paul Flaud.\n\n{\"status\":\"envoyé\",\"subject\":\"Bonjour, ceci est un test\",\"to\":\"paulpro.flaud@gmail.com\",\"via\":\"google\"}";
+        let propre = strip_internal_noise(brut);
+        println!("APRÈS NETTOYAGE : {propre}");
+        assert!(!propre.contains("status"), "{propre}");
+    }
+    /// Une accolade dans une phrase normale ne doit pas emporter le texte.
+    #[test]
+    fn une_accolade_ordinaire_est_preservee() {
+        let texte = "J'ai trouvé le fichier {brouillon} dans Documents.";
+        assert_eq!(strip_internal_noise(texte), texte);
+    }
+}
+
+#[cfg(test)]
+mod memoire_tests {
+    use super::*;
+
+    /// Syn ne retient rien de lui-même, mais il ne laisse pas non plus filer ce
+    /// qu'il vient d'apprendre : après un envoi vers une adresse inconnue, il
+    /// PROPOSE l'association. Le nom vient d'une résolution infructueuse
+    /// récente, jamais d'une phrase interprétée.
+    #[test]
+    fn une_adresse_inconnue_declenche_une_proposition_nommee() {
+        let dir = std::env::temp_dir().join(format!("syn-appris-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = crate::db::Db::open(&dir.join("t.db"), &"9".repeat(64)).unwrap();
+        let args = json!({"to": "camille.roux@exemple.fr"});
+
+        // Sans recherche préalable, aucun nom : on ne propose rien plutôt que
+        // de fabriquer une fiche à partir d'une adresse.
+        assert!(learnable_contact(&db, &args).unwrap().is_none());
+
+        crate::security::log_access(&db, "people", "resolve_email_unresolved", Some("Camille Roux"));
+        let (nom, adresse) = learnable_contact(&db, &args).unwrap().expect("proposition attendue");
+        assert_eq!(nom, "Camille Roux");
+        assert_eq!(adresse, "camille.roux@exemple.fr");
+
+        // Une fois la personne connue, plus aucune proposition : pas de doublon.
+        crate::memory::find_or_create_person(&db, "Camille Roux", Some("camille.roux@exemple.fr"), None)
+            .unwrap();
+        assert!(learnable_contact(&db, &args).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// L'enregistrement passe toujours par une confirmation, quel que soit le
+    /// niveau d'autonomie — c'est ce qui empêche la mémoire de se remplir toute
+    /// seule.
+    #[test]
+    fn memoriser_un_contact_deduit_se_confirme_a_tout_niveau_dautonomie() {
+        for autonomie in [
+            crate::settings::Autonomy::Prudent,
+            crate::settings::Autonomy::Assiste,
+            crate::settings::Autonomy::Autonome,
+        ] {
+            assert!(
+                actions::needs_confirmation(
+                    actions::RiskClass::ReversibleLocal,
+                    &autonomie,
+                    false,
+                    "people.link_email"
+                ),
+                "confirmation attendue pour {autonomie:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod composition_tests {
+    use super::*;
+    use crate::connectors::mail;
+
+    /// Rejoue la conversation du 17/08 à 23h36, tour par tour.
+    ///
+    /// L'utilisateur donne le contenu au tour 2, le compte au tour 3, puis
+    /// demande l'envoi. Syn redemandait le contenu et repartait sur une
+    /// recherche de documents. L'état d'envoi doit rendre chaque information
+    /// définitivement acquise.
+    #[test]
+    fn un_envoi_se_construit_sur_plusieurs_tours_sans_rien_redemander() {
+        let dir = std::env::temp_dir().join(format!("syn-compo-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = crate::db::Db::open(&dir.join("t.db"), &"4".repeat(64)).unwrap();
+        crate::connectors::set_status(&db, "google", "google", "connected").unwrap();
+        let session = "s-compo";
+        let historique = "Tu pourrais envoyer un mail à paulpro.flaud@gmail.com ?";
+
+        // Tour 1 — le destinataire seul. Il manque le contenu.
+        let etat = mail::remember_composition(
+            &db,
+            session,
+            &json!({"to": "paulpro.flaud@gmail.com"}),
+        )
+        .unwrap();
+        assert_eq!(etat.missing(), vec!["contenu"]);
+
+        // Tour 2 — le contenu. Le destinataire ne doit pas disparaître.
+        let etat = mail::remember_composition(
+            &db,
+            session,
+            &json!({"subject": "Test", "body": "Bonjour, ceci est un test"}),
+        )
+        .unwrap();
+        assert_eq!(etat.recipient, "paulpro.flaud@gmail.com");
+        assert!(etat.missing().is_empty(), "{etat:?}");
+
+        // Tour 3 — le compte, et rien d'autre.
+        let etat = mail::remember_composition(&db, session, &json!({"via": "google"})).unwrap();
+        assert_eq!(etat.body, "Bonjour, ceci est un test");
+        assert_eq!(etat.via, "google");
+
+        // Tour 4 — le modèle rappelle mail.send SANS aucun argument, comme il
+        // le fait quand il a « oublié ». L'état complète, et plus rien ne
+        // bloque : la carte de confirmation peut être préparée.
+        let complete = json!({
+            "to": etat.recipient, "subject": etat.subject,
+            "body": etat.body, "via": etat.via
+        });
+        assert!(
+            mail_send_preflight(&db, &complete, "envoie", historique, true, false).is_none(),
+            "l'envoi ne devrait plus rien réclamer"
+        );
+
+        // Après l'envoi, l'état disparaît : la demande suivante repart à neuf.
+        mail::clear_composition(&db, session).unwrap();
+        assert!(mail::composition(&db, session).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Le secours hors ligne doit distinguer « retrouve un mail » de « envoie
+    /// un mail » : ce sont deux parcours opposés qui partagent leurs mots.
+    #[test]
+    fn chercher_un_mail_nest_pas_en_ecrire_un() {
+        assert!(is_mail_search_query(
+            "Tu peux me retrouver un mail de Liverpool qui concerne ma réservation ?"
+        ));
+        assert!(is_mail_search_query("où est le message du syndic ?"));
+        assert!(is_mail_search_query(
+            "j'ai reçu un courriel d'Orange, tu le retrouves ?"
+        ));
+        // Composer, ce n'est pas chercher.
+        assert!(!is_mail_search_query("Tu peux envoyer un mail à Paul ?"));
+        assert!(!is_mail_search_query(
+            "écris un mail à Camille pour la remercier"
+        ));
+        // Une recherche de document reste une recherche de document.
+        assert!(!is_mail_search_query("retrouve mon contrat de location"));
+    }
+
+    /// Le parcours d'envoi ne doit rien devoir au mail de test qui a servi à le
+    /// corriger. Des tournures, des destinataires et des sujets sans rapport
+    /// entre eux — c'est la garde contre une correction taillée pour un cas.
+    #[test]
+    fn le_parcours_ne_depend_pas_dune_tournure_particuliere() {
+        let neutre = intent::Intent {
+            kind: intent::Kind::MailCompose,
+            scope: intent::Scope::Any,
+            subject: None,
+            source: intent::Source::Understood,
+        };
+        for demande in [
+            "Envoie un mail à Camille pour la remercier de son aide",
+            "Écris un mail à mon propriétaire pour signaler la fuite d'eau",
+            "Tu peux envoyer un courriel à Julie pour lui dire que je serai en retard ?",
+            "rédige un email à l'agence pour demander un rendez-vous la semaine prochaine",
+            "envoie un mail au syndic : la minuterie du hall ne fonctionne plus",
+        ] {
+            assert!(
+                mail_content_expressed(demande, &neutre),
+                "contenu non reconnu : {demande}"
+            );
+        }
+
+        for accord in [
+            "Oui",
+            "ok",
+            "c'est parfait",
+            "ça me va",
+            "Je valide",
+            "vas-y",
+            "👍",
+            "c'est très bien",
+            "Envoie",
+        ] {
+            assert!(
+                mail_flow::is_draft_approval(accord),
+                "accord non reconnu : {accord}"
+            );
+        }
+
+        for retouche in [
+            "non",
+            "attends",
+            "plutôt plus court",
+            "change la première phrase",
+            "n'envoie pas ça",
+            "ajoute une phrase sur la date",
+        ] {
+            assert!(
+                !mail_flow::is_draft_approval(retouche),
+                "pris à tort pour un accord : {retouche}"
+            );
+        }
+    }
+
+    /// Une confirmation d'adresse n'est pas un contenu de mail : la prendre
+    /// pour tel faisait rédiger un message sur « c'est correct ».
+    #[test]
+    fn une_confirmation_dadresse_ne_vaut_pas_contenu() {
+        let sans_sujet = |kind| intent::Intent {
+            kind,
+            scope: intent::Scope::Any,
+            subject: None,
+            source: intent::Source::Understood,
+        };
+        let avec_sujet = |sujet: &str| intent::Intent {
+            kind: intent::Kind::MailCompose,
+            scope: intent::Scope::Any,
+            subject: Some(sujet.to_string()),
+            source: intent::Source::Understood,
+        };
+
+        assert!(!mail_content_expressed(
+            "C'est correct",
+            &sans_sujet(intent::Kind::MailCompose)
+        ));
+        assert!(!mail_content_expressed(
+            "Oui, c'est bien celle-là",
+            &sans_sujet(intent::Kind::MailCompose)
+        ));
+        // Le contenu porté par la demande elle-même.
+        assert!(mail_content_expressed(
+            "À toi de rédiger un mail pour lui demander s'il est d'accord pour la colocation",
+            &sans_sujet(intent::Kind::MailCompose)
+        ));
+        assert!(mail_content_expressed(
+            "dis-lui que je serai en retard",
+            &sans_sujet(intent::Kind::MailCompose)
+        ));
+        // Le sujet compris par le classifieur suffit, sans mot-clé.
+        assert!(mail_content_expressed(
+            "souhaite-lui un bon anniversaire",
+            &avec_sujet("un bon anniversaire")
+        ));
+    }
+
+    /// Cas réel du 18/08, 14h31 : Syn a écrit « Le mail a été envoyé à
+    /// paulpro.flaud@gmail.com » alors qu'aucun outil n'avait tourné. Une
+    /// affirmation d'envoi se confronte au journal des actions, jamais à la
+    /// bonne foi du modèle.
+    #[test]
+    fn une_affirmation_denvoi_est_reconnue() {
+        assert!(claims_a_sent_mail(
+            "Le mail a été envoyé à paulpro.flaud@gmail.com. L'utilisateur a confirmé."
+        ));
+        assert!(claims_a_sent_mail("C'est envoyé !"));
+        assert!(claims_a_sent_mail("J'ai bien envoyé ton message."));
+        // Ce que Syn dit quand il n'a rien envoyé ne doit pas se faire prendre
+        // pour un aveu d'envoi.
+        assert!(!claims_a_sent_mail(
+            "Je n'ai encore rien envoyé : ce mail attend ta validation."
+        ));
+        assert!(!claims_a_sent_mail(
+            "Depuis quel compte souhaites-tu envoyer le mail à Paul ?"
+        ));
+    }
+
+    /// Le blocage vu le 18/08 en conditions réelles : Syn trouve l'adresse de
+    /// Paul dans le carnet, l'utilisateur répond « c'est bien celle-là »… et le
+    /// contrôle anti-adresse-inventée refusait l'envoi, parce que l'utilisateur
+    /// n'avait jamais TAPÉ l'adresse lui-même. Le parcours rendait alors la
+    /// main au modèle, qui improvisait.
+    #[test]
+    fn une_adresse_sortie_du_carnet_est_legitime_sans_etre_tapee() {
+        let dir = std::env::temp_dir().join(format!("syn-carnet-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = crate::db::Db::open(&dir.join("t.db"), &"7".repeat(64)).unwrap();
+        crate::connectors::set_status(&db, "google", "google", "connected").unwrap();
+        let historique = "Tu peux envoyer un mail à Paul ?\nC'est bien celle-là";
+        let args = json!({
+            "to": "paulpro.flaud@gmail.com", "subject": "Colocation",
+            "body": "Salut Paul, est-ce que tu serais partant ?", "via": "google"
+        });
+
+        // Adresse écrite par le modèle : le contrôle tient, comme avant.
+        assert_eq!(
+            mail_send_preflight(&db, &args, "", historique, true, false).unwrap()["status"],
+            "destinataire_non_resolu"
+        );
+        // Adresse sortie du carnet de l'utilisateur : le parcours passe.
+        assert!(
+            mail_send_preflight(&db, &args, "", historique, true, true).is_none(),
+            "une adresse résolue par Syn doit être acceptée"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// La confiance suit l'adresse, pas la session : dès qu'un appel d'outil en
+    /// écrit une autre, on repasse sous contrôle.
+    #[test]
+    fn la_provenance_du_destinataire_suit_sa_source() {
+        let dir = std::env::temp_dir().join(format!("syn-source-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = crate::db::Db::open(&dir.join("t.db"), &"8".repeat(64)).unwrap();
+        let session = "s-source";
+
+        let resolu =
+            mail::remember_resolved_recipient(&db, session, "paulpro.flaud@gmail.com").unwrap();
+        assert!(resolu.recipient_is_resolved());
+
+        // Le corps arrive ensuite : la provenance de l'adresse ne bouge pas.
+        let redige =
+            mail::remember_composition(&db, session, &json!({"body": "Salut Paul"})).unwrap();
+        assert!(redige.recipient_is_resolved());
+
+        // Une autre adresse, écrite par le modèle : sous contrôle.
+        let reecrit =
+            mail::remember_composition(&db, session, &json!({"to": "inconnu@ailleurs.fr"})).unwrap();
+        assert!(!reecrit.recipient_is_resolved());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Le parcours des maquettes : Syn rédige, l'utilisateur relit, PUIS on
+    /// parle du compte d'envoi. Un texte proposé n'est jamais réputé accepté.
+    #[test]
+    fn le_texte_redige_par_syn_attend_sa_relecture() {
+        let dir = std::env::temp_dir().join(format!("syn-relecture-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = crate::db::Db::open(&dir.join("t.db"), &"6".repeat(64)).unwrap();
+        let session = "s-relecture";
+
+        let etat = mail::remember_composition(
+            &db,
+            session,
+            &json!({"to": "paulpro.flaud@gmail.com", "subject": "Joyeux anniversaire",
+                    "body": "Hello Paul,\n\nPetit message pour te souhaiter…"}),
+        )
+        .unwrap();
+        assert!(etat.awaits_approval(), "le texte proposé doit être relu");
+
+        // Un rappel d'outil qui ne change pas le corps ne repose pas la question.
+        let inchange =
+            mail::remember_composition(&db, session, &json!({"via": "google"})).unwrap();
+        assert!(inchange.awaits_approval());
+
+        let approuve = mail::approve_body(&db, session).unwrap();
+        assert!(!approuve.awaits_approval());
+        assert_eq!(approuve.via, "google");
+
+        // Une réécriture demandée après coup redevient un texte à relire.
+        let reecrit = mail::remember_composition(
+            &db,
+            session,
+            &json!({"body": "Hello Paul, joyeux anniversaire !"}),
+        )
+        .unwrap();
+        assert!(reecrit.awaits_approval());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Cas des maquettes : « un mail très concis pour lui souhaiter un bon
+    /// anniversaire » ne contient pas le texte du mail, mais dit assez pour que
+    /// Syn rédige. Redemander « que veux-tu dire ? » était une boucle.
+    #[test]
+    fn une_intention_de_message_vaut_matiere_a_rediger() {
+        assert!(mail_request_missing_content("Tu pourrais envoyer un mail à Paul ?"));
+        assert!(!mail_request_missing_content(
+            "Je veux lui envoyer un mail très concis pour lui souhaiter un bon anniversaire"
+        ));
+        assert!(!mail_request_missing_content(
+            "Envoie un mail à Camille pour la remercier de son aide"
+        ));
+        // Une circonstance n'est pas une intention de message.
+        assert!(mail_request_missing_content("Envoie un mail à Paul pour moi"));
+    }
+
+    /// Un champ vide ne doit jamais effacer un champ connu — c'est ce qui
+    /// faisait perdre le contenu quand le modèle rappelait l'outil.
+    #[test]
+    fn un_argument_vide_neffce_jamais_une_information_acquise() {
+        let dir = std::env::temp_dir().join(format!("syn-compo2-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = crate::db::Db::open(&dir.join("t.db"), &"5".repeat(64)).unwrap();
+        mail::remember_composition(
+            &db,
+            "s",
+            &json!({"to": "a@b.fr", "subject": "Objet", "body": "Corps"}),
+        )
+        .unwrap();
+        let apres = mail::remember_composition(
+            &db,
+            "s",
+            &json!({"to": "", "subject": "", "body": "", "via": "microsoft"}),
+        )
+        .unwrap();
+        assert_eq!(apres.recipient, "a@b.fr");
+        assert_eq!(apres.body, "Corps");
+        assert_eq!(apres.via, "microsoft");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

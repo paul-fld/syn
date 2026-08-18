@@ -65,6 +65,11 @@ pub fn run() {
             // session & sécurité
             ipc::app_status,
             ipc::runtime_ready,
+            ipc::dictation_status,
+            ipc::dictation_request_permission,
+            ipc::dictation_start,
+            ipc::dictation_transcript,
+            ipc::dictation_stop,
             ipc::setup_master,
             ipc::unlock,
             ipc::unlock_with_keychain,
@@ -82,6 +87,7 @@ pub fn run() {
             ipc::list_projects,
             ipc::create_project,
             ipc::move_session_to_project,
+            ipc::choose_mail_account,
             ipc::get_startup_brief,
             ipc::get_daily_wrap,
             // actions

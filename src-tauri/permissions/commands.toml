@@ -5,7 +5,7 @@ commands.allow = [
   "app_status", "setup_master", "unlock", "unlock_with_keychain", "unlock_with_recovery",
   "lock", "change_master_password", "regenerate_recovery", "set_keychain", "query",
   "list_sessions", "get_conversation", "rename_session", "delete_session", "list_projects",
-  "create_project", "move_session_to_project", "get_startup_brief", "get_daily_wrap",
+  "create_project", "move_session_to_project", "choose_mail_account", "get_startup_brief", "get_daily_wrap",
   "list_pending_actions", "list_actions", "confirm_action", "reject_action", "undo_action",
   "connector_status", "native_permissions", "request_native_permission", "open_native_settings",
   "connector_connect", "connector_sync", "connector_disconnect", "screen_context", "get_settings", "set_settings",
@@ -17,12 +17,16 @@ commands.allow = [
   "rules_delete", "rules_list", "rules_set_priority", "list_surfacings", "dismiss_surfacing",
   "list_triggers", "trigger_toggle", "system_snapshot", "access_log_list", "calendar_today",
   "tasks_quick_add", "storage_stats", "data_dir_path", "purge_all_data", "onboarding_complete",
-  "open_source", "show_main_window", "hide_bar", "speak_text", "stop_speaking"
+  "open_source", "show_main_window", "hide_bar", "speak_text", "stop_speaking",
+  "runtime_ready", "dictation_status", "dictation_request_permission",
+  "dictation_start", "dictation_transcript", "dictation_stop"
 ]
 
 [[permission]]
 identifier = "bar-commands"
 description = "Sous-ensemble minimal utilisé par la barre flottante."
 commands.allow = [
-  "query", "screen_context", "confirm_action", "reject_action", "show_main_window", "hide_bar"
+  "query", "screen_context", "confirm_action", "reject_action", "choose_mail_account", "show_main_window", "hide_bar",
+  "get_settings", "dictation_status", "dictation_request_permission",
+  "dictation_start", "dictation_transcript", "dictation_stop"
 ]

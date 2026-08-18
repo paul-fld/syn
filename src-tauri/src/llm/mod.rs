@@ -51,6 +51,102 @@ pub struct ToolCall {
     pub arguments: Value,
 }
 
+
+/// Récupère un appel d'outil que le modèle a écrit en TEXTE au lieu de le
+/// livrer dans le champ structuré.
+///
+/// Llama le fait régulièrement, et parfois avec un JSON abîmé
+/// (`"parameters{"to":…` — les deux-points manquent). Sans ce rattrapage,
+/// l'utilisateur voyait le JSON brut s'afficher dans la conversation à la place
+/// de l'action demandée. On ne cherche donc pas à valider du JSON parfait : on
+/// extrait le nom de l'outil et le premier objet équilibré qui suit
+/// `parameters` ou `arguments`.
+pub fn tool_call_from_text(content: &str) -> Option<ToolCall> {
+    let body = content
+        .trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
+    if !body.starts_with('{') {
+        return None;
+    }
+
+    // Voie normale : le JSON est valide.
+    if let Ok(value) = serde_json::from_str::<Value>(body) {
+        let function = if value["function"].is_object() {
+            value["function"].clone()
+        } else {
+            value.clone()
+        };
+        if let Some(name) = function["name"].as_str() {
+            let arguments = ["arguments", "parameters"]
+                .iter()
+                .map(|key| function[*key].clone())
+                .find(|value| value.is_object())
+                .unwrap_or_else(|| serde_json::json!({}));
+            return Some(ToolCall {
+                name: name.to_string(),
+                arguments,
+            });
+        }
+    }
+
+    // Voie de secours : JSON abîmé. On lit les deux seules informations utiles.
+    let name = quoted_value_after(body, "\"name\"")?;
+    let arguments = ["parameters", "arguments"]
+        .iter()
+        .filter_map(|key| balanced_object_after(body, key))
+        .find_map(|text| serde_json::from_str::<Value>(&text).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    Some(ToolCall { name, arguments })
+}
+
+/// Valeur entre guillemets qui suit une clé, sans exiger la ponctuation JSON.
+fn quoted_value_after(text: &str, key: &str) -> Option<String> {
+    let after = &text[text.find(key)? + key.len()..];
+    let start = after.find('"')?;
+    let rest = &after[start + 1..];
+    let end = rest.find('"')?;
+    let value = &rest[..end];
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+/// Premier objet `{…}` équilibré qui suit une clé, guillemets pris en compte.
+fn balanced_object_after(text: &str, key: &str) -> Option<String> {
+    let from = text.find(key)? + key.len();
+    let start = from + text[from..].find('{')?;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (offset, character) in text[start..].char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' if in_string => escaped = true,
+            '"' => in_string = !in_string,
+            '{' if !in_string => depth += 1,
+            '}' if !in_string => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(text[start..start + offset + 1].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Le contenu ressemble-t-il à une sortie structurée plutôt qu'à une phrase ?
+/// Sert à ne jamais diffuser de JSON dans la conversation.
+pub fn looks_structured(content: &str) -> bool {
+    let trimmed = content.trim_start();
+    trimmed.starts_with('{') || trimmed.starts_with("```")
+}
+
 /// Contrat d'outil (doc maître §10) — exposé au routeur.
 #[derive(Debug, Clone, Serialize)]
 pub struct ToolSpec {
@@ -168,4 +264,42 @@ pub fn blob_to_vec(b: &[u8]) -> Vec<f32> {
     b.chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Cas réel du 17/08/2026 : Syn affichait ce JSON dans la conversation au
+    /// lieu d'envoyer le mail. Noter le `"parameters{` — les deux-points
+    /// manquent, le JSON est invalide.
+    #[test]
+    fn un_appel_doutil_ecrit_en_texte_est_recupere_meme_abime() {
+        let abime = r#"{"type":"function","name":"mail.send","parameters{"to":"paul@example.com","subject":"Bonjour","body":"Ceci est un test de mail."}}}"#;
+        let call = tool_call_from_text(abime).expect("appel non récupéré");
+        assert_eq!(call.name, "mail.send");
+        assert_eq!(call.arguments["to"], "paul@example.com");
+        assert_eq!(call.arguments["subject"], "Bonjour");
+    }
+
+    #[test]
+    fn les_formes_valides_habituelles_passent_aussi() {
+        for texte in [
+            r#"{"name":"files.search","arguments":{"query":"bail"}}"#,
+            r#"{"function":{"name":"files.search","arguments":{"query":"bail"}}}"#,
+            "```json\n{\"type\":\"function\",\"name\":\"files.search\",\"parameters\":{\"query\":\"bail\"}}\n```",
+        ] {
+            let call = tool_call_from_text(texte).expect(texte);
+            assert_eq!(call.name, "files.search");
+            assert_eq!(call.arguments["query"], "bail");
+        }
+    }
+
+    #[test]
+    fn une_vraie_phrase_nest_jamais_prise_pour_un_appel_doutil() {
+        assert!(tool_call_from_text("J'ai trouvé deux documents.").is_none());
+        assert!(!looks_structured("J'ai trouvé deux documents."));
+        assert!(looks_structured("{\"name\":"));
+        assert!(looks_structured("```json"));
+    }
 }

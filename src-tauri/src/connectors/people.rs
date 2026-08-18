@@ -107,9 +107,87 @@ pub fn context(db: &Db, name: &str) -> Result<Value> {
     })
 }
 
+/// Correspondants connus par les mails déjà synchronisés (Gmail, Outlook,
+/// Apple Mail). Sans cela, Syn ignorait des adresses qu'il avait pourtant sous
+/// les yeux : l'utilisateur devait lui dicter une adresse figurant dans sa
+/// propre boîte de réception.
+///
+/// Les en-têtes ingérés ont la forme `De : Nom <adresse>` / `À : …`. On lit ces
+/// deux lignes uniquement — jamais le corps, qui n'est pas une source d'identité.
+fn correspondents_matching(db: &Db, folded_name: &str) -> Result<Vec<Value>> {
+    let bodies: Vec<String> = db.read(|c| {
+        let mut stmt = c.prepare(
+            "SELECT COALESCE(body,'') FROM items
+             WHERE source='mail' AND status='active'
+               AND syn_fold(COALESCE(body,'')) LIKE '%'||?1||'%'
+             ORDER BY COALESCE(created_at,0) DESC LIMIT 200",
+        )?;
+        let rows = stmt.query_map(params![folded_name], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    })?;
+
+    let mut seen = std::collections::HashSet::new();
+    let mut matches = Vec::new();
+    for body in bodies {
+        for line in body.lines().take(4) {
+            let Some(list) = line
+                .strip_prefix("De : ")
+                .or_else(|| line.strip_prefix("À : "))
+                .or_else(|| line.strip_prefix("A : "))
+            else {
+                continue;
+            };
+            for entry in list.split(',') {
+                let Some((display, email)) = split_address(entry) else {
+                    continue;
+                };
+                let folded_display = crate::db::fold(&display);
+                let local = email.split('@').next().unwrap_or_default();
+                if !folded_display.contains(folded_name)
+                    && !crate::db::fold(local).contains(folded_name)
+                {
+                    continue;
+                }
+                if !seen.insert(email.clone()) {
+                    continue;
+                }
+                matches.push(json!({
+                    "name": if display.is_empty() { email.clone() } else { display },
+                    "email": email,
+                    "source": "mails synchronisés",
+                }));
+            }
+        }
+    }
+    Ok(matches)
+}
+
+/// Découpe `Nom <adresse>` ou une adresse nue. Rend `(nom, adresse)`.
+fn split_address(entry: &str) -> Option<(String, String)> {
+    let entry = entry.trim();
+    if let Some(open) = entry.rfind('<') {
+        let email = entry[open + 1..].trim_end_matches('>').trim().to_lowercase();
+        let display = entry[..open].trim().trim_matches('"').to_string();
+        return valid_email(&email).then_some((display, email));
+    }
+    let email = entry.trim_matches('"').to_lowercase();
+    valid_email(&email).then_some((String::new(), email))
+}
+
+fn valid_email(value: &str) -> bool {
+    value.contains('@') && value.contains('.') && !value.contains(' ')
+}
+
 /// Résolution explicite d'un destinataire. Renvoie toutes les correspondances
 /// afin que le modèle demande une précision en cas d'homonymie ou d'adresses
 /// multiples, au lieu de choisir ou de fabriquer une adresse.
+///
+/// Deux sources, dans cet ordre : le carnet d'adresses explicite, puis les
+/// mails déjà synchronisés.
 pub fn resolve_email(db: &Db, name: &str) -> Result<Value> {
     let folded = crate::db::fold(name.trim());
     if folded.is_empty() {
@@ -145,6 +223,12 @@ pub fn resolve_email(db: &Db, name: &str) -> Result<Value> {
         }
         Ok(out)
     })?;
+    // Le carnet d'adresses explicite prime ; les mails déjà synchronisés
+    // complètent quand il ne dit rien.
+    let mut matches = matches;
+    if matches.is_empty() {
+        matches = correspondents_matching(db, &folded)?;
+    }
     let resolved = matches.len() == 1;
     Ok(json!({
         "resolved": resolved,
@@ -271,4 +355,40 @@ pub fn add_fact_about(db: &Db, text: &str) -> Result<String> {
         Ok(())
     })?;
     Ok(id)
+}
+
+#[cfg(test)]
+mod correspondents_tests {
+    use super::*;
+
+    /// Un correspondant présent dans les mails synchronisés doit être trouvé
+    /// sans que l'utilisateur ait à saisir son adresse à la main : c'est
+    /// exactement ce que Paul reprochait le 17/08/2026.
+    #[test]
+    fn une_adresse_vue_dans_les_mails_synchronises_est_resolue() {
+        let dir = std::env::temp_dir().join(format!("syn-corresp-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("t.db"), &"6".repeat(64)).unwrap();
+        db.with(|c| {
+            c.execute(
+                "INSERT INTO items(id,source,source_ref,type,title,body,created_at,ingested_at,status)
+                 VALUES ('m1','mail','google:gmail:1','email','Devis',
+                         'De : Camille Roux <camille.roux@exemple.fr>\nÀ : moi@exemple.fr\nObjet : Devis\n\nBonjour',
+                         10, 10, 'active')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let resolved = resolve_email(&db, "Camille").unwrap();
+        assert_eq!(resolved["resolved"], true, "{resolved}");
+        assert_eq!(resolved["matches"][0]["email"], "camille.roux@exemple.fr");
+
+        // Un inconnu reste inconnu : on ne fabrique jamais d'adresse.
+        let unknown = resolve_email(&db, "Bertrand").unwrap();
+        assert_eq!(unknown["resolved"], false, "{unknown}");
+        assert!(unknown["matches"].as_array().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

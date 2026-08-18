@@ -1,6 +1,8 @@
 // Barre « Demander à Syn » (maquette Accueil) : + | input | box-select · micro · ondes.
-import { createSignal, onCleanup, type JSX } from "solid-js";
+import { createSignal, For, onCleanup, Show, type JSX } from "solid-js";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { Icon } from "./Icon";
+import { activeSession, attachDocument, conversation, detachDocument } from "../lib/conversations";
 import { label } from "../lib/voice";
 import { settings, refreshSettings } from "../lib/state";
 import { ipc, type ScreenContext } from "../lib/ipc";
@@ -22,6 +24,9 @@ export function AskBar(props: {
   const [capturing, setCapturing] = createSignal(false);
   const [captureError, setCaptureError] = createSignal("");
   const [voiceMode, setVoiceMode] = createSignal<VoiceMode | null>(null);
+  const [joining, setJoining] = createSignal(false);
+  const [joinError, setJoinError] = createSignal("");
+  const documents = () => conversation(activeSession()).documents;
   const [voiceError, setVoiceError] = createSignal("");
   let poller: number | undefined;
   let inputEl: HTMLInputElement | undefined;
@@ -112,8 +117,53 @@ export function AskBar(props: {
   };
 
   return (
+    <>
+    <Show when={documents().length > 0 || joinError()}>
+      <div class="askbar-documents">
+        <For each={documents()}>
+          {(document) => (
+            <span class="document-chip" title={`${document.path}${document.truncated ? " · lu en partie" : ""}`}>
+              <Icon name="file" size={13} />
+              {document.name}
+              <Show when={document.truncated}><em>· lu en partie</em></Show>
+              <button
+                class="document-chip-remove"
+                aria-label={`Retirer ${document.name}`}
+                onClick={() => {
+                  const session = activeSession();
+                  if (session) void detachDocument(session, document.id);
+                }}
+              >
+                <Icon name="x" size={11} />
+              </button>
+            </span>
+          )}
+        </For>
+        <Show when={joinError()}><span class="document-chip error">{joinError()}</span></Show>
+      </div>
+    </Show>
     <div class="askbar" classList={{ listening: !!voiceMode() }}>
-      <button title="Pièces jointes non disponibles dans cette version" aria-label="Pièces jointes non disponibles" disabled>
+      {/* Confier un document à la conversation. Syn le lit une fois : son
+          contenu entre ensuite dans chaque tour, sans dépendre d'une recherche. */}
+      <button
+        title="Joindre un document à la conversation"
+        aria-label="Joindre un document"
+        disabled={props.disabled || joining()}
+        onClick={async () => {
+          setJoining(true);
+          try {
+            const chosen = await openDialog({ multiple: true, title: "Documents à confier à Syn" });
+            const paths = Array.isArray(chosen) ? chosen : chosen ? [chosen] : [];
+            for (const path of paths) {
+              await attachDocument(activeSession(), path);
+            }
+          } catch (error: any) {
+            setJoinError(error?.message ?? String(error));
+          } finally {
+            setJoining(false);
+          }
+        }}
+      >
         <Icon name="plus" size={16} />
       </button>
       <input
@@ -175,5 +225,6 @@ export function AskBar(props: {
         <Icon name="audio-lines" size={15} />
       </button>
     </div>
+    </>
   );
 }

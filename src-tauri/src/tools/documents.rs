@@ -237,6 +237,101 @@ pub fn locate_local(db: &Db, target: &str) -> Result<PathBuf> {
 
 /// Écrit dans un document local existant. `append` conserve le contenu, ce qui
 /// laisse le geste réversible ; `replace` sauvegarde d'abord l'ancienne version.
+/// Retouche un document Word existant, en place, avec sauvegarde.
+///
+/// Contrairement à `write_local`, qui réécrit du texte brut, la mise en forme,
+/// les images et les styles sont préservés : seule la partie principale du
+/// paquet OOXML est modifiée, et uniquement là où une opération s'applique.
+pub fn edit_local(
+    db: &Db,
+    target: &str,
+    operations: &[super::docx_edit::Operation],
+) -> Result<(Value, Value)> {
+    let path = locate_local(db, target)?;
+    let home =
+        dirs::home_dir().ok_or_else(|| AppError::Other("dossier personnel introuvable".into()))?;
+    if super::reorganize::is_protected_target(&path, &home) {
+        return Err(AppError::Security(format!(
+            "« {} » se trouve dans une zone protégée.",
+            path.display()
+        )));
+    }
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_lowercase();
+    if extension != "docx" {
+        return Err(AppError::Invalid(format!(
+            "Syn ne sait retoucher en place que les documents Word (.docx). « {} » est un {extension} — \
+             pour un fichier texte, je peux le réécrire ; pour les autres formats, je ne sais pas encore.",
+            path.display()
+        )));
+    }
+
+    let (bytes, report) = super::docx_edit::apply(&path, operations)?;
+    if report.is_empty() {
+        return Err(AppError::Invalid(
+            "Aucun passage du document ne correspond à ce que tu demandes. Précise ce qu'il faut viser.".into(),
+        ));
+    }
+    // La sauvegarde est prise AVANT l'écriture : c'est elle qui rend la
+    // retouche annulable, et donc acceptable.
+    let backup = super::reorganize::unique_destination(
+        path.with_extension(format!("docx.syn-avant-{}", crate::db::now())),
+    );
+    std::fs::copy(&path, &backup).map_err(|error| {
+        AppError::Other(format!(
+            "sauvegarde de la version précédente impossible : {error}"
+        ))
+    })?;
+    std::fs::write(&path, &bytes).map_err(|error| {
+        AppError::Other(format!(
+            "écriture de {} impossible : {error}",
+            path.display()
+        ))
+    })?;
+
+    let mut faits: Vec<String> = Vec::new();
+    if report.paragraphs_touched > 0 {
+        faits.push(format!(
+            "{} paragraphe(s) mis en forme",
+            report.paragraphs_touched
+        ));
+    }
+    if report.replacements > 0 {
+        faits.push(format!("{} remplacement(s)", report.replacements));
+    }
+    if report.paragraphs_added > 0 {
+        faits.push(format!(
+            "{} paragraphe(s) ajouté(s)",
+            report.paragraphs_added
+        ));
+    }
+    if report.placeholders_added > 0 {
+        faits.push(format!(
+            "{} emplacement(s) d'image réservé(s) — Syn ne crée pas d'images, l'encadré indique où déposer la vôtre",
+            report.placeholders_added
+        ));
+    }
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("document");
+    Ok((
+        json!({
+            "path": path.to_string_lossy(),
+            "report": format!("« {name} » retouché : {}. La version précédente est conservée à côté.", faits.join(", ")),
+            "details": report,
+        }),
+        json!({
+            "kind": "restore_binary_file",
+            "path": path.to_string_lossy(),
+            "backup": backup.to_string_lossy(),
+        }),
+    ))
+}
+
 pub fn write_local(db: &Db, target: &str, content: &str, mode: &str) -> Result<(Value, Value)> {
     let path = locate_local(db, target)?;
     let home =
@@ -260,10 +355,9 @@ pub fn write_local(db: &Db, target: &str, content: &str, mode: &str) -> Result<(
         )));
     }
     let previous = std::fs::read_to_string(&path).unwrap_or_default();
-    let backup = super::reorganize::unique_destination(path.with_extension(format!(
-        "{extension}.syn-avant-{}",
-        crate::db::now()
-    )));
+    let backup = super::reorganize::unique_destination(
+        path.with_extension(format!("{extension}.syn-avant-{}", crate::db::now())),
+    );
     let replaces = matches!(
         mode.trim().to_lowercase().as_str(),
         "replace" | "remplace" | "remplacer"
@@ -281,7 +375,10 @@ pub fn write_local(db: &Db, target: &str, content: &str, mode: &str) -> Result<(
         format!("{}\n\n{content}\n", previous.trim_end())
     };
     std::fs::write(&path, updated.as_bytes()).map_err(|error| {
-        AppError::Other(format!("écriture de {} impossible : {error}", path.display()))
+        AppError::Other(format!(
+            "écriture de {} impossible : {error}",
+            path.display()
+        ))
     })?;
     let undo = json!({
         "kind": "restore_text_file",
@@ -366,8 +463,11 @@ mod tests {
             assert!(names.contains(&part.to_string()), "{names:?}");
         }
         let mut document = String::new();
-        std::io::Read::read_to_string(&mut archive.by_name("word/document.xml").unwrap(), &mut document)
-            .unwrap();
+        std::io::Read::read_to_string(
+            &mut archive.by_name("word/document.xml").unwrap(),
+            &mut document,
+        )
+        .unwrap();
         assert!(document.contains("Deuxième ligne"), "{document}");
     }
 

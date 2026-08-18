@@ -2,7 +2,9 @@
 //! ajouter une capacité = ajouter un outil. Chaque outil déclare son side_effect ;
 //! la classe de risque est calculée par la porte d'action (actions::classify).
 
+pub mod attachments;
 pub mod documents;
+pub mod docx_edit;
 pub mod reorganize;
 
 use crate::bus::Bus;
@@ -72,6 +74,7 @@ pub fn catalog_for(kind: crate::router::intent::Kind) -> Vec<ToolSpec> {
         Kind::DocumentCreate => &[
             "document.create",
             "document.write",
+            "document.edit",
             "document.open",
             "files.search",
             "memory.query",
@@ -100,6 +103,7 @@ pub fn catalog_for(kind: crate::router::intent::Kind) -> Vec<ToolSpec> {
             "system.diagnose",
             "memory.remember",
             "document.create",
+            "document.edit",
             "document.open",
             "files.reorganize",
         ],
@@ -187,6 +191,33 @@ pub fn catalog() -> Vec<ToolSpec> {
                 "mode": {"type": "string", "enum": ["append", "replace"], "description": "« append » complète (défaut), « replace » remplace tout le contenu"}
             }),
             &["target", "content"],
+            SideEffect::WriteLocal,
+        ),
+        spec(
+            "document.edit",
+            "Retouche un document Word EXISTANT en préservant sa mise en forme, ses images et ses styles. Opérations : mettre en forme des paragraphes (couleur, gras, italique, taille) en visant les titres, le corps, tout, ou ceux qui contiennent un texte ; remplacer un texte ; ajouter un paragraphe ; réserver l'emplacement d'une image que Syn ne sait pas produire.",
+            json!({
+                "target": {"type": "string", "description": "nom ou chemin du document à retoucher"},
+                "operations": {
+                    "type": "array",
+                    "description": "liste d'opérations, appliquées dans l'ordre",
+                    "items": {"type": "object", "properties": {
+                        "op": {"type": "string", "enum": ["format", "replace", "append", "image_placeholder"]},
+                        "scope": {"type": "string", "enum": ["titres", "corps", "tout", "contenant"], "description": "pour « format » : quels paragraphes"},
+                        "contains": {"type": "string", "description": "pour scope « contenant » : le texte à repérer"},
+                        "color": {"type": "string", "description": "couleur hexadécimale sans dièse, ex. 0000FF"},
+                        "bold": {"type": "boolean"},
+                        "italic": {"type": "boolean"},
+                        "size_pt": {"type": "integer"},
+                        "from": {"type": "string", "description": "pour « replace »"},
+                        "to": {"type": "string", "description": "pour « replace »"},
+                        "text": {"type": "string", "description": "pour « append »"},
+                        "heading": {"type": "boolean", "description": "pour « append » : en faire un titre"},
+                        "description": {"type": "string", "description": "pour « image_placeholder » : ce que l'image doit montrer"}
+                    }}
+                }
+            }),
+            &["target", "operations"],
             SideEffect::WriteLocal,
         ),
         spec(
@@ -345,6 +376,85 @@ pub fn catalog() -> Vec<ToolSpec> {
     ]
 }
 
+/// Traduit les opérations décrites par le modèle en opérations de document.
+///
+/// Une opération incomprise est REFUSÉE, jamais approximée : mieux vaut dire
+/// « je n'ai pas su faire » que retoucher un document de travers.
+fn parse_edit_operations(value: &Value) -> Result<Vec<docx_edit::Operation>> {
+    let items = value
+        .as_array()
+        .ok_or_else(|| AppError::Invalid("aucune opération demandée".into()))?;
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let op = item["op"].as_str().unwrap_or_default().to_lowercase();
+        match op.as_str() {
+            "format" => {
+                let target = match item["scope"].as_str().unwrap_or("tout") {
+                    "titres" | "titles" | "headings" => docx_edit::Target::Headings,
+                    "corps" | "body" => docx_edit::Target::Body,
+                    "contenant" | "containing" => docx_edit::Target::Containing(
+                        item["contains"].as_str().unwrap_or_default().to_string(),
+                    ),
+                    _ => docx_edit::Target::All,
+                };
+                out.push(docx_edit::Operation::Format {
+                    target,
+                    formatting: docx_edit::Formatting {
+                        color: item["color"].as_str().map(normalized_color),
+                        bold: item["bold"].as_bool(),
+                        italic: item["italic"].as_bool(),
+                        size_pt: item["size_pt"].as_u64().map(|value| value as u32),
+                    },
+                });
+            }
+            "replace" => out.push(docx_edit::Operation::Replace {
+                from: item["from"].as_str().unwrap_or_default().to_string(),
+                to: item["to"].as_str().unwrap_or_default().to_string(),
+            }),
+            "append" => out.push(docx_edit::Operation::Append {
+                text: item["text"].as_str().unwrap_or_default().to_string(),
+                heading: item["heading"].as_bool().unwrap_or(false),
+            }),
+            "image_placeholder" | "image" => out.push(docx_edit::Operation::ImagePlaceholder {
+                description: item["description"]
+                    .as_str()
+                    .or_else(|| item["text"].as_str())
+                    .unwrap_or("image à insérer")
+                    .to_string(),
+            }),
+            autre => {
+                return Err(AppError::Invalid(format!(
+                    "Je ne sais pas faire « {autre} » sur un document."
+                )))
+            }
+        }
+    }
+    if out.is_empty() {
+        return Err(AppError::Invalid("aucune opération demandée".into()));
+    }
+    Ok(out)
+}
+
+/// Une couleur telle que le modèle peut l'écrire : « #0000FF », « bleu », « blue ».
+fn normalized_color(value: &str) -> String {
+    let brut = value.trim().trim_start_matches('#');
+    if brut.len() == 6 && brut.chars().all(|c| c.is_ascii_hexdigit()) {
+        return brut.to_uppercase();
+    }
+    match crate::db::fold(brut).as_str() {
+        "bleu" | "blue" => "0000FF",
+        "rouge" | "red" => "FF0000",
+        "vert" | "green" => "008000",
+        "noir" | "black" => "000000",
+        "gris" | "gray" | "grey" => "808080",
+        "orange" => "FFA500",
+        "violet" | "purple" => "800080",
+        "jaune" | "yellow" => "FFFF00",
+        _ => "000000",
+    }
+    .to_string()
+}
+
 /// Découpe une référence de message en (fournisseur, identifiant).
 ///
 /// La référence vient de l'interface, donc indirectement d'un contenu indexé :
@@ -407,6 +517,7 @@ pub fn outcome_summary(tool: &str, result: &Value, vouvoie: bool) -> String {
             field("service"),
             field("name")
         ),
+        "document.edit" => field("report"),
         "document.write" => format!("Document {} : {}.", field("mode"), field("path")),
         "calendar.create" => "Événement ajouté à ton agenda.".into(),
         "tasks.create" => "Tâche créée.".into(),
@@ -482,6 +593,13 @@ pub fn preview_for(tool: &str, args: &Value) -> String {
                 s("content").chars().take(500).collect::<String>()
             )
         }
+        "document.edit" => {
+            format!(
+            "Retoucher le document « {} » — {} opération(s), la version précédente est sauvegardée",
+            s("target"),
+            args["operations"].as_array().map(|items| items.len()).unwrap_or(0)
+        )
+        }
         "document.write" => format!(
             "{} le document « {} »\n{}",
             if args["mode"].as_str() == Some("replace") {
@@ -493,11 +611,9 @@ pub fn preview_for(tool: &str, args: &Value) -> String {
             s("content").chars().take(500).collect::<String>()
         ),
         "document.open" => format!("Ouvrir « {} »", s("target")),
-        "people.link_email" => format!(
-            "Retenir que {} utilise l'adresse {}",
-            s("name"),
-            s("email")
-        ),
+        "people.link_email" => {
+            format!("Retenir que {} utilise l'adresse {}", s("name"), s("email"))
+        }
         "memory.remember" => format!("Mémoriser : « {} »", s("fact")),
         _ => format!("{tool} {args}"),
     }
@@ -735,6 +851,30 @@ pub async fn execute(ctx: &ToolCtx, tool: &str, args: &Value) -> Result<ToolResu
             }
         }
 
+        "document.edit" => {
+            let target = args["target"]
+                .as_str()
+                .ok_or_else(|| AppError::Invalid("document cible requis".into()))?;
+            let operations = parse_edit_operations(&args["operations"])?;
+            let (report, undo) = documents::edit_local(&ctx.db, target, &operations)?;
+            crate::security::log_access(&ctx.db, "files", "edit_document", Some(target));
+            if let Some(path) = report["path"].as_str() {
+                crate::connectors::files::index_file(
+                    &ctx.db,
+                    &ctx.llm,
+                    &ctx.bus,
+                    &ctx.settings.embed_model,
+                    std::path::Path::new(path),
+                )
+                .await
+                .ok();
+            }
+            Ok(ToolResult {
+                result: report,
+                undo: Some(undo),
+            })
+        }
+
         "document.write" => {
             let target = args["target"]
                 .as_str()
@@ -770,10 +910,7 @@ pub async fn execute(ctx: &ToolCtx, tool: &str, args: &Value) -> Result<ToolResu
                 .ok_or_else(|| AppError::Invalid("document à ouvrir requis".into()))?;
             let result = documents::open_target(&ctx.db, target)?;
             crate::security::log_access(&ctx.db, "files", "open_document", Some(target));
-            Ok(ToolResult {
-                result,
-                undo: None,
-            })
+            Ok(ToolResult { result, undo: None })
         }
 
         "mail.list" => {
@@ -815,10 +952,7 @@ pub async fn execute(ctx: &ToolCtx, tool: &str, args: &Value) -> Result<ToolResu
             }
             let result = crate::connectors::external::trash_mail(provider, id).await?;
             crate::security::log_access(&ctx.db, provider, "mail.delete", Some(reference));
-            Ok(ToolResult {
-                result,
-                undo: None,
-            })
+            Ok(ToolResult { result, undo: None })
         }
 
         "mail.draft" => {
@@ -1321,10 +1455,7 @@ mod catalogue_tests {
                 restreint.iter().any(|spec| spec.name == indispensable),
                 "{indispensable} manque pour {kind:?}"
             );
-            assert!(
-                restreint.len() < complet,
-                "aucun allègement pour {kind:?}"
-            );
+            assert!(restreint.len() < complet, "aucun allègement pour {kind:?}");
         }
         // Rédiger un mail ne doit pas exposer le rangement de fichiers : moins
         // d'outils, c'est aussi moins d'occasions de se tromper d'outil.
@@ -1362,7 +1493,8 @@ mod compte_rendu_tests {
     /// Un résultat d'outil ne doit jamais atteindre l'utilisateur tel quel.
     #[test]
     fn un_resultat_doutil_devient_une_phrase() {
-        let envoi = json!({"status":"envoyé","subject":"Bonjour","to":"paul@exemple.fr","via":"google"});
+        let envoi =
+            json!({"status":"envoyé","subject":"Bonjour","to":"paul@exemple.fr","via":"google"});
         let phrase = outcome_summary("mail.send", &envoi, false);
         assert_eq!(
             phrase,
@@ -1373,10 +1505,17 @@ mod compte_rendu_tests {
         // La forme d'adresse choisie par l'utilisateur vaut aussi pour les
         // phrases écrites en dur.
         let vouvoye = outcome_summary("mail.send", &envoi, true);
-        assert!(vouvoye.contains("Vous pouvez le retrouver dans vos éléments"), "{vouvoye}");
+        assert!(
+            vouvoye.contains("Vous pouvez le retrouver dans vos éléments"),
+            "{vouvoye}"
+        );
 
         // Un outil sans rendu dédié reste muet sur sa mécanique.
-        let inconnu = outcome_summary("un.outil.futur", &json!({"status":"ok","payload":{"a":1}}), false);
+        let inconnu = outcome_summary(
+            "un.outil.futur",
+            &json!({"status":"ok","payload":{"a":1}}),
+            false,
+        );
         assert_eq!(inconnu, "Action effectuée.");
 
         // Un compte rendu déjà rédigé par l'outil prime.

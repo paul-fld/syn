@@ -371,6 +371,17 @@ pub async fn handle_query_with_context(
         }
     }
 
+    // Les documents confiés à cette conversation entrent dans le contexte de
+    // CHAQUE tour : l'utilisateur les a sous les yeux, il parle de ceux-là.
+    // Les faire dépendre de la recherche reviendrait à remettre au hasard ce
+    // qu'il vient de donner.
+    let joints = crate::tools::attachments::context_fragments(db, session_id)?;
+    for fragment in &joints {
+        let citation = ctx.fragments.len() + 1;
+        ctx.fragments.push((citation, fragment.clone()));
+        ctx.untrusted_text.push_str(fragment);
+    }
+
     // Règles actives injectées dans le comportement.
     let (style_rules, action_modifiers) = crate::rules::active_rule_texts(db)?;
     let mut system =

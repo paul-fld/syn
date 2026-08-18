@@ -456,6 +456,21 @@ pub fn apply_undo(db: &Db, undo: &Value) -> Result<String> {
             )?;
             Ok(format!("Version précédente de {path} restaurée."))
         }
+        // Un document binaire (Word…) ne se restaure pas depuis son texte : la
+        // copie prise avant la retouche est la seule version fidèle.
+        "restore_binary_file" => {
+            let path = undo["path"]
+                .as_str()
+                .ok_or_else(|| AppError::Invalid("chemin manquant".into()))?;
+            let backup = undo["backup"]
+                .as_str()
+                .ok_or_else(|| AppError::Invalid("sauvegarde manquante".into()))?;
+            std::fs::copy(backup, path).map_err(|error| {
+                AppError::Other(format!("restauration impossible : {error}"))
+            })?;
+            let _ = std::fs::remove_file(backup);
+            Ok(format!("Version précédente de {path} restaurée."))
+        }
         _ => Err(AppError::Invalid(
             "cette action ne peut pas être annulée".into(),
         )),

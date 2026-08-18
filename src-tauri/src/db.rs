@@ -42,6 +42,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0010_mail_recipient_source",
         include_str!("../../migrations/0010_mail_recipient_source.sql"),
     ),
+    (
+        "0011_session_documents",
+        include_str!("../../migrations/0011_session_documents.sql"),
+    ),
 ];
 
 /// Normalisation de recherche : minuscules + suppression des diacritiques

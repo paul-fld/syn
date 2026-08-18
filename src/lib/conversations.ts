@@ -20,6 +20,7 @@ import {
   type Answer,
   type Retrieved,
   type ScreenContext,
+  type SessionDocument,
 } from "./ipc";
 import { page, refreshPending, setSessionsVersion } from "./state";
 
@@ -43,6 +44,8 @@ export interface ConvoState {
   /// Un tour resté sans réponse : l'application a été quittée pendant la
   /// réflexion. On le dit, et on propose de relancer.
   interrupted: boolean;
+  /// Les documents confiés à cette conversation.
+  documents: SessionDocument[];
   /// Syn a fini de répondre pendant que l'utilisateur regardait ailleurs. La
   /// réponse attend d'être lue — un anneau qui disparaît sans rien laisser
   /// derrière lui ne se remarque pas.
@@ -57,6 +60,7 @@ const EMPTY: ConvoState = {
   loaded: false,
   interrupted: false,
   unread: false,
+  documents: [],
 };
 
 const [conversations, setConversations] = createStore<Record<string, ConvoState>>({});
@@ -143,6 +147,42 @@ export async function openConversation(id: string): Promise<void> {
   setActiveSession(id);
   markRead(id);
   await loadConversation(id);
+  await loadDocuments(id);
+}
+
+async function loadDocuments(id: string): Promise<void> {
+  ensure(id);
+  const documents = await ipc.sessionDocuments(id).catch(() => null);
+  if (documents) setConversations(id, { documents });
+}
+
+/// Confie un document à la conversation. Syn le lit une fois ; son contenu
+/// entre ensuite dans le contexte de chaque tour, sans dépendre d'une recherche.
+export async function attachDocument(
+  sessionId: string | null,
+  path: string,
+): Promise<SessionDocument | null> {
+  const id = sessionId ?? crypto.randomUUID();
+  ensure(id);
+  setActiveSession((current) => current ?? id);
+  const document = await ipc.attachDocument(id, path);
+  setConversations(
+    id,
+    produce((state) => {
+      state.documents.push(document);
+    }),
+  );
+  return document;
+}
+
+export async function detachDocument(sessionId: string, documentId: string): Promise<void> {
+  await ipc.detachDocument(sessionId, documentId).catch(() => {});
+  setConversations(
+    sessionId,
+    produce((state) => {
+      state.documents = state.documents.filter((document) => document.id !== documentId);
+    }),
+  );
 }
 
 export function startNewConversation(): void {

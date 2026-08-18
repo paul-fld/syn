@@ -88,6 +88,9 @@ pub fn run() {
             ipc::create_project,
             ipc::move_session_to_project,
             ipc::choose_mail_account,
+            ipc::attach_document,
+            ipc::session_documents,
+            ipc::detach_document,
             ipc::get_startup_brief,
             ipc::get_daily_wrap,
             // actions

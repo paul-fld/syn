@@ -153,6 +153,37 @@ pub async fn query(
     crate::router::handle_query_with_context(&core, &sid, &text, screen_context.as_ref()).await
 }
 
+/// Confie un document à une conversation : Syn le lit une fois, et son contenu
+/// suit la conversation à chaque tour.
+#[tauri::command]
+pub fn attach_document(
+    state: State<'_, AppState>,
+    session_id: String,
+    path: String,
+) -> Result<crate::tools::attachments::SessionDocument> {
+    let core = state.core()?;
+    crate::tools::attachments::attach(&core.db, &session_id, std::path::Path::new(&path))
+}
+
+#[tauri::command]
+pub fn session_documents(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<Vec<crate::tools::attachments::SessionDocument>> {
+    let core = state.core()?;
+    crate::tools::attachments::list(&core.db, &session_id)
+}
+
+#[tauri::command]
+pub fn detach_document(
+    state: State<'_, AppState>,
+    session_id: String,
+    document_id: String,
+) -> Result<()> {
+    let core = state.core()?;
+    crate::tools::attachments::detach(&core.db, &session_id, &document_id)
+}
+
 /// Le compte d'envoi choisi d'un clic sur la proposition affichée dans le fil.
 /// Aucun appel au modèle : le choix est un fait, pas une phrase à interpréter.
 #[tauri::command]

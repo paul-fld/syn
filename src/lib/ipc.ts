@@ -95,6 +95,18 @@ export interface Answer {
   degraded: boolean;
 }
 
+export interface SessionDocument {
+  id: string;
+  name: string;
+  path: string;
+  kind: string;
+  mime: string | null;
+  bytes: number;
+  truncated: boolean;
+  words: number;
+  added_at: number;
+}
+
 export interface AccountChoice {
   via: string;
   label: string;
@@ -309,6 +321,12 @@ export const ipc = {
     invoke<void>("move_session_to_project", { sessionId, projectId }),
   chooseMailAccount: (sessionId: string, via: string) =>
     invoke<Answer>("choose_mail_account", { sessionId, via }),
+  attachDocument: (sessionId: string, path: string) =>
+    invoke<SessionDocument>("attach_document", { sessionId, path }),
+  sessionDocuments: (sessionId: string) =>
+    invoke<SessionDocument[]>("session_documents", { sessionId }),
+  detachDocument: (sessionId: string, documentId: string) =>
+    invoke<void>("detach_document", { sessionId, documentId }),
 
   // briefs
   getStartupBrief: () => invoke<Brief>("get_startup_brief"),

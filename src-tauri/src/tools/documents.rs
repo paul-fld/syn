@@ -242,6 +242,26 @@ pub fn locate_local(db: &Db, target: &str) -> Result<PathBuf> {
 /// Contrairement à `write_local`, qui réécrit du texte brut, la mise en forme,
 /// les images et les styles sont préservés : seule la partie principale du
 /// paquet OOXML est modifiée, et uniquement là où une opération s'applique.
+/// Un document Google visé par son nom : Syn ne connaît que ce qu'il a déjà vu
+/// passer (recherche cloud, document créé). On rend l'identifiant du fichier.
+pub fn locate_google(db: &Db, target: &str) -> Result<Option<String>> {
+    let folded = crate::db::fold(target);
+    db.read(|connection| {
+        Ok(connection
+            .query_row(
+                "SELECT source_ref FROM items
+                 WHERE source='cloud' AND status='active'
+                   AND source_ref LIKE 'google:drive:%'
+                   AND syn_fold(COALESCE(title,'')) LIKE '%'||?1||'%'
+                 ORDER BY COALESCE(mtime, ingested_at) DESC LIMIT 1",
+                [&folded],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+            .and_then(|reference| reference.strip_prefix("google:drive:").map(str::to_string)))
+    })
+}
+
 pub fn edit_local(
     db: &Db,
     target: &str,
@@ -261,15 +281,18 @@ pub fn edit_local(
         .and_then(|value| value.to_str())
         .unwrap_or_default()
         .to_lowercase();
-    if extension != "docx" {
-        return Err(AppError::Invalid(format!(
-            "Syn ne sait retoucher en place que les documents Word (.docx). « {} » est un {extension} — \
-             pour un fichier texte, je peux le réécrire ; pour les autres formats, je ne sais pas encore.",
-            path.display()
-        )));
-    }
-
-    let (bytes, report) = super::docx_edit::apply(&path, operations)?;
+    let (bytes, report) = match extension.as_str() {
+        "docx" => super::docx_edit::apply(&path, operations)?,
+        "xlsx" => super::xlsx_edit::apply(&path, operations)?,
+        "pptx" => super::pptx_edit::apply(&path, operations)?,
+        autre => {
+            return Err(AppError::Invalid(format!(
+                "Syn retouche en place les fichiers Word, Excel et PowerPoint. « {} » est un {autre} — \
+                 pour un fichier texte, je peux le réécrire ; pour les autres formats, je ne sais pas encore.",
+                path.display()
+            )))
+        }
+    };
     if report.is_empty() {
         return Err(AppError::Invalid(
             "Aucun passage du document ne correspond à ce que tu demandes. Précise ce qu'il faut viser.".into(),

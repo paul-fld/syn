@@ -5,7 +5,10 @@
 pub mod attachments;
 pub mod documents;
 pub mod docx_edit;
+pub mod ooxml;
+pub mod pptx_edit;
 pub mod reorganize;
+pub mod xlsx_edit;
 
 use crate::bus::Bus;
 use crate::connectors::{calendar, people as people_conn, system as system_conn};
@@ -62,7 +65,13 @@ fn spec(
 pub fn catalog_for(kind: crate::router::intent::Kind) -> Vec<ToolSpec> {
     use crate::router::intent::Kind;
     let retenus: &[&str] = match kind {
-        Kind::MailSearch => &["mail.search", "mail.list", "mail.open", "memory.query"],
+        Kind::MailSearch => &[
+            "mail.search",
+            "mail.list",
+            "mail.open",
+            "mail.attachments",
+            "memory.query",
+        ],
         Kind::MailCompose => &[
             "mail.search",
             "mail.draft",
@@ -247,6 +256,13 @@ pub fn catalog() -> Vec<ToolSpec> {
         spec(
             "mail.open",
             "Affiche le contenu complet d'un message déjà identifié, à partir de sa référence (source_ref).",
+            json!({"source_ref": {"type": "string", "description": "référence du message, de la forme google:mail:… ou microsoft:mail:…"}}),
+            &["source_ref"],
+            SideEffect::Read,
+        ),
+        spec(
+            "mail.attachments",
+            "Importe les pièces jointes d'un message dans la conversation : Syn les télécharge, les lit, et peut ensuite répondre à leur sujet ou les modifier.",
             json!({"source_ref": {"type": "string", "description": "référence du message, de la forme google:mail:… ou microsoft:mail:…"}}),
             &["source_ref"],
             SideEffect::Read,
@@ -502,6 +518,7 @@ pub fn outcome_summary(tool: &str, result: &Value, vouvoie: bool) -> String {
             )
         }
         "mail.draft" => format!("Brouillon enregistré dans {}.", field("saved_in")),
+        "mail.attachments" => field("report"),
         "mail.delete" => pick(
             "Le message est dans la corbeille. Tu peux encore le récupérer depuis ta messagerie.",
             "Le message est dans la corbeille. Vous pouvez encore le récupérer depuis votre messagerie.",
@@ -856,6 +873,30 @@ pub async fn execute(ctx: &ToolCtx, tool: &str, args: &Value) -> Result<ToolResu
                 .as_str()
                 .ok_or_else(|| AppError::Invalid("document cible requis".into()))?;
             let operations = parse_edit_operations(&args["operations"])?;
+            // Un fichier Google se retouche par son API : elle applique des
+            // opérations structurées et préserve le reste elle-même. Aucune
+            // sauvegarde locale n'a de sens — Google conserve l'historique des
+            // versions, et c'est lui qui fait foi.
+            if let Some(file_id) = documents::locate_google(&ctx.db, target)? {
+                let mime = crate::connectors::external::drive_mime(&file_id).await?;
+                if crate::connectors::gsuite::family_of(&mime).is_some() {
+                    let (faits, applique) =
+                        crate::connectors::gsuite::edit(&file_id, &mime, &operations).await?;
+                    crate::security::log_access(&ctx.db, "google", "edit_document", Some(target));
+                    if !applique {
+                        return Err(AppError::Invalid(
+                            "Aucun passage de ce document ne correspond à ce que tu demandes."
+                                .into(),
+                        ));
+                    }
+                    return Ok(ToolResult {
+                        result: json!({
+                            "report": format!("« {target} » retouché chez Google : {faits}. L'historique des versions de Google garde l'état précédent."),
+                        }),
+                        undo: None,
+                    });
+                }
+            }
             let (report, undo) = documents::edit_local(&ctx.db, target, &operations)?;
             crate::security::log_access(&ctx.db, "files", "edit_document", Some(target));
             if let Some(path) = report["path"].as_str() {
@@ -930,6 +971,47 @@ pub async fn execute(ctx: &ToolCtx, tool: &str, args: &Value) -> Result<ToolResu
             crate::security::log_access(&ctx.db, "mail", "list", None);
             Ok(ToolResult {
                 result: json!({"messages": messages}),
+                undo: None,
+            })
+        }
+
+        "mail.attachments" => {
+            let reference = args["source_ref"].as_str().unwrap_or("").trim();
+            let (provider, id) = split_mail_ref(reference)?;
+            if !crate::connectors::is_connected(&ctx.db, provider) {
+                return Err(AppError::Security(format!(
+                    "Le connecteur {provider} n’est pas synchronisé."
+                )));
+            }
+            let fichiers = crate::connectors::external::download_attachments(provider, id).await?;
+            if fichiers.is_empty() {
+                return Ok(ToolResult {
+                    result: json!({"report": "Ce message ne contient aucune pièce jointe."}),
+                    undo: None,
+                });
+            }
+            // Chaque pièce jointe devient un document de la conversation : Syn
+            // la lit une fois, et peut ensuite répondre à son sujet.
+            let session = args["_syn_session"].as_str().unwrap_or_default();
+            let mut noms = Vec::new();
+            for chemin in &fichiers {
+                if !session.is_empty() {
+                    attachments::attach(&ctx.db, session, chemin)?;
+                }
+                noms.push(
+                    chemin
+                        .file_name()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or("pièce jointe")
+                        .to_string(),
+                );
+            }
+            crate::security::log_access(&ctx.db, provider, "mail.attachments", Some(reference));
+            Ok(ToolResult {
+                result: json!({
+                    "report": format!("{} pièce(s) jointe(s) importée(s) : {}. Je peux maintenant répondre à leur sujet ou les modifier.", noms.len(), noms.join(", ")),
+                    "fichiers": noms,
+                }),
                 undo: None,
             })
         }

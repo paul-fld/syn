@@ -36,7 +36,7 @@ pub fn classify(tool: &str, args: &Value) -> RiskClass {
         // Lectures
         "memory.query" | "files.search" | "mail.search" | "cloud.search" | "calendar.list" | "tasks.list"
         | "commitments.list" | "people.context" | "people.resolve_email" | "photos.search"
-        | "mail.list" | "mail.open"
+        | "mail.list" | "mail.open" | "mail.attachments"
         | "system.diagnose"
         | "document.open" /* affiche un document déjà connu : ne modifie rien */
         | "files.reorganize" /* dry-run : produit un PLAN, ne déplace rien */ => RiskClass::Read,

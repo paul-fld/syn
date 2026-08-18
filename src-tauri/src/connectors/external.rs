@@ -1091,7 +1091,10 @@ async fn live_google_mail(query: &str, token: &str) -> Result<Vec<Value>> {
             token,
         )
         .await?;
-        if list["messages"].as_array().is_some_and(|found| !found.is_empty()) {
+        if list["messages"]
+            .as_array()
+            .is_some_and(|found| !found.is_empty())
+        {
             break;
         }
     }
@@ -1514,7 +1517,11 @@ pub async fn remember_live_result(
             format!("Objet : {title}\nMessagerie : {boite}\n\n{snippet}"),
         )
     } else {
-        let emplacement = if microsoft { "OneDrive" } else { "Google Drive" };
+        let emplacement = if microsoft {
+            "OneDrive"
+        } else {
+            "Google Drive"
+        };
         (
             "cloud",
             "document",
@@ -1570,7 +1577,9 @@ pub async fn create_document(provider: &str, title: &str, content: &str) -> Resu
         let status = response.status();
         let value: Value = response.json().await?;
         if !status.is_success() {
-            return Err(AppError::Other(format!("API Google Drive {status} : {value}")));
+            return Err(AppError::Other(format!(
+                "API Google Drive {status} : {value}"
+            )));
         }
         let id = value["id"].as_str().unwrap_or_default().to_string();
         return Ok(json!({
@@ -1635,6 +1644,127 @@ pub async fn create_document(provider: &str, title: &str, content: &str) -> Resu
         "url": final_item["webUrl"].as_str().or_else(|| item["webUrl"].as_str()),
         "source_ref": format!("microsoft:drive:{id}"),
     }))
+}
+
+/// Le type MIME d'un fichier Drive : c'est lui qui dit si c'est un Doc, une
+/// feuille ou une présentation, et donc quelle API sait le modifier.
+pub async fn drive_mime(file_id: &str) -> Result<String> {
+    let token = super::oauth::access_token("google").await?;
+    let client = reqwest::Client::new();
+    let value = get_json(
+        &client,
+        &format!("https://www.googleapis.com/drive/v3/files/{file_id}?fields=mimeType,name&supportsAllDrives=true"),
+        &token,
+    )
+    .await?;
+    Ok(value["mimeType"].as_str().unwrap_or_default().to_string())
+}
+
+/// Les pièces jointes d'un message, téléchargées sur la machine pour que Syn
+/// puisse les lire comme n'importe quel document.
+pub async fn download_attachments(
+    provider: &str,
+    message_id: &str,
+) -> Result<Vec<std::path::PathBuf>> {
+    let token = super::oauth::access_token(provider).await?;
+    let client = reqwest::Client::new();
+    let dossier = dirs::download_dir()
+        .or_else(dirs::home_dir)
+        .ok_or_else(|| AppError::Other("dossier de téléchargement introuvable".into()))?
+        .join("Syn — pièces jointes");
+    std::fs::create_dir_all(&dossier)
+        .map_err(|error| AppError::Other(format!("dossier impossible à créer : {error}")))?;
+
+    let mut fichiers = Vec::new();
+    if provider == "google" {
+        let message = get_json(
+            &client,
+            &format!(
+                "https://gmail.googleapis.com/gmail/v1/users/me/messages/{message_id}?format=full"
+            ),
+            &token,
+        )
+        .await?;
+        for (nom, attachment_id) in gmail_attachment_parts(&message["payload"]) {
+            let part = get_json(
+                &client,
+                &format!("https://gmail.googleapis.com/gmail/v1/users/me/messages/{message_id}/attachments/{attachment_id}"),
+                &token,
+            )
+            .await?;
+            let data = part["data"].as_str().unwrap_or_default();
+            let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(
+                    data.replace('-', "+")
+                        .replace('_', "/")
+                        .trim_end_matches('='),
+                )
+                .or_else(|_| base64::engine::general_purpose::STANDARD.decode(data))
+                .map_err(|_| AppError::Other("pièce jointe illisible".into()))?;
+            let chemin =
+                crate::tools::reorganize::unique_destination(dossier.join(safe_name(&nom)));
+            std::fs::write(&chemin, &bytes)
+                .map_err(|error| AppError::Other(format!("écriture impossible : {error}")))?;
+            fichiers.push(chemin);
+        }
+        return Ok(fichiers);
+    }
+
+    let liste = get_json(
+        &client,
+        &format!("https://graph.microsoft.com/v1.0/me/messages/{message_id}/attachments"),
+        &token,
+    )
+    .await?;
+    for attachment in liste["value"].as_array().cloned().unwrap_or_default() {
+        let Some(nom) = attachment["name"].as_str() else {
+            continue;
+        };
+        let Some(data) = attachment["contentBytes"].as_str() else {
+            continue;
+        };
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .map_err(|_| AppError::Other("pièce jointe illisible".into()))?;
+        let chemin = crate::tools::reorganize::unique_destination(dossier.join(safe_name(nom)));
+        std::fs::write(&chemin, &bytes)
+            .map_err(|error| AppError::Other(format!("écriture impossible : {error}")))?;
+        fichiers.push(chemin);
+    }
+    Ok(fichiers)
+}
+
+/// Parcourt l'arbre des parties d'un message Gmail et rend (nom, identifiant)
+/// pour chaque pièce jointe réelle.
+fn gmail_attachment_parts(payload: &Value) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut pile = vec![payload.clone()];
+    while let Some(part) = pile.pop() {
+        if let Some(parts) = part["parts"].as_array() {
+            pile.extend(parts.iter().cloned());
+        }
+        let nom = part["filename"].as_str().unwrap_or_default();
+        let id = part["body"]["attachmentId"].as_str().unwrap_or_default();
+        if !nom.is_empty() && !id.is_empty() {
+            out.push((nom.to_string(), id.to_string()));
+        }
+    }
+    out
+}
+
+/// Un nom de fichier venu d'un mail est du contenu non fiable : il ne doit pas
+/// pouvoir désigner un autre dossier.
+fn safe_name(nom: &str) -> String {
+    let base = nom.rsplit(['/', '\\']).next().unwrap_or("piece-jointe");
+    let nettoye: String = base
+        .chars()
+        .map(|c| if c.is_control() || c == ':' { '_' } else { c })
+        .collect();
+    if nettoye.trim().is_empty() || nettoye.starts_with('.') {
+        format!("piece-jointe{nettoye}")
+    } else {
+        nettoye
+    }
 }
 
 /// Les derniers messages d'une boîte, sans requête de recherche.
@@ -1729,7 +1859,9 @@ pub async fn read_mail(provider: &str, id: &str) -> Result<Value> {
     )
     .await?;
     let mut resume = ms_summary(&value).unwrap_or_else(|| json!({}));
-    resume["body"] = json!(strip_html(value["body"]["content"].as_str().unwrap_or_default()));
+    resume["body"] = json!(strip_html(
+        value["body"]["content"].as_str().unwrap_or_default()
+    ));
     Ok(resume)
 }
 
@@ -1947,7 +2079,9 @@ mod tests {
         // `name contains 'Vie'` ne matche qu'un préfixe côté Drive : il ne doit
         // plus être la seule prise sur « Le Jeu de la Vie 2.0 ».
         assert!(
-            !filters.iter().any(|filter| filter.contains("contains 'Vie'")),
+            !filters
+                .iter()
+                .any(|filter| filter.contains("contains 'Vie'")),
             "{filters:?}"
         );
         // Le repli conjonctif reste borné aux mots porteurs de sens.
@@ -2073,7 +2207,8 @@ mod tests {
         assert!(filtres[2].contains("'\"rapport\"' or "), "{filtres:?}");
 
         // Demande longue : l'expression exacte est sautée, on part des termes.
-        let bavarde = google_drive_filters("cherche le rapport de stage de Maxime dans mon OneDrive");
+        let bavarde =
+            google_drive_filters("cherche le rapport de stage de Maxime dans mon OneDrive");
         assert_eq!(bavarde.len(), 2, "{bavarde:?}");
         assert!(bavarde[0].contains("'\"rapport\"' and "), "{bavarde:?}");
 
@@ -2086,6 +2221,9 @@ mod tests {
             !bavard[0].contains("Tu peux me ressortir"),
             "la phrase entière ne doit pas être cherchée comme titre : {bavard:?}"
         );
-        assert!(bavard[0].contains("'\"Jeu\"' and fullText contains '\"Vie\"'"), "{bavard:?}");
+        assert!(
+            bavard[0].contains("'\"Jeu\"' and fullText contains '\"Vie\"'"),
+            "{bavard:?}"
+        );
     }
 }

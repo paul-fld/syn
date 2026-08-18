@@ -552,6 +552,12 @@ pub async fn handle_query_with_context(
             // le modèle n'a plus besoin de se souvenir de tout, et l'utilisateur
             // n'a plus à répéter ce qu'il a déjà dit.
             let mut verified_arguments = call.arguments.clone();
+            // Certains outils rangent leur résultat DANS la conversation (une
+            // pièce jointe importée en devient un document) : ils ont besoin de
+            // savoir laquelle.
+            if call.name == "mail.attachments" {
+                verified_arguments["_syn_session"] = json!(session_id);
+            }
             if matches!(call.name.as_str(), "mail.send" | "mail.draft") {
                 let known =
                     crate::connectors::mail::remember_composition(db, session_id, &call.arguments)?;

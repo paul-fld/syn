@@ -4,6 +4,7 @@
 pub mod calendar;
 pub mod external;
 pub mod files;
+pub mod gsuite;
 pub mod mail;
 pub mod messages;
 pub mod native;

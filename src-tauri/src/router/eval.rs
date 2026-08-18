@@ -65,14 +65,44 @@ pub const TURNS: &[TurnCase] = {
     &[
         // ——— Accords, dans des formes qui n'ont pas de mot commun ———
         turn(DraftReview, "Oui", Accord, "accord minimal"),
-        turn(DraftReview, "c'est parfait, envoie", Accord, "accord + ordre d'envoi"),
+        turn(
+            DraftReview,
+            "c'est parfait, envoie",
+            Accord,
+            "accord + ordre d'envoi",
+        ),
         turn(DraftReview, "ça me va 👍", Accord, "emoji comme validation"),
-        turn(DraftReview, "nickel", Accord, "registre familier, aucun mot d'accord"),
-        turn(DraftReview, "impec, tu peux y aller", Accord, "élision et familiarité"),
-        turn(DraftReview, "va pour celui-là", Accord, "tournure indirecte"),
+        turn(
+            DraftReview,
+            "nickel",
+            Accord,
+            "registre familier, aucun mot d'accord",
+        ),
+        turn(
+            DraftReview,
+            "impec, tu peux y aller",
+            Accord,
+            "élision et familiarité",
+        ),
+        turn(
+            DraftReview,
+            "va pour celui-là",
+            Accord,
+            "tournure indirecte",
+        ),
         turn(DraftReview, "yes, send it", Accord, "anglais"),
-        turn(DraftReview, "aucune remarque", Accord, "accord exprimé par l'absence d'objection"),
-        turn(DraftReview, "c'est très bien comme ça", Accord, "accord développé"),
+        turn(
+            DraftReview,
+            "aucune remarque",
+            Accord,
+            "accord exprimé par l'absence d'objection",
+        ),
+        turn(
+            DraftReview,
+            "c'est très bien comme ça",
+            Accord,
+            "accord développé",
+        ),
         // ——— Corrections : elles contiennent souvent des mots d'accord ———
         turn(
             DraftReview,
@@ -80,21 +110,76 @@ pub const TURNS: &[TurnCase] = {
             Correction,
             "« d'accord » à l'intérieur d'une consigne de rédaction",
         ),
-        turn(DraftReview, "oui mais fais plus court", Correction, "commence par oui"),
-        turn(DraftReview, "enlève la dernière phrase", Correction, "retrait demandé"),
-        turn(DraftReview, "ajoute que je passerai samedi", Correction, "ajout demandé"),
-        turn(DraftReview, "trop formel", Correction, "jugement sans verbe"),
+        turn(
+            DraftReview,
+            "oui mais fais plus court",
+            Correction,
+            "commence par oui",
+        ),
+        turn(
+            DraftReview,
+            "enlève la dernière phrase",
+            Correction,
+            "retrait demandé",
+        ),
+        turn(
+            DraftReview,
+            "ajoute que je passerai samedi",
+            Correction,
+            "ajout demandé",
+        ),
+        turn(
+            DraftReview,
+            "trop formel",
+            Correction,
+            "jugement sans verbe",
+        ),
         turn(DraftReview, "tutoie-le", Correction, "consigne de ton"),
-        turn(DraftReview, "il manque l'heure du rendez-vous", Correction, "manque signalé"),
+        turn(
+            DraftReview,
+            "il manque l'heure du rendez-vous",
+            Correction,
+            "manque signalé",
+        ),
         turn(DraftReview, "make it shorter", Correction, "anglais"),
-        turn(DraftReview, "attends, je réfléchis", Correction, "ni accord ni consigne : rien ne part"),
+        turn(
+            DraftReview,
+            "attends, je réfléchis",
+            Correction,
+            "ni accord ni consigne : rien ne part",
+        ),
         // ——— Le compte d'envoi, nommé de plusieurs façons ———
         turn(AccountChoice, "gmail", Compte("google"), "nom de service"),
-        turn(AccountChoice, "avec mon compte Google", Compte("google"), "nom d'éditeur"),
-        turn(AccountChoice, "Outlook", Compte("microsoft"), "nom de service"),
-        turn(AccountChoice, "depuis ma boîte pro Microsoft", Compte("microsoft"), "périphrase"),
-        turn(AccountChoice, "Apple Mail stp", Compte("apple"), "application native"),
-        turn(AccountChoice, "celui de Google", Compte("google"), "désignation indirecte"),
+        turn(
+            AccountChoice,
+            "avec mon compte Google",
+            Compte("google"),
+            "nom d'éditeur",
+        ),
+        turn(
+            AccountChoice,
+            "Outlook",
+            Compte("microsoft"),
+            "nom de service",
+        ),
+        turn(
+            AccountChoice,
+            "depuis ma boîte pro Microsoft",
+            Compte("microsoft"),
+            "périphrase",
+        ),
+        turn(
+            AccountChoice,
+            "Apple Mail stp",
+            Compte("apple"),
+            "application native",
+        ),
+        turn(
+            AccountChoice,
+            "celui de Google",
+            Compte("google"),
+            "désignation indirecte",
+        ),
         // ——— Autre chose : l'étape n'est pas la réponse ———
         turn(
             DraftReview,
@@ -102,21 +187,90 @@ pub const TURNS: &[TurnCase] = {
             Autre,
             "changement de sujet en plein parcours",
         ),
-        turn(DraftReview, "il fait quel temps demain ?", Autre, "question sans rapport"),
-        turn(AccountChoice, "en fait annule, je le ferai moi-même", Autre, "abandon"),
-        turn(AccountChoice, "c'est quoi la différence entre les deux ?", Autre, "question sur le choix"),
-        turn(DraftReview, "à qui tu l'envoies déjà ?", Autre, "question sur l'état, pas une réponse"),
+        turn(
+            DraftReview,
+            "il fait quel temps demain ?",
+            Autre,
+            "question sans rapport",
+        ),
+        turn(
+            AccountChoice,
+            "en fait annule, je le ferai moi-même",
+            Autre,
+            "abandon",
+        ),
+        turn(
+            AccountChoice,
+            "c'est quoi la différence entre les deux ?",
+            Autre,
+            "question sur le choix",
+        ),
+        turn(
+            DraftReview,
+            "à qui tu l'envoies déjà ?",
+            Autre,
+            "question sur l'état, pas une réponse",
+        ),
         // ——— Confirmer un envoi déjà préparé : le geste le plus conséquent ———
-        turn(SendConfirmation, "oui envoie", Accord, "consentement direct"),
-        turn(SendConfirmation, "c'est parti", Accord, "consentement idiomatique"),
+        turn(
+            SendConfirmation,
+            "oui envoie",
+            Accord,
+            "consentement direct",
+        ),
+        turn(
+            SendConfirmation,
+            "c'est parti",
+            Accord,
+            "consentement idiomatique",
+        ),
         turn(
             SendConfirmation,
             "tu peux envoyer un courriel à Julie pour lui dire que je serai en retard ?",
             Autre,
             "demande NEUVE qui commence comme un accord : ne doit pas envoyer le mail préparé",
         ),
-        turn(SendConfirmation, "attends, je relis", Autre, "temporisation"),
-        turn(SendConfirmation, "non finalement laisse tomber", Autre, "refus"),
+        turn(
+            SendConfirmation,
+            "attends, je relis",
+            Autre,
+            "temporisation",
+        ),
+        turn(
+            SendConfirmation,
+            "non finalement laisse tomber",
+            Autre,
+            "refus",
+        ),
+    ]
+};
+
+/// Ce que l'utilisateur veut faire des messages, pour les mêmes raisons que le
+/// reste : mesurer plutôt que supposer. Aucune de ces formulations ne figure
+/// dans le calibrage du modèle.
+pub const MAIL_ACTIONS: &[(&str, super::intent::MailAction)] = {
+    use super::intent::MailAction::{Afficher, Lister, Retrouver, Supprimer};
+    &[
+        ("montre-moi mes derniers mails", Lister),
+        ("j'ai des non-lus ?", Lister),
+        ("qu'est-ce qui est arrivé dans ma boîte ce matin ?", Lister),
+        ("retrouve le mail de Liverpool sur mes billets", Retrouver),
+        ("où est passé le message du syndic ?", Retrouver),
+        ("le mail d'Orange avec la facture, tu l'as ?", Retrouver),
+        ("affiche-moi le message de la CAF", Afficher),
+        ("lis-moi celui de ma banque", Afficher),
+        ("ouvre le dernier mail de Marie", Afficher),
+        ("supprime la newsletter Decathlon", Supprimer),
+        ("vire ce spam de ma boîte", Supprimer),
+        ("mets le mail de relance à la corbeille", Supprimer),
+        // ——— Sans le verbe attendu : c'est là que la mesure devient utile ———
+        ("j'ai quoi de neuf dans ma messagerie ?", Lister),
+        ("quoi de nouveau côté mails ?", Lister),
+        ("qu'est-ce que Marie m'a écrit ?", Afficher),
+        ("que dit le mail d'EDF ?", Afficher),
+        ("fais disparaître ce mail de pub", Supprimer),
+        ("débarrasse-moi de ces messages promotionnels", Supprimer),
+        ("il est passé où le mail de confirmation SNCF ?", Retrouver),
     ]
 };
 
@@ -159,6 +313,27 @@ pub const CORPUS: &[Case] = &[
         Route::MailSearch,
         "une facture reçue par mail n'est pas un document rangé",
     ),
+    // ——— Les autres gestes sur les messages : voir, lire, jeter ———
+    case(
+        "montre-moi mes derniers mails",
+        Route::MailSearch,
+        "consulter sa boîte, sans rien chercher de précis",
+    ),
+    case(
+        "j'ai des non-lus ?",
+        Route::MailSearch,
+        "aucun verbe, aucune mention de messagerie",
+    ),
+    case(
+        "supprime le mail de la newsletter Décathlon",
+        Route::MailSearch,
+        "geste destructeur sur un message",
+    ),
+    case(
+        "affiche-moi le message de la CAF",
+        Route::MailSearch,
+        "lire le contenu d'un message précis",
+    ),
     // ——— Recherche documentaire, français, sans verbe de recherche ———
     case(
         "Le Jeu de la Vie, tu l'as quelque part ?",
@@ -195,11 +370,7 @@ pub const CORPUS: &[Case] = &[
         Route::FileSearch,
         "verbe attendu — cas facile de contrôle",
     ),
-    case(
-        "mon bail",
-        Route::FileSearch,
-        "télégraphique, deux mots",
-    ),
+    case("mon bail", Route::FileSearch, "télégraphique, deux mots"),
     case(
         "faudrait que je relise le rapport Ducasse avant demain",
         Route::FileSearch,
@@ -341,11 +512,7 @@ pub const CORPUS: &[Case] = &[
         Route::Conversation,
         "question de culture générale, même sujet qu'une recherche",
     ),
-    case(
-        "merci, c'est parfait",
-        Route::Conversation,
-        "clôture",
-    ),
+    case("merci, c'est parfait", Route::Conversation, "clôture"),
     case(
         "tu penses que c'est une bonne idée ?",
         Route::Conversation,
@@ -370,29 +537,113 @@ pub const CORPUS: &[Case] = &[
 /// mesure donc aussi ce que le réglage lui a appris. Celui-ci mesure ce que Syn
 /// comprend d'une demande qu'aucune étape de conception n'a vue.
 pub const VALIDATION: &[Case] = &[
-    case("le PV d'assemblée générale, il est passé où", Route::FileSearch, "sigle, dislocation"),
-    case("j'arrive plus à mettre la main sur mon relevé de notes", Route::FileSearch, "périphrase"),
-    case("t'aurais pas gardé la notice du lave-vaisselle ?", Route::FileSearch, "élision familière"),
-    case("Kannst du die Rechnung von März finden?", Route::FileSearch, "allemand : troisième langue"),
-    case("show me last year's tax return", Route::FileSearch, "anglais impératif"),
-    case("la clause de non-concurrence est dans le contrat signé", Route::FileSearch, "affirmation qui présuppose la recherche"),
-    case("il est sur Sharepoint le référentiel qualité", Route::FileSearchMicrosoft, "fournisseur en fin de phrase"),
-    case("va voir dans Google Sheets le suivi des heures", Route::FileSearchGoogle, "fournisseur nommé"),
-    case("uniquement ce qui est stocké sur la machine", Route::FileSearchLocal, "portée locale sans nom de fichier"),
-    case("signale à Nadia que le colis est arrivé", Route::MailCompose, "acte de parole, destinataire"),
-    case("faut que je décline l'invitation de M. Perrin", Route::MailCompose, "intention rapportée"),
-    case("apologise to the client for the delay", Route::MailCompose, "anglais, acte de parole"),
-    case("l'écran scintille par moments", Route::DeviceDiagnostic, "symptôme matériel inédit"),
-    case("mon disque est plein à ras bord", Route::DeviceDiagnostic, "expression imagée"),
-    case("is the battery holding up?", Route::DeviceDiagnostic, "anglais familier"),
-    case("prépare-moi un modèle de lettre de résiliation", Route::DocumentCreate, "production"),
-    case("il me faudrait un pense-bête avec ces trois points", Route::DocumentCreate, "production, mot rare"),
-    case("turn this into a proper memo", Route::DocumentCreate, "anglais, transformation"),
-    case("qu'est-ce qu'une clause de non-concurrence ?", Route::Conversation, "savoir, sujet identique à un cas de recherche"),
+    case(
+        "le PV d'assemblée générale, il est passé où",
+        Route::FileSearch,
+        "sigle, dislocation",
+    ),
+    case(
+        "j'arrive plus à mettre la main sur mon relevé de notes",
+        Route::FileSearch,
+        "périphrase",
+    ),
+    case(
+        "t'aurais pas gardé la notice du lave-vaisselle ?",
+        Route::FileSearch,
+        "élision familière",
+    ),
+    case(
+        "Kannst du die Rechnung von März finden?",
+        Route::FileSearch,
+        "allemand : troisième langue",
+    ),
+    case(
+        "show me last year's tax return",
+        Route::FileSearch,
+        "anglais impératif",
+    ),
+    case(
+        "la clause de non-concurrence est dans le contrat signé",
+        Route::FileSearch,
+        "affirmation qui présuppose la recherche",
+    ),
+    case(
+        "il est sur Sharepoint le référentiel qualité",
+        Route::FileSearchMicrosoft,
+        "fournisseur en fin de phrase",
+    ),
+    case(
+        "va voir dans Google Sheets le suivi des heures",
+        Route::FileSearchGoogle,
+        "fournisseur nommé",
+    ),
+    case(
+        "uniquement ce qui est stocké sur la machine",
+        Route::FileSearchLocal,
+        "portée locale sans nom de fichier",
+    ),
+    case(
+        "signale à Nadia que le colis est arrivé",
+        Route::MailCompose,
+        "acte de parole, destinataire",
+    ),
+    case(
+        "faut que je décline l'invitation de M. Perrin",
+        Route::MailCompose,
+        "intention rapportée",
+    ),
+    case(
+        "apologise to the client for the delay",
+        Route::MailCompose,
+        "anglais, acte de parole",
+    ),
+    case(
+        "l'écran scintille par moments",
+        Route::DeviceDiagnostic,
+        "symptôme matériel inédit",
+    ),
+    case(
+        "mon disque est plein à ras bord",
+        Route::DeviceDiagnostic,
+        "expression imagée",
+    ),
+    case(
+        "is the battery holding up?",
+        Route::DeviceDiagnostic,
+        "anglais familier",
+    ),
+    case(
+        "prépare-moi un modèle de lettre de résiliation",
+        Route::DocumentCreate,
+        "production",
+    ),
+    case(
+        "il me faudrait un pense-bête avec ces trois points",
+        Route::DocumentCreate,
+        "production, mot rare",
+    ),
+    case(
+        "turn this into a proper memo",
+        Route::DocumentCreate,
+        "anglais, transformation",
+    ),
+    case(
+        "qu'est-ce qu'une clause de non-concurrence ?",
+        Route::Conversation,
+        "savoir, sujet identique à un cas de recherche",
+    ),
     case("t'es sûr de toi là ?", Route::Conversation, "mise en doute"),
     case("bon, on verra demain", Route::Conversation, "clôture floue"),
-    case("how do you store my data?", Route::Conversation, "méta, anglais"),
-    case("resume ce qu'on a dit", Route::Conversation, "résumé oral, pas de fichier demandé"),
+    case(
+        "how do you store my data?",
+        Route::Conversation,
+        "méta, anglais",
+    ),
+    case(
+        "resume ce qu'on a dit",
+        Route::Conversation,
+        "résumé oral, pas de fichier demandé",
+    ),
 ];
 
 /// Suites d'échanges : chaque cas est une conversation, et c'est le DERNIER

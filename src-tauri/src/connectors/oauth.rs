@@ -337,7 +337,11 @@ async fn start_pkce(
             // `drive.file` n'ouvre l'écriture QUE sur les documents créés par Syn :
             // la lecture reste en `drive.readonly`, Syn ne peut pas réécrire un
             // document existant de l'utilisateur.
-            "openid email profile https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/calendar https://www.googleapis.com/auth/drive.readonly https://www.googleapis.com/auth/drive.file",
+            // `gmail.modify` est requis pour mettre un message à la corbeille :
+            // Google n'offre pas de portée plus étroite pour ce geste. Elle
+            // ouvre donc plus que la suppression — c'est le prix demandé par le
+            // fournisseur, à connaître avant de l'accorder.
+            "openid email profile https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/calendar https://www.googleapis.com/auth/drive.readonly https://www.googleapis.com/auth/drive.file",
             "&access_type=offline&prompt=consent",
         )
     } else {
@@ -345,7 +349,7 @@ async fn start_pkce(
             "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
             // `Sites.Read.All` est ce qui rend SharePoint et les fichiers partagés
             // visibles ; `Files.ReadWrite.All` permet de déposer un document.
-            "openid profile email offline_access User.Read Mail.Read Mail.Send Calendars.ReadWrite Files.ReadWrite.All Sites.Read.All",
+            "openid profile email offline_access User.Read Mail.Read Mail.ReadWrite Mail.Send Calendars.ReadWrite Files.ReadWrite.All Sites.Read.All",
             "",
         )
     };

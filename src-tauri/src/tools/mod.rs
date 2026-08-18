@@ -60,7 +60,7 @@ fn spec(
 pub fn catalog_for(kind: crate::router::intent::Kind) -> Vec<ToolSpec> {
     use crate::router::intent::Kind;
     let retenus: &[&str] = match kind {
-        Kind::MailSearch => &["mail.search", "memory.query"],
+        Kind::MailSearch => &["mail.search", "mail.list", "mail.open", "memory.query"],
         Kind::MailCompose => &[
             "mail.search",
             "mail.draft",
@@ -204,6 +204,30 @@ pub fn catalog() -> Vec<ToolSpec> {
             SideEffect::Read,
         ),
         spec(
+            "mail.list",
+            "Liste les derniers messages reçus, ou seulement les non lus. À utiliser quand l'utilisateur veut VOIR sa boîte, sans rien chercher de précis.",
+            json!({
+                "unread_only": {"type": "boolean", "description": "ne garder que les messages non lus"},
+                "limit": {"type": "integer", "description": "nombre de messages, 10 par défaut"}
+            }),
+            &[],
+            SideEffect::Read,
+        ),
+        spec(
+            "mail.open",
+            "Affiche le contenu complet d'un message déjà identifié, à partir de sa référence (source_ref).",
+            json!({"source_ref": {"type": "string", "description": "référence du message, de la forme google:mail:… ou microsoft:mail:…"}}),
+            &["source_ref"],
+            SideEffect::Read,
+        ),
+        spec(
+            "mail.delete",
+            "Met un message à la corbeille de sa messagerie. Réversible : le message reste récupérable chez le fournisseur.",
+            json!({"source_ref": {"type": "string", "description": "référence du message à mettre à la corbeille"}}),
+            &["source_ref"],
+            SideEffect::WriteExternal,
+        ),
+        spec(
             "mail.draft",
             "Prépare un BROUILLON de mail (local, rien n'est envoyé).",
             json!({
@@ -321,6 +345,25 @@ pub fn catalog() -> Vec<ToolSpec> {
     ]
 }
 
+/// Découpe une référence de message en (fournisseur, identifiant).
+///
+/// La référence vient de l'interface, donc indirectement d'un contenu indexé :
+/// on ne lui fait pas confiance sur parole, on vérifie sa forme.
+fn split_mail_ref(reference: &str) -> Result<(&'static str, &str)> {
+    let (prefixe, id) = reference
+        .split_once(":mail:")
+        .ok_or_else(|| AppError::Invalid("référence de message invalide".into()))?;
+    let provider = match prefixe {
+        "google" => "google",
+        "microsoft" => "microsoft",
+        _ => return Err(AppError::Invalid("messagerie inconnue".into())),
+    };
+    if id.trim().is_empty() || id.contains('/') {
+        return Err(AppError::Invalid("identifiant de message invalide".into()));
+    }
+    Ok((provider, id))
+}
+
 /// Compte rendu lisible d'une action exécutée.
 ///
 /// Sans lui, l'interface affichait le résultat BRUT de l'outil dans la
@@ -349,6 +392,11 @@ pub fn outcome_summary(tool: &str, result: &Value, vouvoie: bool) -> String {
             )
         }
         "mail.draft" => format!("Brouillon enregistré dans {}.", field("saved_in")),
+        "mail.delete" => pick(
+            "Le message est dans la corbeille. Tu peux encore le récupérer depuis ta messagerie.",
+            "Le message est dans la corbeille. Vous pouvez encore le récupérer depuis votre messagerie.",
+        )
+        .to_string(),
         "people.link_email" => format!(
             "C'est retenu : {} utilise l'adresse {}.",
             field("name"),
@@ -390,6 +438,10 @@ pub fn preview_for(tool: &str, args: &Value) -> String {
             },
             s("subject"),
             s("body").chars().take(500).collect::<String>()
+        ),
+        "mail.delete" => format!(
+            "Mettre à la corbeille le message {} (récupérable chez le fournisseur)",
+            s("source_ref")
         ),
         "mail.draft" => format!(
             "Créer un brouillon pour {} — objet : « {} »",
@@ -718,6 +770,51 @@ pub async fn execute(ctx: &ToolCtx, tool: &str, args: &Value) -> Result<ToolResu
                 .ok_or_else(|| AppError::Invalid("document à ouvrir requis".into()))?;
             let result = documents::open_target(&ctx.db, target)?;
             crate::security::log_access(&ctx.db, "files", "open_document", Some(target));
+            Ok(ToolResult {
+                result,
+                undo: None,
+            })
+        }
+
+        "mail.list" => {
+            let unread = args["unread_only"].as_bool().unwrap_or(false);
+            let limit = args["limit"].as_u64().unwrap_or(10) as usize;
+            let mut messages = Vec::new();
+            for (provider, _) in crate::connectors::mail::available_channels(&ctx.db) {
+                if provider == "apple" {
+                    continue;
+                }
+                if let Ok(found) =
+                    crate::connectors::external::list_mail(provider, unread, limit).await
+                {
+                    messages.extend(found);
+                }
+            }
+            crate::security::log_access(&ctx.db, "mail", "list", None);
+            Ok(ToolResult {
+                result: json!({"messages": messages}),
+                undo: None,
+            })
+        }
+
+        "mail.open" | "mail.delete" => {
+            let reference = args["source_ref"].as_str().unwrap_or("").trim();
+            let (provider, id) = split_mail_ref(reference)?;
+            if !crate::connectors::is_connected(&ctx.db, provider) {
+                return Err(AppError::Security(format!(
+                    "Le connecteur {provider} n’est pas synchronisé."
+                )));
+            }
+            if tool == "mail.open" {
+                let message = crate::connectors::external::read_mail(provider, id).await?;
+                crate::security::log_access(&ctx.db, provider, "mail.open", Some(reference));
+                return Ok(ToolResult {
+                    result: message,
+                    undo: None,
+                });
+            }
+            let result = crate::connectors::external::trash_mail(provider, id).await?;
+            crate::security::log_access(&ctx.db, provider, "mail.delete", Some(reference));
             Ok(ToolResult {
                 result,
                 undo: None,

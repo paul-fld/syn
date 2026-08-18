@@ -1637,6 +1637,180 @@ pub async fn create_document(provider: &str, title: &str, content: &str) -> Resu
     }))
 }
 
+/// Les derniers messages d'une boîte, sans requête de recherche.
+///
+/// « Montre-moi mes derniers mails » n'est pas une recherche : il n'y a rien à
+/// chercher. Passer par la recherche obligeait à inventer des mots-clés, et le
+/// fournisseur répondait à côté ou ne répondait rien.
+pub async fn list_mail(provider: &str, unread_only: bool, limit: usize) -> Result<Vec<Value>> {
+    let token = super::oauth::access_token(provider).await?;
+    let client = reqwest::Client::new();
+    let limit = limit.clamp(1, 25);
+    if provider == "google" {
+        let query = if unread_only { "is:unread" } else { "in:inbox" };
+        let list = get_json(
+            &client,
+            &format!(
+                "https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults={limit}&q={}",
+                urlencoding(query)
+            ),
+            &token,
+        )
+        .await?;
+        let ids = list["messages"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|message| message["id"].as_str().map(str::to_string));
+        let fetched = stream::iter(ids)
+            .map(|id| {
+                let client = client.clone();
+                let token = token.clone();
+                async move {
+                    let value = get_json(
+                        &client,
+                        &format!("https://gmail.googleapis.com/gmail/v1/users/me/messages/{id}?format=metadata&metadataHeaders=Subject&metadataHeaders=From&metadataHeaders=Date"),
+                        &token,
+                    )
+                    .await?;
+                    Ok::<_, AppError>((id, value))
+                }
+            })
+            .buffer_unordered(10)
+            .collect::<Vec<_>>()
+            .await;
+        let mut out = Vec::new();
+        for result in fetched {
+            let (id, value) = result?;
+            out.push(gmail_summary(&id, &value));
+        }
+        return Ok(out);
+    }
+    let filtre = if unread_only {
+        "&$filter=isRead%20eq%20false"
+    } else {
+        ""
+    };
+    let value = get_json(
+        &client,
+        &format!("https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages?$top={limit}&$orderby=receivedDateTime%20desc&$select=id,subject,from,receivedDateTime,bodyPreview,webLink,hasAttachments{filtre}"),
+        &token,
+    )
+    .await?;
+    Ok(value["value"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(ms_summary)
+        .collect())
+}
+
+/// Le contenu complet d'un message, pour l'afficher dans la conversation.
+pub async fn read_mail(provider: &str, id: &str) -> Result<Value> {
+    let token = super::oauth::access_token(provider).await?;
+    let client = reqwest::Client::new();
+    if provider == "google" {
+        let value = get_json(
+            &client,
+            &format!("https://gmail.googleapis.com/gmail/v1/users/me/messages/{id}?format=full"),
+            &token,
+        )
+        .await?;
+        let mut resume = gmail_summary(id, &value);
+        resume["body"] = json!(gmail_body(&value["payload"]));
+        return Ok(resume);
+    }
+    let value = get_json(
+        &client,
+        &format!("https://graph.microsoft.com/v1.0/me/messages/{id}?$select=id,subject,from,receivedDateTime,body,webLink,hasAttachments"),
+        &token,
+    )
+    .await?;
+    let mut resume = ms_summary(&value).unwrap_or_else(|| json!({}));
+    resume["body"] = json!(strip_html(value["body"]["content"].as_str().unwrap_or_default()));
+    Ok(resume)
+}
+
+/// Met un message à la corbeille. Jamais une suppression définitive : le
+/// message reste récupérable chez le fournisseur pendant 30 jours.
+pub async fn trash_mail(provider: &str, id: &str) -> Result<Value> {
+    let token = super::oauth::access_token(provider).await?;
+    let client = reqwest::Client::new();
+    let response = if provider == "google" {
+        client
+            .post(format!(
+                "https://gmail.googleapis.com/gmail/v1/users/me/messages/{id}/trash"
+            ))
+            .bearer_auth(&token)
+            .header("content-length", "0")
+            .send()
+            .await?
+    } else {
+        client
+            .post(format!(
+                "https://graph.microsoft.com/v1.0/me/messages/{id}/move"
+            ))
+            .bearer_auth(&token)
+            .json(&json!({"destinationId": "deleteditems"}))
+            .send()
+            .await?
+    };
+    if !response.status().is_success() {
+        // Une autorisation obtenue avant l'ajout des portées d'écriture ne
+        // permet pas ce geste : le dire, plutôt que de renvoyer le refus brut
+        // du fournisseur.
+        if response.status() == reqwest::StatusCode::FORBIDDEN
+            || response.status() == reqwest::StatusCode::UNAUTHORIZED
+        {
+            return Err(AppError::Security(format!(
+                "Ce compte {provider} n'autorise pas encore Syn à déplacer un message. Reconnecte-le depuis Connecteurs pour accorder cette permission."
+            )));
+        }
+        return Err(AppError::Other(format!(
+            "Mise à la corbeille refusée par {provider} : {}",
+            response.text().await.unwrap_or_default()
+        )));
+    }
+    Ok(json!({"status": "corbeille", "provider": provider, "id": id}))
+}
+
+fn gmail_summary(id: &str, value: &Value) -> Value {
+    json!({
+        "item_id": format!("live:google:gmail:{id}"),
+        "source": "mail",
+        "source_ref": format!("google:mail:{id}"),
+        "title": gmail_header(&value["payload"], "Subject"),
+        "path": format!("https://mail.google.com/mail/u/0/#all/{id}"),
+        "snippet": value["snippet"].as_str().unwrap_or_default(),
+        "from": gmail_header(&value["payload"], "From"),
+        "date": gmail_header(&value["payload"], "Date"),
+        "provider": "google",
+        "live": true,
+    })
+}
+
+fn ms_summary(mail: &Value) -> Option<Value> {
+    let id = mail["id"].as_str()?.to_string();
+    Some(json!({
+        "item_id": format!("live:microsoft:mail:{id}"),
+        "source": "mail",
+        "source_ref": format!("microsoft:mail:{id}"),
+        "title": mail["subject"],
+        "path": mail["webLink"],
+        "snippet": mail["bodyPreview"],
+        "from": mail["from"]["emailAddress"]["name"]
+            .as_str()
+            .or_else(|| mail["from"]["emailAddress"]["address"].as_str())
+            .unwrap_or_default(),
+        "date": mail["receivedDateTime"],
+        "attachments": mail["hasAttachments"],
+        "provider": "microsoft",
+        "live": true,
+    }))
+}
+
 pub async fn send_mail(provider: &str, to: &str, subject: &str, body: &str) -> Result<Value> {
     let token = super::oauth::access_token(provider).await?;
     let client = reqwest::Client::new();

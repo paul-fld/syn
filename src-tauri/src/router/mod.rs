@@ -234,14 +234,25 @@ pub async fn handle_query_with_context(
             .clone()
             .filter(|subject| subject.trim().len() >= 3)
             .unwrap_or_else(|| user_text.to_string());
-        return answer_mail_search(
-            core,
-            session_id,
-            &target,
-            understood.scope,
-            settings.voice.vouvoie(),
-        )
-        .await;
+        let action = understood
+            .mail_action
+            .unwrap_or_else(|| mail_action_fallback(user_text));
+        return match action {
+            intent::MailAction::Lister => {
+                answer_mail_list(core, session_id, user_text, settings.voice.vouvoie()).await
+            }
+            _ => {
+                answer_mail_search(
+                    core,
+                    session_id,
+                    &target,
+                    understood.scope,
+                    action,
+                    settings.voice.vouvoie(),
+                )
+                .await
+            }
+        };
     }
     if let Some((query, is_correction)) = file_request {
         return answer_file_search(
@@ -260,8 +271,7 @@ pub async fn handle_query_with_context(
     // modèle pour qu'il résolve le nom en adresse et la fasse confirmer —
     // demander le contenu d'un mail dont on ignore le destinataire mettait
     // l'utilisateur devant une question prématurée.
-    let destinataire_connu =
-        !composition_en_cours.recipient.is_empty() || user_text.contains('@');
+    let destinataire_connu = !composition_en_cours.recipient.is_empty() || user_text.contains('@');
     if mail_composition
         && destinataire_connu
         && mail_request_missing_content(user_text)
@@ -303,8 +313,8 @@ pub async fn handle_query_with_context(
         // « un texte attend une relecture » suffisait à faire réécrire le mail
         // sur une phrase qui parlait d'autre chose.
         let correction_demandee = lecture == Some(intent::Reply::Correction);
-        let premiere_redaction = composition_en_cours.body.is_empty()
-            && mail_content_expressed(user_text, &understood);
+        let premiere_redaction =
+            composition_en_cours.body.is_empty() && mail_content_expressed(user_text, &understood);
         if correction_demandee || premiere_redaction {
             if let Some(answer) = mail_flow::compose(
                 core,
@@ -540,7 +550,11 @@ pub async fn handle_query_with_context(
                     ("body", &known.body),
                     ("via", &known.via),
                 ] {
-                    if verified_arguments[key].as_str().unwrap_or("").trim().is_empty()
+                    if verified_arguments[key]
+                        .as_str()
+                        .unwrap_or("")
+                        .trim()
+                        .is_empty()
                         && !value.is_empty()
                     {
                         verified_arguments[key] = json!(value);
@@ -606,9 +620,15 @@ pub async fn handle_query_with_context(
                 verified_arguments["_syn_preflight_v1"] = json!(true);
                 // Un seul compte disponible : inutile de demander, mais le
                 // choix devient explicite dans l'aperçu de confirmation.
-                if verified_arguments["via"].as_str().unwrap_or("").trim().is_empty() {
-                    if let Some((id, _)) =
-                        crate::connectors::mail::available_channels(db).first().copied()
+                if verified_arguments["via"]
+                    .as_str()
+                    .unwrap_or("")
+                    .trim()
+                    .is_empty()
+                {
+                    if let Some((id, _)) = crate::connectors::mail::available_channels(db)
+                        .first()
+                        .copied()
                     {
                         verified_arguments["via"] = json!(id);
                     }
@@ -698,11 +718,11 @@ pub async fn handle_query_with_context(
                         // l'utilisateur tranche : une mémoire qui se remplit
                         // toute seule finit par contenir surtout du bruit.
                         if matches!(call.name.as_str(), "mail.send" | "mail.draft") {
-                            if let Some((name, email)) =
-                                learnable_contact(db, &verified_arguments)?
+                            if let Some((name, email)) = learnable_contact(db, &verified_arguments)?
                             {
                                 let link_args = json!({"name": name, "email": email});
-                                let preview = crate::tools::preview_for("people.link_email", &link_args);
+                                let preview =
+                                    crate::tools::preview_for("people.link_email", &link_args);
                                 let action_id = actions::queue_pending(
                                     db,
                                     "people.link_email",
@@ -829,7 +849,8 @@ pub async fn handle_query_with_context(
         // la réponse du modèle par un rappel qu'il a sous les yeux.
         && !envoi_deja_en_attente
     {
-        if let Some(answer) = mail_flow::advance(core, session_id, &settings, &trusted_user_history)?
+        if let Some(answer) =
+            mail_flow::advance(core, session_id, &settings, &trusted_user_history)?
         {
             return Ok(answer);
         }
@@ -842,11 +863,18 @@ pub async fn handle_query_with_context(
     if claims_a_sent_mail(&final_text) && !mail_really_sent(db, session_id)? {
         // On ne se contente pas de démentir : on reprend le parcours là où il en
         // est réellement — relecture, choix du compte, ou carte de confirmation.
-        let reprise = match mail_flow::advance(core, session_id, &settings, &trusted_user_history)? {
+        let reprise = match mail_flow::advance(core, session_id, &settings, &trusted_user_history)?
+        {
             Some(answer) => Some(answer),
             None => {
-                mail_flow::compose(core, session_id, user_text, &trusted_user_history, &settings)
-                    .await?
+                mail_flow::compose(
+                    core,
+                    session_id,
+                    user_text,
+                    &trusted_user_history,
+                    &settings,
+                )
+                .await?
             }
         };
         if let Some(answer) = reprise {
@@ -1666,6 +1694,7 @@ async fn answer_mail_search(
     session_id: &str,
     query: &str,
     scope: intent::Scope,
+    action: intent::MailAction,
     formal: bool,
 ) -> Result<Answer> {
     let comptes = crate::connectors::mail::available_channels(&core.db);
@@ -1743,6 +1772,22 @@ async fn answer_mail_search(
     }
     results.truncate(8);
 
+    // Afficher ou supprimer suppose UN message. Tant qu'il y a une ambiguïté, on
+    // montre la liste et on laisse l'utilisateur désigner : agir sur « le
+    // premier résultat » serait deviner à sa place.
+    let geste_unitaire = matches!(
+        action,
+        intent::MailAction::Afficher | intent::MailAction::Supprimer
+    );
+    if geste_unitaire && results.len() == 1 {
+        return match action {
+            intent::MailAction::Afficher => {
+                answer_mail_open(core, session_id, &results[0], formal).await
+            }
+            _ => propose_mail_deletion(core, session_id, &results[0], formal),
+        };
+    }
+
     let text = if results.is_empty() {
         let ou = mail_boxes_label(&boites, apple_indexe);
         if formal {
@@ -1750,6 +1795,27 @@ async fn answer_mail_search(
         } else {
             format!("Je n'ai trouvé aucun message correspondant dans {ou}. Donne-moi un expéditeur, un mot de l'objet ou une période, et je relance la recherche.")
         }
+    } else if geste_unitaire {
+        let mut body = format!(
+            "{} messages correspondent. Lequel {} ?",
+            results.len(),
+            if action == intent::MailAction::Supprimer {
+                "faut-il mettre à la corbeille"
+            } else if formal {
+                "voulez-vous lire"
+            } else {
+                "veux-tu lire"
+            }
+        );
+        for (index, result) in results.iter().enumerate() {
+            body.push_str(&format!(
+                "\n{}. **{}** — {}",
+                index + 1,
+                result.title,
+                mail_origin(result)
+            ));
+        }
+        body
     } else {
         let mut body = format!(
             "J'ai trouvé {} message{} dans {} :",
@@ -1790,6 +1856,240 @@ async fn answer_mail_search(
     Ok(Answer {
         text,
         sources: results,
+        pending_actions: vec![],
+        choices: vec![],
+        session_id: session_id.into(),
+        degraded: false,
+    })
+}
+
+/// Voir sa boîte : les derniers messages, ou seulement les non lus.
+///
+/// Ce n'est pas une recherche — il n'y a rien à chercher. Passer par la
+/// recherche obligeait à inventer des mots-clés à partir d'une phrase qui n'en
+/// contient pas, et le fournisseur répondait à côté.
+async fn answer_mail_list(
+    core: &Core,
+    session_id: &str,
+    user_text: &str,
+    formal: bool,
+) -> Result<Answer> {
+    let boites: Vec<&'static str> = crate::connectors::mail::available_channels(&core.db)
+        .into_iter()
+        .map(|(id, _)| id)
+        .filter(|id| *id != "apple")
+        .collect();
+    if boites.is_empty() {
+        return no_mailbox_answer(core, session_id, formal);
+    }
+    let non_lus = ["non lu", "non-lu", "pas lu", "unread"]
+        .iter()
+        .any(|term| crate::db::fold(user_text).contains(term));
+    emit_progress(
+        core,
+        session_id,
+        "retrieve",
+        if non_lus {
+            "Lecture des messages non lus"
+        } else {
+            "Lecture des derniers messages"
+        },
+        None,
+        3,
+        5,
+        "running",
+    );
+    let mut results = Vec::new();
+    for provider in &boites {
+        let live = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            crate::connectors::external::list_mail(provider, non_lus, 8),
+        )
+        .await;
+        let Ok(Ok(messages)) = live else { continue };
+        for value in messages {
+            remember_live_cloud(core, &value).await;
+            if let Some(result) = retrieved_from_live_mail(&value) {
+                results.push(result);
+            }
+        }
+    }
+    results.truncate(10);
+
+    let text = if results.is_empty() {
+        if non_lus {
+            "Aucun message non lu.".to_string()
+        } else {
+            "Aucun message récent dans les boîtes connectées.".to_string()
+        }
+    } else {
+        let mut body = format!(
+            "{} dans {} :",
+            if non_lus {
+                "Messages non lus"
+            } else {
+                "Derniers messages reçus"
+            },
+            mail_boxes_label(&boites, false)
+        );
+        for (index, result) in results.iter().enumerate() {
+            body.push_str(&format!(
+                "\n{}. **{}** — {}",
+                index + 1,
+                result.title,
+                mail_origin(result)
+            ));
+        }
+        body.push_str(if formal {
+            "\n\nCliquez sur l'objet pour ouvrir le message."
+        } else {
+            "\n\nClique sur l'objet pour ouvrir le message."
+        });
+        body
+    };
+    memory::persist_turn(&core.db, session_id, "assistant", &text)?;
+    emit_progress(
+        core,
+        session_id,
+        "complete",
+        "Boîte consultée",
+        None,
+        5,
+        5,
+        "done",
+    );
+    Ok(Answer {
+        text,
+        sources: results,
+        pending_actions: vec![],
+        choices: vec![],
+        session_id: session_id.into(),
+        degraded: false,
+    })
+}
+
+/// Affiche le contenu d'un message dans le fil, avec son lien.
+async fn answer_mail_open(
+    core: &Core,
+    session_id: &str,
+    message: &retrieval::Retrieved,
+    formal: bool,
+) -> Result<Answer> {
+    let ctx = crate::tools::ToolCtx {
+        db: core.db.clone(),
+        llm: core.llm.clone(),
+        bus: core.bus.clone(),
+        settings: crate::settings::load(&core.db)?,
+    };
+    let ouvert = crate::tools::execute(
+        &ctx,
+        "mail.open",
+        &json!({ "source_ref": message.source_ref }),
+    )
+    .await;
+    let invite = if formal {
+        "Cliquez sur l'objet pour l'ouvrir dans votre messagerie."
+    } else {
+        "Clique sur l'objet pour l'ouvrir dans ta messagerie."
+    };
+    let text = match ouvert {
+        Ok(outcome) => {
+            let corps = outcome.result["body"]
+                .as_str()
+                .unwrap_or_default()
+                .trim()
+                .chars()
+                .take(2_000)
+                .collect::<String>();
+            let entete = format!("**{}** — {}", message.title, mail_origin(message));
+            if corps.is_empty() {
+                format!("{entete}\n\nJe n'ai pas pu lire le corps de ce message. {invite}")
+            } else {
+                let cite = corps
+                    .lines()
+                    .map(|line| format!("> {line}").trim_end().to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!("{entete}\n\n{cite}\n\n{invite}")
+            }
+        }
+        Err(error) => format!("Je n'ai pas pu ouvrir ce message : {error}"),
+    };
+    memory::persist_turn(&core.db, session_id, "assistant", &text)?;
+    Ok(Answer {
+        text,
+        sources: vec![message.clone()],
+        pending_actions: vec![],
+        choices: vec![],
+        session_id: session_id.into(),
+        degraded: false,
+    })
+}
+
+/// Prépare la mise à la corbeille — et s'arrête là. Effacer une donnée de
+/// l'utilisateur passe toujours par sa validation explicite, quel que soit son
+/// niveau d'autonomie.
+fn propose_mail_deletion(
+    core: &Core,
+    session_id: &str,
+    message: &retrieval::Retrieved,
+    formal: bool,
+) -> Result<Answer> {
+    let args = json!({ "source_ref": message.source_ref });
+    let risk = actions::classify("mail.delete", &args);
+    let preview = format!(
+        "Mettre à la corbeille « {} » — {}",
+        message.title,
+        mail_origin(message)
+    );
+    let action_id = actions::queue_pending(
+        &core.db,
+        "mail.delete",
+        &args,
+        risk,
+        &preview,
+        false,
+        Some(session_id),
+    )?;
+    core.bus.emit(BusEvent::ActionAwaitingConfirmation {
+        action_id: action_id.clone(),
+        tool: "mail.delete".into(),
+        preview: preview.clone(),
+        risk_class: risk.as_str().into(),
+    });
+    let text = format!(
+        "Je peux mettre « {} » à la corbeille de {} messagerie. Le message y restera récupérable.",
+        message.title,
+        if formal { "votre" } else { "ta" }
+    );
+    memory::persist_turn(&core.db, session_id, "assistant", &text)?;
+    Ok(Answer {
+        text,
+        sources: vec![message.clone()],
+        pending_actions: vec![PendingRef {
+            action_id,
+            tool: "mail.delete".into(),
+            preview,
+            risk_class: risk.as_str().into(),
+        }],
+        choices: vec![],
+        session_id: session_id.into(),
+        degraded: false,
+    })
+}
+
+/// Aucune messagerie connectée : Syn le dit, il ne cherche pas pour la forme.
+fn no_mailbox_answer(core: &Core, session_id: &str, formal: bool) -> Result<Answer> {
+    let text = if formal {
+        "Désolé, pour l'instant je ne peux pas consulter vos messageries : aucun compte mail n'est connecté. Vous pouvez en ajouter un dans Connecteurs."
+    } else {
+        "Désolé, pour l'instant je ne peux pas consulter tes messageries : aucun compte mail n'est connecté. Tu peux en ajouter un dans Connecteurs."
+    }
+    .to_string();
+    memory::persist_turn(&core.db, session_id, "assistant", &text)?;
+    Ok(Answer {
+        text,
+        sources: vec![],
         pending_actions: vec![],
         choices: vec![],
         session_id: session_id.into(),
@@ -2439,9 +2739,48 @@ fn mail_really_sent(db: &crate::db::Db, session_id: &str) -> Result<bool> {
 /// Mail au lieu du texte à relire.
 fn asked_for_draft(text: &str) -> bool {
     let text = crate::db::fold(text);
-    ["brouillon", "draft", "sans l'envoyer", "ne l'envoie pas", "ne pas l'envoyer"]
+    [
+        "brouillon",
+        "draft",
+        "sans l'envoyer",
+        "ne l'envoie pas",
+        "ne pas l'envoyer",
+    ]
+    .iter()
+    .any(|term| text.contains(term))
+}
+
+/// Secours déterministe pour l'action, quand le modèle n'a rien dit. Comme
+/// toute reconnaissance par mots, elle ne vaut que pour les formulations les
+/// plus explicites — et cesse de servir dès que la compréhension répond.
+fn mail_action_fallback(text: &str) -> intent::MailAction {
+    let folded = crate::db::fold(text);
+    if ["supprime", "efface", "vire", "jette", "corbeille", "delete"]
         .iter()
-        .any(|term| text.contains(term))
+        .any(|term| folded.contains(term))
+    {
+        return intent::MailAction::Supprimer;
+    }
+    if ["ouvre", "affiche", "montre-moi le", "lis-moi", "contenu du"]
+        .iter()
+        .any(|term| folded.contains(term))
+    {
+        return intent::MailAction::Afficher;
+    }
+    if [
+        "liste",
+        "derniers",
+        "non lus",
+        "non-lus",
+        "ma boite",
+        "recu aujourd'hui",
+    ]
+    .iter()
+    .any(|term| folded.contains(term))
+    {
+        return intent::MailAction::Lister;
+    }
+    intent::MailAction::Retrouver
 }
 
 /// Secours déterministe : chercher un message REÇU, quand le modèle local est
@@ -2453,8 +2792,16 @@ fn is_mail_search_query(text: &str) -> bool {
         .iter()
         .any(|term| folded.contains(term));
     let retrouve = [
-        "retrouve", "retrouver", "cherche", "chercher", "recherche", "ou est", "j'ai recu",
-        "recu de", "montre", "affiche",
+        "retrouve",
+        "retrouver",
+        "cherche",
+        "chercher",
+        "recherche",
+        "ou est",
+        "j'ai recu",
+        "recu de",
+        "montre",
+        "affiche",
     ]
     .iter()
     .any(|term| folded.contains(term));
@@ -2602,7 +2949,13 @@ fn mail_request_missing_content(text: &str) -> bool {
 /// rédiger une proposition. Redemander « que veux-tu dire ? » à ce moment-là
 /// était une boucle — l'utilisateur venait de répondre.
 fn states_an_intent(folded: &str) -> bool {
-    for lead in [" pour ", " afin de ", " au sujet de ", " a propos de ", " concernant "] {
+    for lead in [
+        " pour ",
+        " afin de ",
+        " au sujet de ",
+        " a propos de ",
+        " concernant ",
+    ] {
         let Some((_, tail)) = folded.split_once(lead) else {
             continue;
         };
@@ -2611,8 +2964,19 @@ fn states_an_intent(folded: &str) -> bool {
         // une intention de message.
         let first_is_pronoun = words.first().is_some_and(|word| {
             [
-                "moi", "toi", "nous", "vous", "eux", "ca", "cela", "ce", "cet", "cette", "demain",
-                "aujourd'hui", "hier",
+                "moi",
+                "toi",
+                "nous",
+                "vous",
+                "eux",
+                "ca",
+                "cela",
+                "ce",
+                "cet",
+                "cette",
+                "demain",
+                "aujourd'hui",
+                "hier",
             ]
             .contains(word)
         });
@@ -2622,8 +2986,6 @@ fn states_an_intent(folded: &str) -> bool {
     }
     false
 }
-
-
 
 /// Un contact à retenir après un envoi : l'adresse utilisée n'est encore liée à
 /// personne, et un nom a été cherché sans succès dans les dernières minutes.
@@ -3311,25 +3673,37 @@ mod routing_eval {
         }
         let total = CORPUS.len();
         println!("\n╭─ Routage : {total} demandes du corpus");
-        println!("│  intention manquée : {} ({:.0} %)", intention_ratee.len(),
-                 100.0 * intention_ratee.len() as f64 / total as f64);
-        println!("│  portée manquée    : {} ({:.0} %)", portee_ratee.len(),
-                 100.0 * portee_ratee.len() as f64 / total as f64);
-        println!("╰─ total erroné      : {} ({:.0} %)",
-                 intention_ratee.len() + portee_ratee.len(),
-                 100.0 * (intention_ratee.len() + portee_ratee.len()) as f64 / total as f64);
+        println!(
+            "│  intention manquée : {} ({:.0} %)",
+            intention_ratee.len(),
+            100.0 * intention_ratee.len() as f64 / total as f64
+        );
+        println!(
+            "│  portée manquée    : {} ({:.0} %)",
+            portee_ratee.len(),
+            100.0 * portee_ratee.len() as f64 / total as f64
+        );
+        println!(
+            "╰─ total erroné      : {} ({:.0} %)",
+            intention_ratee.len() + portee_ratee.len(),
+            100.0 * (intention_ratee.len() + portee_ratee.len()) as f64 / total as f64
+        );
         println!("\n  Intentions manquées :");
         for (case, obtenue) in &intention_ratee {
-            println!("   ✗ {:?} au lieu de {:?}  « {} »\n       ({})",
-                     obtenue, case.expected, case.text, case.note);
+            println!(
+                "   ✗ {:?} au lieu de {:?}  « {} »\n       ({})",
+                obtenue, case.expected, case.text, case.note
+            );
         }
         println!("\n  Portées manquées :");
         for (case, obtenue) in &portee_ratee {
-            println!("   ~ {:?} au lieu de {:?}  « {} »", obtenue, case.expected, case.text);
+            println!(
+                "   ~ {:?} au lieu de {:?}  « {} »",
+                obtenue, case.expected, case.text
+            );
         }
         println!();
     }
-
 
     /// Mesure la compréhension EN CONTEXTE : le dernier message d'une suite
     /// d'échanges doit poursuivre l'intention en cours, pas en ouvrir une autre.
@@ -3362,7 +3736,9 @@ mod routing_eval {
                     kind: super::intent::Kind::Conversation,
                     scope: super::intent::Scope::Any,
                     subject: None,
-                    reply: None,                    source: super::intent::Source::Fallback,
+                    reply: None,
+                    mail_action: None,
+                    source: super::intent::Source::Fallback,
                 },
             )
             .await;
@@ -3379,8 +3755,11 @@ mod routing_eval {
             }
         }
         println!("\n╭─ Suites d'échanges : {} cas", SUITES.len());
-        println!("╰─ erronés : {} ({:.0} %)", ratees.len(),
-                 100.0 * ratees.len() as f64 / SUITES.len() as f64);
+        println!(
+            "╰─ erronés : {} ({:.0} %)",
+            ratees.len(),
+            100.0 * ratees.len() as f64 / SUITES.len() as f64
+        );
         for (texte, obtenue, attendue) in &ratees {
             println!("   ✗ {obtenue:?} au lieu de {attendue:?}  « {texte} »");
         }
@@ -3407,16 +3786,29 @@ mod routing_eval {
             return;
         }
         let contexte: Vec<(String, String)> = vec![
-            ("user".into(), "Tu pourrais envoyer un mail à paul flaud ?".into()),
-            ("assistant".into(), "Que voulez-vous dire dans ce mail ?".into()),
-            ("user".into(), "Dis-lui « Bonjour, ceci est un test »".into()),
-            ("assistant".into(), "Quel compte d'envoi souhaitez-vous utiliser ?".into()),
+            (
+                "user".into(),
+                "Tu pourrais envoyer un mail à paul flaud ?".into(),
+            ),
+            (
+                "assistant".into(),
+                "Que voulez-vous dire dans ce mail ?".into(),
+            ),
+            (
+                "user".into(),
+                "Dis-lui « Bonjour, ceci est un test »".into(),
+            ),
+            (
+                "assistant".into(),
+                "Quel compte d'envoi souhaitez-vous utiliser ?".into(),
+            ),
         ];
         let vide = intent::Intent {
             kind: intent::Kind::Conversation,
             scope: intent::Scope::Any,
             subject: None,
             reply: None,
+            mail_action: None,
             source: intent::Source::Fallback,
         };
         // Chauffe.
@@ -3437,11 +3829,18 @@ mod routing_eval {
                 "Tu es Syn, un assistant de vie numérique local-first.",
                 &[crate::llm::ChatMessage::user("gmail")],
                 &outils,
-                crate::llm::GenParams { temperature: 0.3, max_tokens: Some(1200), json: false },
+                crate::llm::GenParams {
+                    temperature: 0.3,
+                    max_tokens: Some(1200),
+                    json: false,
+                },
             )
             .await;
         println!("  3. une itération agentique      : {:?}", t.elapsed());
-        println!("     (la boucle peut en enchaîner jusqu'à {})\n", MAX_TOOL_ITERATIONS);
+        println!(
+            "     (la boucle peut en enchaîner jusqu'à {})\n",
+            MAX_TOOL_ITERATIONS
+        );
     }
     /// Mesure les réponses données EN COURS de parcours — accord, correction,
     /// choix de compte, changement de sujet.
@@ -3501,6 +3900,7 @@ mod routing_eval {
                     scope: super::intent::Scope::Any,
                     subject: None,
                     reply: None,
+                    mail_action: None,
                     source: super::intent::Source::Fallback,
                 },
             )
@@ -3509,7 +3909,11 @@ mod routing_eval {
                 cas.step,
                 comprise.reply,
                 cas.text,
-                &[("apple", "Apple Mail"), ("google", "Gmail"), ("microsoft", "Outlook")],
+                &[
+                    ("apple", "Apple Mail"),
+                    ("google", "Gmail"),
+                    ("microsoft", "Outlook"),
+                ],
             );
             if decision != cas.expected {
                 ratees.push((cas, Some(decision)));
@@ -3527,7 +3931,72 @@ mod routing_eval {
             );
         }
         for cas in &mots_cles {
-            println!("   ~ mots-clés se trompent sur « {} »  [{}]", cas.text, cas.note);
+            println!(
+                "   ~ mots-clés se trompent sur « {} »  [{}]",
+                cas.text, cas.note
+            );
+        }
+        println!();
+    }
+
+    /// Mesure ce que Syn comprend du GESTE demandé sur des messages : voir sa
+    /// boîte, retrouver, lire, jeter. Le même mot « mail » sert aux quatre.
+    #[tokio::test]
+    async fn mesure_des_gestes_sur_les_messages() {
+        use super::eval::MAIL_ACTIONS;
+        let secours: Vec<_> = MAIL_ACTIONS
+            .iter()
+            .filter(|(texte, attendu)| super::mail_action_fallback(texte) != *attendu)
+            .collect();
+        println!("\n╭─ Gestes sur les messages : {} cas", MAIL_ACTIONS.len());
+        println!(
+            "│  secours à mots-clés  : {} erreurs ({:.0} %)",
+            secours.len(),
+            100.0 * secours.len() as f64 / MAIL_ACTIONS.len() as f64
+        );
+        let llm: std::sync::Arc<dyn crate::llm::LlmClient> =
+            std::sync::Arc::new(crate::llm::ollama::OllamaClient::new(
+                "http://127.0.0.1:11434",
+                "llama3.1:latest",
+                "nomic-embed-text",
+                std::sync::Arc::new(crate::security::egress::EgressGuard::new()),
+            ));
+        if !llm.status().await.chat_model_ready {
+            println!("╰─ modèle absent : compréhension non mesurée\n");
+            return;
+        }
+        super::intent::preheat(&llm).await;
+        let mut ratees = Vec::new();
+        for (texte, attendu) in MAIL_ACTIONS {
+            let comprise = super::intent::classify(
+                &llm,
+                texte,
+                &[],
+                None,
+                super::intent::Intent {
+                    kind: super::intent::Kind::Conversation,
+                    scope: super::intent::Scope::Any,
+                    subject: None,
+                    reply: None,
+                    mail_action: None,
+                    source: super::intent::Source::Fallback,
+                },
+            )
+            .await;
+            let geste = comprise
+                .mail_action
+                .unwrap_or_else(|| super::mail_action_fallback(texte));
+            if geste != *attendu {
+                ratees.push((texte, geste, attendu, comprise.kind));
+            }
+        }
+        println!(
+            "╰─ compréhension       : {} erreurs ({:.0} %)",
+            ratees.len(),
+            100.0 * ratees.len() as f64 / MAIL_ACTIONS.len() as f64
+        );
+        for (texte, geste, attendu, kind) in &ratees {
+            println!("   ✗ {geste:?} au lieu de {attendu:?}  « {texte} »  [intention: {kind:?}]");
         }
         println!();
     }
@@ -3549,57 +4018,81 @@ mod routing_eval {
             return;
         }
 
-        for (nom, jeu) in [("réglage", CORPUS), ("VALIDATION (jamais utilisé pour régler)", VALIDATION)] {
-        let mut intention_ratee = Vec::new();
-        let mut portee_ratee = Vec::new();
-        for case in jeu {
-            let comprise = super::intent::classify(
-                &llm,
-                case.text,
-                &[],
-                None,
-                super::intent::Intent {
-                    kind: super::intent::Kind::Conversation,
-                    scope: super::intent::Scope::Any,
-                    subject: None,
-                    reply: None,                    source: super::intent::Source::Fallback,
-                },
-            )
-            .await;
-            let obtenue = match (comprise.kind, comprise.scope) {
-                (super::intent::Kind::FileSearch, super::intent::Scope::Google) => Route::FileSearchGoogle,
-                (super::intent::Kind::FileSearch, super::intent::Scope::Microsoft) => Route::FileSearchMicrosoft,
-                (super::intent::Kind::FileSearch, super::intent::Scope::Local) => Route::FileSearchLocal,
-                (super::intent::Kind::FileSearch, _) => Route::FileSearch,
-                (super::intent::Kind::MailSearch, _) => Route::MailSearch,
-                (super::intent::Kind::MailCompose, _) => Route::MailCompose,
-                (super::intent::Kind::DeviceDiagnostic, _) => Route::DeviceDiagnostic,
-                (super::intent::Kind::DocumentCreate, _) => Route::DocumentCreate,
-                (super::intent::Kind::Conversation, _) => Route::Conversation,
-            };
-            if !meme_famille(obtenue, case.expected) {
-                intention_ratee.push((case, obtenue, comprise.subject.clone()));
-            } else if obtenue != case.expected {
-                portee_ratee.push((case, obtenue));
+        for (nom, jeu) in [
+            ("réglage", CORPUS),
+            ("VALIDATION (jamais utilisé pour régler)", VALIDATION),
+        ] {
+            let mut intention_ratee = Vec::new();
+            let mut portee_ratee = Vec::new();
+            for case in jeu {
+                let comprise = super::intent::classify(
+                    &llm,
+                    case.text,
+                    &[],
+                    None,
+                    super::intent::Intent {
+                        kind: super::intent::Kind::Conversation,
+                        scope: super::intent::Scope::Any,
+                        subject: None,
+                        reply: None,
+                        mail_action: None,
+                        source: super::intent::Source::Fallback,
+                    },
+                )
+                .await;
+                let obtenue = match (comprise.kind, comprise.scope) {
+                    (super::intent::Kind::FileSearch, super::intent::Scope::Google) => {
+                        Route::FileSearchGoogle
+                    }
+                    (super::intent::Kind::FileSearch, super::intent::Scope::Microsoft) => {
+                        Route::FileSearchMicrosoft
+                    }
+                    (super::intent::Kind::FileSearch, super::intent::Scope::Local) => {
+                        Route::FileSearchLocal
+                    }
+                    (super::intent::Kind::FileSearch, _) => Route::FileSearch,
+                    (super::intent::Kind::MailSearch, _) => Route::MailSearch,
+                    (super::intent::Kind::MailCompose, _) => Route::MailCompose,
+                    (super::intent::Kind::DeviceDiagnostic, _) => Route::DeviceDiagnostic,
+                    (super::intent::Kind::DocumentCreate, _) => Route::DocumentCreate,
+                    (super::intent::Kind::Conversation, _) => Route::Conversation,
+                };
+                if !meme_famille(obtenue, case.expected) {
+                    intention_ratee.push((case, obtenue, comprise.subject.clone()));
+                } else if obtenue != case.expected {
+                    portee_ratee.push((case, obtenue));
+                }
             }
-        }
-        let total = jeu.len();
-        let errones = intention_ratee.len() + portee_ratee.len();
-        println!("\n╭─ Compréhension · jeu de {nom} : {total} demandes");
-        println!("│  intention manquée : {} ({:.0} %)", intention_ratee.len(),
-                 100.0 * intention_ratee.len() as f64 / total as f64);
-        println!("│  portée manquée    : {} ({:.0} %)", portee_ratee.len(),
-                 100.0 * portee_ratee.len() as f64 / total as f64);
-        println!("╰─ total erroné      : {errones} ({:.1} %)",
-                 100.0 * errones as f64 / total as f64);
-        for (case, obtenue, sujet) in &intention_ratee {
-            println!("   ✗ {:?} au lieu de {:?}  « {} »  [sujet: {:?}]",
-                     obtenue, case.expected, case.text, sujet);
-        }
-        for (case, obtenue) in &portee_ratee {
-            println!("   ~ {:?} au lieu de {:?}  « {} »", obtenue, case.expected, case.text);
-        }
-        println!();
+            let total = jeu.len();
+            let errones = intention_ratee.len() + portee_ratee.len();
+            println!("\n╭─ Compréhension · jeu de {nom} : {total} demandes");
+            println!(
+                "│  intention manquée : {} ({:.0} %)",
+                intention_ratee.len(),
+                100.0 * intention_ratee.len() as f64 / total as f64
+            );
+            println!(
+                "│  portée manquée    : {} ({:.0} %)",
+                portee_ratee.len(),
+                100.0 * portee_ratee.len() as f64 / total as f64
+            );
+            println!(
+                "╰─ total erroné      : {errones} ({:.1} %)",
+                100.0 * errones as f64 / total as f64
+            );
+            for (case, obtenue, sujet) in &intention_ratee {
+                println!(
+                    "   ✗ {:?} au lieu de {:?}  « {} »  [sujet: {:?}]",
+                    obtenue, case.expected, case.text, sujet
+                );
+            }
+            for (case, obtenue) in &portee_ratee {
+                println!(
+                    "   ~ {:?} au lieu de {:?}  « {} »",
+                    obtenue, case.expected, case.text
+                );
+            }
+            println!();
         }
     }
 }
@@ -3620,7 +4113,6 @@ mod reponse_tests {
         assert!(!propre.contains("1e2db97f"), "{propre}");
         assert!(propre.contains("en attente de confirmation"), "{propre}");
     }
-
 
     #[test]
     fn le_resultat_dun_envoi_ne_saffiche_pas() {
@@ -3656,14 +4148,26 @@ mod memoire_tests {
         // de fabriquer une fiche à partir d'une adresse.
         assert!(learnable_contact(&db, &args).unwrap().is_none());
 
-        crate::security::log_access(&db, "people", "resolve_email_unresolved", Some("Camille Roux"));
-        let (nom, adresse) = learnable_contact(&db, &args).unwrap().expect("proposition attendue");
+        crate::security::log_access(
+            &db,
+            "people",
+            "resolve_email_unresolved",
+            Some("Camille Roux"),
+        );
+        let (nom, adresse) = learnable_contact(&db, &args)
+            .unwrap()
+            .expect("proposition attendue");
         assert_eq!(nom, "Camille Roux");
         assert_eq!(adresse, "camille.roux@exemple.fr");
 
         // Une fois la personne connue, plus aucune proposition : pas de doublon.
-        crate::memory::find_or_create_person(&db, "Camille Roux", Some("camille.roux@exemple.fr"), None)
-            .unwrap();
+        crate::memory::find_or_create_person(
+            &db,
+            "Camille Roux",
+            Some("camille.roux@exemple.fr"),
+            None,
+        )
+        .unwrap();
         assert!(learnable_contact(&db, &args).unwrap().is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -3712,12 +4216,9 @@ mod composition_tests {
         let historique = "Tu pourrais envoyer un mail à paulpro.flaud@gmail.com ?";
 
         // Tour 1 — le destinataire seul. Il manque le contenu.
-        let etat = mail::remember_composition(
-            &db,
-            session,
-            &json!({"to": "paulpro.flaud@gmail.com"}),
-        )
-        .unwrap();
+        let etat =
+            mail::remember_composition(&db, session, &json!({"to": "paulpro.flaud@gmail.com"}))
+                .unwrap();
         assert_eq!(etat.missing(), vec!["contenu"]);
 
         // Tour 2 — le contenu. Le destinataire ne doit pas disparaître.
@@ -3782,7 +4283,9 @@ mod composition_tests {
             kind: intent::Kind::MailCompose,
             scope: intent::Scope::Any,
             subject: None,
-            reply: None,            source: intent::Source::Understood,
+            reply: None,
+            mail_action: None,
+            source: intent::Source::Understood,
         };
         for demande in [
             "Envoie un mail à Camille pour la remercier de son aide",
@@ -3837,13 +4340,17 @@ mod composition_tests {
             kind,
             scope: intent::Scope::Any,
             subject: None,
-            reply: None,            source: intent::Source::Understood,
+            reply: None,
+            mail_action: None,
+            source: intent::Source::Understood,
         };
         let avec_sujet = |sujet: &str| intent::Intent {
             kind: intent::Kind::MailCompose,
             scope: intent::Scope::Any,
             subject: Some(sujet.to_string()),
-            reply: None,            source: intent::Source::Understood,
+            reply: None,
+            mail_action: None,
+            source: intent::Source::Understood,
         };
 
         assert!(!mail_content_expressed(
@@ -3941,7 +4448,8 @@ mod composition_tests {
 
         // Une autre adresse, écrite par le modèle : sous contrôle.
         let reecrit =
-            mail::remember_composition(&db, session, &json!({"to": "inconnu@ailleurs.fr"})).unwrap();
+            mail::remember_composition(&db, session, &json!({"to": "inconnu@ailleurs.fr"}))
+                .unwrap();
         assert!(!reecrit.recipient_is_resolved());
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -3965,8 +4473,7 @@ mod composition_tests {
         assert!(etat.awaits_approval(), "le texte proposé doit être relu");
 
         // Un rappel d'outil qui ne change pas le corps ne repose pas la question.
-        let inchange =
-            mail::remember_composition(&db, session, &json!({"via": "google"})).unwrap();
+        let inchange = mail::remember_composition(&db, session, &json!({"via": "google"})).unwrap();
         assert!(inchange.awaits_approval());
 
         let approuve = mail::approve_body(&db, session).unwrap();
@@ -3989,7 +4496,9 @@ mod composition_tests {
     /// Syn rédige. Redemander « que veux-tu dire ? » était une boucle.
     #[test]
     fn une_intention_de_message_vaut_matiere_a_rediger() {
-        assert!(mail_request_missing_content("Tu pourrais envoyer un mail à Paul ?"));
+        assert!(mail_request_missing_content(
+            "Tu pourrais envoyer un mail à Paul ?"
+        ));
         assert!(!mail_request_missing_content(
             "Je veux lui envoyer un mail très concis pour lui souhaiter un bon anniversaire"
         ));
@@ -3997,7 +4506,9 @@ mod composition_tests {
             "Envoie un mail à Camille pour la remercier de son aide"
         ));
         // Une circonstance n'est pas une intention de message.
-        assert!(mail_request_missing_content("Envoie un mail à Paul pour moi"));
+        assert!(mail_request_missing_content(
+            "Envoie un mail à Paul pour moi"
+        ));
     }
 
     /// Un champ vide ne doit jamais effacer un champ connu — c'est ce qui

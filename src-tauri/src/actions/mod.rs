@@ -36,6 +36,7 @@ pub fn classify(tool: &str, args: &Value) -> RiskClass {
         // Lectures
         "memory.query" | "files.search" | "mail.search" | "cloud.search" | "calendar.list" | "tasks.list"
         | "commitments.list" | "people.context" | "people.resolve_email" | "photos.search"
+        | "mail.list" | "mail.open"
         | "system.diagnose"
         | "document.open" /* affiche un document déjà connu : ne modifie rien */
         | "files.reorganize" /* dry-run : produit un PLAN, ne déplace rien */ => RiskClass::Read,
@@ -74,7 +75,7 @@ pub fn classify(tool: &str, args: &Value) -> RiskClass {
                 RiskClass::ReversibleLocal
             }
         }
-        "calendar.delete" => RiskClass::ReversibleExternal,
+        "calendar.delete" | "mail.delete" => RiskClass::ReversibleExternal,
 
         // Exécution d'un plan de rangement : réversible local (undo global),
         // mais soumis à la revue unique (B6) — voir needs_confirmation.
@@ -109,6 +110,12 @@ pub fn needs_confirmation(
     // Note : `memory.remember` n'est pas concerné, l'utilisateur l'a demandé
     // explicitement ; lui reposer la question serait du bruit.
     if tool == "people.link_email" {
+        return true;
+    }
+    // Supprimer un message est réversible (corbeille), mais c'est la donnée de
+    // l'utilisateur qui disparaît de sa vue. Une donnée ne s'efface jamais sans
+    // qu'il l'ait vu et accepté, quel que soit son niveau d'autonomie.
+    if tool == "mail.delete" {
         return true;
     }
     match risk {

@@ -59,6 +59,23 @@ pub enum Source {
     Fallback,
 }
 
+/// Ce que l'utilisateur veut FAIRE des messages qu'il vise.
+///
+/// Une action, pas une intention nouvelle : ajouter quatre classes plates à la
+/// taxonomie dégrade un modèle de 8 milliards de paramètres, alors qu'un champ
+/// supplémentaire sur une intention qu'il a déjà reconnue lui coûte peu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MailAction {
+    /// Remettre la main sur un message précis.
+    Retrouver,
+    /// Voir sa boîte, sans rien chercher de particulier.
+    Lister,
+    /// Afficher le contenu d'un message.
+    Afficher,
+    /// Le mettre à la corbeille.
+    Supprimer,
+}
+
 /// L'étape en cours d'un parcours, quand il y en a une.
 ///
 /// Sans elle, « oui » n'est interprétable par personne : ni par une liste de
@@ -115,6 +132,8 @@ pub struct Intent {
     pub subject: Option<String>,
     /// Sa réponse à l'étape en cours, s'il y en avait une.
     pub reply: Option<Reply>,
+    /// Ce qu'il veut faire des messages, quand sa demande porte sur des mails.
+    pub mail_action: Option<MailAction>,
     pub source: Source,
 }
 
@@ -125,6 +144,7 @@ impl Intent {
             scope: Scope::Any,
             subject: None,
             reply: None,
+            mail_action: None,
             source,
         }
     }
@@ -151,11 +171,15 @@ Choisis UNE intention, d'après ce que l'utilisateur veut obtenir :
   de ne plus la trouver, en avoir besoin, demander si tu l'as, ou simplement la
   nommer, relèvent tous de cette intention.
 
-- "mail_search" — il veut retrouver un MESSAGE reçu ou envoyé dans une de ses
-  messageries. Le critère est un signe EXPLICITE que la chose est arrivée par
-  message : le mot mail, message ou courriel ; le fait de l'avoir « reçu » ;
-  ou un expéditeur qui la lui a envoyée (entreprise, service, personne). Sans
-  un de ces signes, une chose qu'il possède est un document : "file_search".
+- "mail_search" — sa demande porte sur des MESSAGES de ses messageries. Le
+  critère est un signe EXPLICITE qu'il parle de sa boîte mail : le mot mail,
+  message ou courriel ; le fait d'avoir « reçu » ; ou un expéditeur qui lui a
+  écrit. Sans un de ces signes, une chose qu'il possède est un document :
+  "file_search". Ajoute alors un champ "mail_action" :
+    "retrouver" — remettre la main sur un message précis ;
+    "lister"    — voir sa boîte, ses derniers messages, ses non-lus ;
+    "afficher"  — lire le contenu d'un message ;
+    "supprimer" — le mettre à la corbeille.
 
 - "mail_compose" — il veut qu'un message PARTE vers une personne nommée. Le
   critère est la présence d'un destinataire humain et d'un acte de parole qui
@@ -286,11 +310,23 @@ const CALIBRATION: &[(&str, &str)] = &[
     // Frontière décisive : la chose cherchée est arrivée dans une boîte mail.
     (
         "retrouve le message d'Air France avec mes billets",
-        r#"{"intent":"mail_search","scope":"any","subject":"message d'Air France avec mes billets"}"#,
+        r#"{"intent":"mail_search","scope":"any","subject":"message d'Air France avec mes billets","mail_action":"retrouver"}"#,
     ),
     (
         "j'ai reçu un truc de la banque la semaine dernière, tu le retrouves ?",
-        r#"{"intent":"mail_search","scope":"any","subject":"un truc de la banque"}"#,
+        r#"{"intent":"mail_search","scope":"any","subject":"un truc de la banque","mail_action":"retrouver"}"#,
+    ),
+    (
+        "qu'est-ce que j'ai reçu aujourd'hui ?",
+        r#"{"intent":"mail_search","scope":"any","subject":"","mail_action":"lister"}"#,
+    ),
+    (
+        "ouvre-moi celui de la CAF",
+        r#"{"intent":"mail_search","scope":"any","subject":"celui de la CAF","mail_action":"afficher"}"#,
+    ),
+    (
+        "vire cette newsletter de ma boîte",
+        r#"{"intent":"mail_search","scope":"any","subject":"cette newsletter","mail_action":"supprimer"}"#,
     ),
     (
         "dis à Karim que le rendez-vous est décalé",
@@ -345,6 +381,16 @@ fn parse_kind(value: &str) -> Option<Kind> {
 /// Le champ tel que le modèle l'a rendu. La tolérance porte ici sur SON
 /// vocabulaire — « validation » pour « accord » —, jamais sur celui de
 /// l'utilisateur : ce serait revenir à une liste de mots.
+fn parse_mail_action(value: Option<&str>) -> Option<MailAction> {
+    match value?.trim().to_ascii_lowercase().as_str() {
+        "retrouver" | "chercher" | "rechercher" => Some(MailAction::Retrouver),
+        "lister" | "liste" | "voir" => Some(MailAction::Lister),
+        "afficher" | "lire" | "ouvrir" => Some(MailAction::Afficher),
+        "supprimer" | "effacer" | "corbeille" => Some(MailAction::Supprimer),
+        _ => None,
+    }
+}
+
 fn parse_reply(value: Option<&str>) -> Option<Reply> {
     let value = value?.trim().to_ascii_lowercase();
     let value = value.trim_matches(|c: char| !c.is_alphanumeric());
@@ -430,7 +476,11 @@ fn situated(text: &str, context: &[(String, String)], step: Option<Step>) -> Str
     if !context.is_empty() {
         prompt.push_str("Échanges précédents :\n");
         for (role, content) in context.iter().rev().take(6).rev() {
-            let who = if role == "user" { "utilisateur" } else { "assistant" };
+            let who = if role == "user" {
+                "utilisateur"
+            } else {
+                "assistant"
+            };
             let extrait: String = content.chars().take(240).collect();
             prompt.push_str(&format!("{who} : {extrait}\n"));
         }
@@ -494,6 +544,9 @@ async fn ask_model(
         kind,
         scope,
         subject: validated_subject(value["subject"].as_str(), text),
+        mail_action: (kind == Kind::MailSearch)
+            .then(|| parse_mail_action(value["mail_action"].as_str()))
+            .flatten(),
         // Le champ manque parfois : plutôt que de renoncer, on lit ce que le
         // modèle a compris par ailleurs. C'est encore de la compréhension —
         // ses propres sorties —, jamais une liste de mots de l'utilisateur.
@@ -550,7 +603,14 @@ fn validated_scope(proposed: Scope, text: &str) -> Scope {
         ]),
         Scope::AnyCloud => mentions(&["cloud", "en ligne", "online"]),
         Scope::Local => mentions(&[
-            "mac", "disque", "disk", "local", "ordinateur", "machine", "hors ligne", "offline",
+            "mac",
+            "disque",
+            "disk",
+            "local",
+            "ordinateur",
+            "machine",
+            "hors ligne",
+            "offline",
         ]),
         Scope::Any => true,
     };
@@ -597,6 +657,7 @@ pub fn fallback(
             scope: keyword_scope,
             subject: keyword_file_search.map(|(subject, _)| subject),
             reply: None,
+            mail_action: None,
             source: Source::Fallback,
         };
     }
@@ -606,6 +667,7 @@ pub fn fallback(
             scope: Scope::Any,
             subject: None,
             reply: None,
+            mail_action: None,
             source: Source::Fallback,
         };
     }
@@ -615,6 +677,7 @@ pub fn fallback(
             scope: keyword_scope,
             subject: Some(subject),
             reply: None,
+            mail_action: None,
             source: Source::Fallback,
         };
     }
@@ -624,6 +687,7 @@ pub fn fallback(
             scope: Scope::Any,
             subject: None,
             reply: None,
+            mail_action: None,
             source: Source::Fallback,
         };
     }

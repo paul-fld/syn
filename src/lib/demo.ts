@@ -14,6 +14,7 @@ const SETTINGS = {
   autostart: false,
   voice: { formality: "vous", address_form: "Monsieur", extras: [] },
   theme: "dark",
+  answer_language: "auto",
   voice_input_enabled: false,
   voice_output_enabled: false,
   bar_shortcut: "Alt+Space",
@@ -28,6 +29,7 @@ const SETTINGS = {
   notify_commitments: true,
   notify_system: true,
   notify_rules: true,
+  notify_reflexes: true,
   work_notification_policy: "urgent",
   cloud_escalation: false,
     sensitive_consent: true,
@@ -128,7 +130,56 @@ export async function demoInvoke(cmd: string, _args?: any): Promise<any> {
     case "list_triggers":
       return [
         { id: "t1", type: "threshold", condition: "cpu.pct>85", priority: "important", reason_template: "Règle active : #Surveille régulièrement les performances de mon ordinateur", action: "notify", source: "rule", enabled: true, last_fired: null, rule_text: "#Surveille régulièrement les performances de mon ordinateur" },
+        { id: "sys.mail_sans_reponse", type: "context", condition: "mail.sans_reponse", priority: "important", reason_template: "Message resté sans réponse", action: "notify", source: "system", enabled: true, last_fired: Date.now() / 1000 - 7200, rule_text: null },
+        { id: "sys.preparation_reunion", type: "context", condition: "agenda.reunion_imminente", priority: "important", reason_template: "Réunion imminente, avec de quoi la préparer", action: "notify", source: "system", enabled: true, last_fired: null, rule_text: null },
+        { id: "sys.engagement_oublie", type: "context", condition: "engagement.sans_suite", priority: "important", reason_template: "Engagement pris et resté sans suite", action: "notify", source: "system", enabled: true, last_fired: null, rule_text: null },
+        { id: "sys.dossier_qui_deborde", type: "context", condition: "fichiers.dossier_encombre", priority: "info", reason_template: "Dossier qui déborde, à ranger", action: "notify", source: "system", enabled: true, last_fired: null, rule_text: null },
+        { id: "sys.anniversaire_proche", type: "context", condition: "personne.anniversaire", priority: "info", reason_template: "Anniversaire d'un proche dans quelques jours", action: "notify", source: "system", enabled: true, last_fired: null, rule_text: null },
       ];
+    // La toile, la chronologie et les habitudes (prévisualisation navigateur).
+    case "memory_graph":
+      return {
+        stats: { relations: 386, noeuds: 74, contacts: 51, par_type: [] },
+        correspondants: [
+          { kind: "contact", id: "julie@exemple.fr", label: "Julie Martin", echanges: 48, last_seen: Date.now() / 1000 - 3600 },
+          { kind: "contact", id: "marc@exemple.fr", label: "Marc Dubois", echanges: 22, last_seen: Date.now() / 1000 - 86400 },
+        ],
+        identites: [{ address: "paul@moi.fr", observations: 380, presence_pct: 94, confirmed: true }],
+        identites_retenues: ["paul@moi.fr"],
+      };
+    case "memory_relations":
+      return {
+        trouve: true,
+        noeud: { kind: "contact", id: "julie@exemple.fr", label: "Julie Martin" },
+        documents_lies: [{ relation: "auteur_de", kind: "item", id: "i1", label: "Devis toiture", observations: 3, last_seen: Date.now() / 1000 - 7200 }],
+        gens_en_commun: [{ relation: "co_destinataire", kind: "contact", id: "marc@exemple.fr", label: "Marc Dubois", observations: 6, last_seen: Date.now() / 1000 - 86400 }],
+        rendez_vous: [],
+        echanges_observes: 48,
+      };
+    case "memory_timeline":
+      return {
+        total: 3,
+        jours: [
+          {
+            jour: "mardi 18 août 2026",
+            entrees: [
+              { at: Date.now() / 1000 - 3600, heure: "14h20", kind: "mail_recu", title: "Devis toiture", detail: "de Julie Martin", source_ref: "mail:1" },
+              { at: Date.now() / 1000 - 7200, heure: "11h05", kind: "action", title: "Envoyer un mail à Marc", detail: "fait par Syn", source_ref: "a1" },
+              { at: Date.now() / 1000 - 9000, heure: "09h30", kind: "rendez_vous", title: "Point chantier", detail: "Visio", source_ref: "e1" },
+            ],
+          },
+        ],
+      };
+    case "habits_list":
+      return [
+        { id: "h1", topic: "mail.compte", subject: "", value: "Gmail", observations: 12, last_seen: Date.now() / 1000, status: "confirmed", evidence: "compte utilisé pour tes derniers envois", phrase: "Tu envoies tes mails depuis Gmail." },
+        { id: "h2", topic: "mail.cloture", subject: "", value: "Bien à toi,", observations: 5, last_seen: Date.now() / 1000, status: "observed", evidence: "façon dont tu termines tes messages", phrase: "Tu termines tes messages par « Bien à toi, »." },
+      ];
+    case "memory_set_identity":
+    case "habits_decide":
+      return null;
+    case "memory_rebuild":
+      return { elements_relus: 420, habitudes: 6 };
     case "connector_status":
       return [
         { id: "files", type: "files", status: "connected", scopes: null, last_sync: null, detail: null },

@@ -12,6 +12,8 @@ commands.allow = [
   "hardware_info", "llm_status", "model_pull", "files_add_folder", "files_request_full_access",
   "files_activate_full_access", "files_remove_folder", "files_reindex", "files_index_status",
   "files_search", "search_memory", "knowledge_stats", "knowledge_file_groups", "list_knowledge",
+  "memory_graph", "memory_relations", "memory_timeline", "memory_set_identity", "memory_rebuild",
+  "habits_list", "habits_decide",
   "forget_item", "get_person_context", "people_list", "people_os_preview", "people_add",
   "unknowns_pending", "unknown_label", "unknown_ignore", "add_fact", "rules_add", "rules_edit",
   "rules_delete", "rules_list", "rules_set_priority", "list_surfacings", "dismiss_surfacing",

@@ -36,9 +36,11 @@ pub struct Brief {
 
 fn greeting(db: &Db) -> String {
     let settings = crate::settings::load(db).unwrap_or_default();
+    let speak = crate::i18n::ambient_speak(db, &settings);
+    let bonjour = speak.either("Bonjour", "Hello");
     match &settings.voice.address_form {
-        Some(addr) => format!("Bonjour {addr},"),
-        None => "Bonjour,".to_string(),
+        Some(addr) => format!("{bonjour} {addr},"),
+        None => format!("{bonjour},"),
     }
 }
 
@@ -54,6 +56,7 @@ pub fn build_brief(db: &Db) -> Result<Brief> {
             generated_at: now(),
         });
     }
+    let speak = crate::i18n::ambient_speak(db, &settings);
     let sections = &settings.brief_sections;
     let mut items: Vec<BriefItem> = vec![];
     let mut chips: Vec<BriefChip> = vec![];
@@ -67,11 +70,16 @@ pub fn build_brief(db: &Db) -> Result<Brief> {
                 .unwrap_or_default();
             items.push(BriefItem {
                 icon: "calendar".into(),
-                text: format!(
-                    "Aujourd'hui vous avez {} à {}",
-                    ev["title"].as_str().unwrap_or("?"),
-                    time
-                ),
+                text: if speak.is_en() {
+                    format!("Today you have {} at {}", ev["title"].as_str().unwrap_or("?"), time)
+                } else {
+                    format!(
+                        "Aujourd'hui {} {} à {}",
+                        speak.pick("tu as", "vous avez", "you have"),
+                        ev["title"].as_str().unwrap_or("?"),
+                        time
+                    )
+                },
                 sub: ev["location"].as_str().map(String::from),
                 source_ref: ev["id"].as_str().map(String::from),
                 kind: "event".into(),
@@ -103,9 +111,44 @@ pub fn build_brief(db: &Db) -> Result<Brief> {
                 .map(|l| l.trim_start_matches("De :").trim().to_string());
             items.push(BriefItem {
                 icon: "gmail".into(),
-                text: format!("Mail concernant « {title} »"),
+                text: if speak.is_en() {
+                    format!("Email about « {title} »")
+                } else {
+                    format!("Mail concernant « {title} »")
+                },
                 sub: from,
                 source_ref: Some(source_ref),
+                kind: "mail".into(),
+            });
+        }
+    }
+
+    // Messages qui attendent une réponse. C'est la ligne la plus utile d'un
+    // brief du matin, et elle manquait : Syn listait les mails récents sans
+    // jamais dire lesquels attendaient quelque chose de l'utilisateur.
+    if super::reflexes::est_actif(db, "sys.mail_sans_reponse") {
+        for attente in super::reflexes::en_attente_de_reponse(db, 3)? {
+            items.push(BriefItem {
+                icon: "mail-open".into(),
+                text: if speak.is_en() {
+                    format!(
+                        "{} is waiting for your reply about « {} »",
+                        attente.qui, attente.objet
+                    )
+                } else {
+                    format!(
+                        "{} attend {} réponse au sujet de « {} »",
+                        attente.qui,
+                        speak.pick("ta", "votre", "your"),
+                        attente.objet
+                    )
+                },
+                sub: Some(if speak.is_en() {
+                    format!("received {} days ago", attente.jours)
+                } else {
+                    format!("reçu il y a {} jours", attente.jours)
+                }),
+                source_ref: Some(attente.source_ref),
                 kind: "mail".into(),
             });
         }
@@ -127,7 +170,7 @@ pub fn build_brief(db: &Db) -> Result<Brief> {
         for (id, title) in tasks {
             items.push(BriefItem {
                 icon: "clock".into(),
-                text: format!("Tâche à faire : {title}"),
+                text: format!("{} {title}", speak.either("Tâche à faire :", "To do:")),
                 sub: None,
                 source_ref: Some(id),
                 kind: "task".into(),
@@ -151,7 +194,7 @@ pub fn build_brief(db: &Db) -> Result<Brief> {
         for (id, text) in commitments {
             items.push(BriefItem {
                 icon: "flag".into(),
-                text: format!("Engagement en cours : {text}"),
+                text: format!("{} {text}", speak.either("Engagement en cours :", "Open commitment:")),
                 sub: None,
                 source_ref: Some(id),
                 kind: "commitment".into(),
@@ -176,7 +219,11 @@ pub fn build_brief(db: &Db) -> Result<Brief> {
         for name in people {
             chips.push(BriefChip {
                 icon: "cake".into(),
-                text: format!("C'est l'anniversaire de {name} aujourd'hui"),
+                text: if speak.is_en() {
+                    format!("It's {name}'s birthday today")
+                } else {
+                    format!("C'est l'anniversaire de {name} aujourd'hui")
+                },
                 source_ref: None,
             });
         }
@@ -203,7 +250,11 @@ pub fn build_brief(db: &Db) -> Result<Brief> {
             if !title.is_empty() {
                 chips.push(BriefChip {
                     icon: "file".into(),
-                    text: format!("Continuer de travailler sur “{title}”"),
+                    text: if speak.is_en() {
+                        format!("Keep working on “{title}”")
+                    } else {
+                        format!("Continuer de travailler sur “{title}”")
+                    },
                     source_ref: Some(source_ref),
                 });
             }
@@ -332,6 +383,100 @@ pub fn build_daily_wrap(db: &Db) -> Result<Value> {
         "actions_executed_today": actions_today,
         "generated_at": now(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::new_id;
+
+    /// La ligne la plus utile du matin : qui attend une réponse. Et l'interrupteur
+    /// du réflexe la commande — couper l'un coupe l'autre.
+    #[test]
+    fn le_brief_dit_qui_attend_une_reponse() {
+        let dir = std::env::temp_dir().join(format!("syn-brief-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("t.db"), &"e".repeat(64)).unwrap();
+
+        // Sans section « events » : l'agenda natif demanderait une permission
+        // macOS que le test n'a pas — et ce n'est pas ce qu'on mesure ici.
+        let settings = crate::settings::Settings {
+            brief_sections: vec!["mails".into()],
+            ..Default::default()
+        };
+        crate::settings::save(&db, &settings).unwrap();
+
+        crate::memory::graph::set_self_address(&db, "paul@moi.fr", true).unwrap();
+        for _ in 0..3 {
+            crate::memory::graph::observe(
+                &db,
+                &crate::memory::graph::Node::new("contact", "julie@exemple.fr"),
+                "ecrit_a",
+                &crate::memory::graph::Node::moi(),
+                now(),
+                "mail",
+            )
+            .unwrap();
+        }
+        db.with(|c| {
+            c.execute(
+                "INSERT INTO items (id,source,source_ref,type,title,body,created_at,ingested_at,status)
+                 VALUES (?1,'mail','ref','email','Devis toiture',
+                         'De : Julie <julie@exemple.fr>' || char(10) || 'À : paul@moi.fr' || char(10) || 'Objet : Devis',
+                         ?2,?2,'active')",
+                params![new_id(), now() - 5 * 86_400],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let brief = build_brief(&db).unwrap();
+        assert!(
+            brief.items.iter().any(|item| item.text.contains("Julie")
+                && item.text.contains("attend")
+                && item.text.contains("réponse")),
+            "le brief doit signaler le message en attente : {:?}",
+            brief.items.iter().map(|i| &i.text).collect::<Vec<_>>()
+        );
+
+        // Le même brief, pour un utilisateur anglophone.
+        let anglais = crate::settings::Settings {
+            brief_sections: vec!["mails".into()],
+            answer_language: "en".into(),
+            ..Default::default()
+        };
+        crate::settings::save(&db, &anglais).unwrap();
+        let brief = build_brief(&db).unwrap();
+        assert!(
+            brief.greeting.starts_with("Hello"),
+            "{}",
+            brief.greeting
+        );
+        assert!(
+            brief.items.iter().any(|item| item
+                .text
+                .contains("is waiting for your reply")),
+            "{:?}",
+            brief.items.iter().map(|i| &i.text).collect::<Vec<_>>()
+        );
+        crate::settings::save(&db, &settings).unwrap();
+
+        super::super::reflexes::ensure_registered(&db).unwrap();
+        db.with(|c| {
+            c.execute(
+                "UPDATE triggers SET enabled=0 WHERE id='sys.mail_sans_reponse'",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let brief = build_brief(&db).unwrap();
+        assert!(
+            !brief.items.iter().any(|item| item.text.contains("attend ta réponse")),
+            "réflexe coupé : la ligne disparaît aussi du brief"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 /// Produit réellement le débrief à l'heure choisie, une seule fois par jour.

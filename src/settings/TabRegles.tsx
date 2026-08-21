@@ -5,6 +5,32 @@ import { ipc, type Rule, type RuleOutcome } from "../lib/ipc";
 import { label } from "../lib/voice";
 import { settings, refreshSettings } from "../lib/state";
 
+interface MailRuleParams {
+  action: "archive" | "trash" | "keep";
+  provider?: "google" | "microsoft" | null;
+  sender_terms: string[];
+  topics: string[];
+}
+
+function mailRuleSummary(rule: Rule): string | null {
+  if (rule.kind !== "mail_cleanup" || !rule.params || typeof rule.params !== "object") return null;
+  const params = rule.params as Partial<MailRuleParams>;
+  const action = { archive: "Archiver", trash: "Mettre à la corbeille", keep: "Conserver" }[params.action ?? ""];
+  if (!action) return null;
+  const topics: Record<string, string> = {
+    invoice: "factures et reçus",
+    booking: "réservations et billets",
+    marketing: "communications marketing",
+    notification: "notifications",
+  };
+  const criteria = [
+    ...(params.topics ?? []).map((topic) => topics[topic] ?? topic),
+    (params.sender_terms ?? []).length ? `expéditeur : ${(params.sender_terms ?? []).join(" ")}` : "",
+    params.provider === "google" ? "Gmail uniquement" : params.provider === "microsoft" ? "Outlook uniquement" : "",
+  ].filter(Boolean);
+  return `${action} · ${criteria.join(" · ")}`;
+}
+
 export function TabRegles(): JSX.Element {
   const [rules, { refetch }] = createResource(() => ipc.rulesList());
   const [draft, setDraft] = createSignal("");
@@ -84,6 +110,7 @@ export function TabRegles(): JSX.Element {
               {f.kind === "style" && " et appliquée au comportement de Syn."}
               {f.kind === "standing" && " et ajoutée à Mes programmations."}
               {f.kind === "action_modifier" && " et appliquée aux actions concernées."}
+              {f.kind === "mail_cleanup" && " et prioritaire lors du rangement de tes mails."}
             </Show>
           </div>
         )}
@@ -98,6 +125,9 @@ export function TabRegles(): JSX.Element {
           <div class="rule-line">
             <span class="grow" title={r.text}>
               {r.text}
+              <Show when={mailRuleSummary(r)} keyed>
+                {(summary) => <small class="muted" style={{ display: "block" }}>{summary}</small>}
+              </Show>
               <Show when={r.status === "conflict"}>
                 <span style={{ color: "var(--warn)" }}> (en conflit)</span>
               </Show>

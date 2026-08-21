@@ -46,6 +46,22 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0011_session_documents",
         include_str!("../../migrations/0011_session_documents.sql"),
     ),
+    (
+        "0012_memory_graph",
+        include_str!("../../migrations/0012_memory_graph.sql"),
+    ),
+    (
+        "0013_language",
+        include_str!("../../migrations/0013_language.sql"),
+    ),
+    (
+        "0014_mail_cleanup",
+        include_str!("../../migrations/0014_mail_cleanup.sql"),
+    ),
+    (
+        "0015_mail_cleanup_audit_v2",
+        include_str!("../../migrations/0015_mail_cleanup_audit_v2.sql"),
+    ),
 ];
 
 /// Normalisation de recherche : minuscules + suppression des diacritiques

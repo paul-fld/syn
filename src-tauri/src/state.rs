@@ -100,6 +100,12 @@ impl AppState {
             key_hex: Arc::new(std::sync::Mutex::new(key_hex.to_string())),
         });
         *self.core.write().unwrap() = Some(core.clone());
+        // Les réflexes sont inscrits dès l'ouverture : ce que Syn surveille doit
+        // être visible et débrayable dans « Mes programmations » avant même
+        // d'avoir eu l'occasion de se déclencher.
+        if let Err(e) = crate::proactivity::reflexes::ensure_registered(&core.db) {
+            eprintln!("inscription des réflexes : {e}");
+        }
         // Chargement des modèles dès le déverrouillage, en tâche de fond. Sans
         // cela, c'est la première question de l'utilisateur qui attend que les
         // poids montent en mémoire — le pire moment possible.

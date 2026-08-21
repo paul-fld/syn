@@ -1,6 +1,15 @@
 //! Mémoire (Intelligence §7) : working (conversations), épisodique (events, tasks,
 //! commitments, actions), sémantique (items + embeddings). Les faits personnels
 //! vivent ici, jamais dans les poids du modèle.
+//!
+//! Trois couches s'ajoutent à l'index de ressemblance, chacune répondant à une
+//! question que les embeddings seuls ne savent pas traiter :
+//! [`graph`] — QUI est relié à quoi ; [`timeline`] — QUAND les choses se sont
+//! passées ; [`habits`] — COMMENT l'utilisateur aime que les choses soient faites.
+
+pub mod graph;
+pub mod habits;
+pub mod timeline;
 
 use crate::db::{new_id, now, Db};
 use crate::error::Result;

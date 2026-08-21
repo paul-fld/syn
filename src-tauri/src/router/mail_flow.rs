@@ -85,8 +85,15 @@ pub async fn compose(
         5,
         "running",
     );
+    // La langue du mail suit celle que l'utilisateur parle à Syn : c'est le seul
+    // signal dont on dispose, et écrire à sa place dans une langue qu'il n'a pas
+    // choisie serait pire que de se tromper de mot.
+    let langue = match crate::i18n::session_speak(&core.db, session_id, settings).lang {
+        crate::i18n::Lang::Fr => "en français",
+        crate::i18n::Lang::En => "in English",
+    };
     let system = format!(
-        "Tu rédiges un mail pour l'utilisateur, en français, en son nom. \
+        "Tu rédiges un mail pour l'utilisateur, {langue}, en son nom. \
          Destinataire : {}. \
          Réponds UNIQUEMENT par un objet JSON {{\"objet\": \"…\", \"corps\": \"…\"}} : \
          aucun commentaire, aucune explication, aucun texte autour. \
@@ -119,11 +126,11 @@ pub async fn compose(
     let Some((subject, body)) = parse_draft(&response.content) else {
         // Rédaction inexploitable : on le dit, plutôt que de laisser le modèle
         // improviser une réponse qui ressemblerait à un envoi.
-        let text = settings
-            .voice
+        let text = crate::i18n::session_speak(&core.db, session_id, settings)
             .pick(
                 "Je n'ai pas réussi à rédiger ce message. Redis-moi en une phrase ce qu'il doit dire.",
                 "Je n'ai pas réussi à rédiger ce message. Redites-moi en une phrase ce qu'il doit dire.",
+                "I couldn't draft this message. Tell me again, in one sentence, what it should say.",
             )
             .to_string();
         memory::persist_turn(&core.db, session_id, "assistant", &text)?;
@@ -225,13 +232,28 @@ pub fn advance(
                 (*only).to_string()
             }
             _ => {
-                return Ok(Some(ask_account(
-                    core,
-                    session_id,
-                    &composition.recipient,
-                    &channels,
-                    settings,
-                )?))
+                // Une habitude que l'utilisateur a lui-même confirmée dans
+                // Connaissances ▸ Habitudes vaut réponse : reposer la question à
+                // chaque mail, c'est ne rien apprendre. Ce n'est pas un défaut
+                // caché pour autant — le compte retenu figure sur la carte de
+                // confirmation, avant que quoi que ce soit ne parte.
+                match crate::memory::habits::compte_denvoi_confirme(db)
+                    .filter(|prefere| channels.iter().any(|(id, _)| id == prefere))
+                {
+                    Some(prefere) => {
+                        mail::remember_composition(db, session_id, &json!({ "via": prefere }))?;
+                        prefere.to_string()
+                    }
+                    None => {
+                        return Ok(Some(ask_account(
+                            core,
+                            session_id,
+                            &composition.recipient,
+                            &channels,
+                            settings,
+                        )?))
+                    }
+                }
             }
         }
     } else {
@@ -418,31 +440,36 @@ fn explain_blockage(
         true,
         composition.recipient_is_resolved(),
     );
-    let voice = &settings.voice;
+    let speak = crate::i18n::session_speak(&core.db, session_id, settings);
     let text = match reason
         .as_ref()
         .and_then(|reason| reason["status"].as_str())
         .unwrap_or_default()
     {
-        "aucun_compte_denvoi" => voice.pick(
+        "aucun_compte_denvoi" => speak.pick(
             "Aucun compte ne peut envoyer de mail depuis cette machine. Connecte Google ou Microsoft dans Connecteurs, ou demande-moi d'enregistrer un brouillon.",
             "Aucun compte ne peut envoyer de mail depuis cette machine. Connectez Google ou Microsoft dans Connecteurs, ou demandez-moi d'enregistrer un brouillon.",
+            "No account on this machine can send mail. Connect Google or Microsoft in Connectors, or ask me to save a draft.",
         ),
-        "destinataire_non_resolu" => voice.pick(
+        "destinataire_non_resolu" => speak.pick(
             "Je n'ai pas d'adresse sûre pour ce destinataire. Donne-la-moi et je prépare l'envoi.",
             "Je n'ai pas d'adresse sûre pour ce destinataire. Donnez-la-moi et je prépare l'envoi.",
+            "I don't have a trustworthy address for this recipient. Give it to me and I'll prepare the message.",
         ),
-        "compte_indisponible" => voice.pick(
+        "compte_indisponible" => speak.pick(
             "Ce compte d'envoi n'est plus disponible. Dis-moi lequel utiliser à la place.",
             "Ce compte d'envoi n'est plus disponible. Dites-moi lequel utiliser à la place.",
+            "That sending account is no longer available. Tell me which one to use instead.",
         ),
-        "incomplet" => voice.pick(
+        "incomplet" => speak.pick(
             "Il me manque encore le texte du message.",
             "Il me manque encore le texte du message.",
+            "I'm still missing the text of the message.",
         ),
-        _ => voice.pick(
+        _ => speak.pick(
             "Je ne peux pas préparer cet envoi pour l'instant.",
             "Je ne peux pas préparer cet envoi pour l'instant.",
+            "I can't prepare this message for now.",
         ),
     }
     .to_string();
@@ -494,7 +521,11 @@ pub fn choose_account(
         session_id,
         &format!(
             "{} « {label} »",
-            settings.voice.pick("Tu as choisi", "Vous avez choisi")
+            crate::i18n::session_speak(db, session_id, settings).pick(
+                "Tu as choisi",
+                "Vous avez choisi",
+                "You chose"
+            )
         ),
     )?;
     let history = memory::recent_turns(db, session_id, 12)?
@@ -530,16 +561,17 @@ fn ask_review(
     composition: &mail::Composition,
     settings: &Settings,
 ) -> Result<Answer> {
-    let voice = &settings.voice;
+    let speak = crate::i18n::session_speak(&core.db, session_id, settings);
     let text = format!(
         "{} {} :\n\n{}\n\n{}",
-        voice.pick(
+        speak.pick(
             "Voici ce que je te propose d'envoyer à",
-            "Voici ce que je vous propose d'envoyer à"
+            "Voici ce que je vous propose d'envoyer à",
+            "Here's what I suggest sending to",
         ),
         composition.recipient,
         quote_block(&composition.body),
-        voice.pick("Tu valides ?", "Vous validez ?"),
+        speak.pick("Tu valides ?", "Vous validez ?", "Shall I send it?"),
     );
     memory::persist_turn(&core.db, session_id, "assistant", &text)?;
     emit_progress(
@@ -572,9 +604,10 @@ fn ask_account(
 ) -> Result<Answer> {
     let text = format!(
         "{} {recipient} ?",
-        settings.voice.pick(
+        crate::i18n::session_speak(&core.db, session_id, settings).pick(
             "Depuis quel compte souhaites-tu envoyer le mail à",
             "Depuis quel compte souhaitez-vous envoyer le mail à",
+            "Which account should the message to",
         )
     );
     memory::persist_turn(&core.db, session_id, "assistant", &text)?;
@@ -619,11 +652,11 @@ fn queue_confirmation(
     if let Some(existing) = actions::list_pending(db)?.into_iter().find(|action| {
         action.tool == "mail.send" && action.session_id.as_deref() == Some(session_id)
     }) {
-        let text = settings
-            .voice
+        let text = crate::i18n::session_speak(db, session_id, settings)
             .pick(
                 "Ce mail est prêt : il attend ta confirmation juste en dessous.",
                 "Ce mail est prêt : il attend votre confirmation juste en dessous.",
+                "This message is ready: it's waiting for your confirmation just below.",
             )
             .to_string();
         memory::persist_turn(db, session_id, "assistant", &text)?;
@@ -667,14 +700,21 @@ fn queue_confirmation(
         preview: preview.clone(),
         risk_class: risk.as_str().into(),
     });
-    let text = format!(
-        "D'accord, j'envoie ce mail à {} {} {} :",
-        composition.recipient,
-        settings
-            .voice
-            .pick("depuis ton compte", "depuis votre compte"),
-        mail::channel_label(via),
-    );
+    let speak = crate::i18n::session_speak(db, session_id, settings);
+    let text = if speak.is_en() {
+        format!(
+            "All right, I'll send this message to {} from your {} account:",
+            composition.recipient,
+            mail::channel_label(via),
+        )
+    } else {
+        format!(
+            "D'accord, j'envoie ce mail à {} {} {} :",
+            composition.recipient,
+            speak.pick("depuis ton compte", "depuis votre compte", "from your account"),
+            mail::channel_label(via),
+        )
+    };
     memory::persist_turn(db, session_id, "assistant", &text)?;
     emit_progress(
         core,

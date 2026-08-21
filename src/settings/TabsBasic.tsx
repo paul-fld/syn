@@ -188,6 +188,21 @@ export function TabPersonnalisation(): JSX.Element {
         />
       </SettingRow>
 
+      <SettingRow
+        label="Langue des réponses"
+        desc="Syn répond dans ta langue. En automatique, il la reconnaît à tes phrases. Sa langue de travail interne reste l'anglais, celle que comprennent le mieux les modèles et les services."
+      >
+        <select
+          class="select"
+          value={settings()?.answer_language ?? "auto"}
+          onChange={(e) => patch({ answer_language: e.currentTarget.value })}
+        >
+          <option value="auto">Automatique</option>
+          <option value="fr">Français</option>
+          <option value="en">English</option>
+        </select>
+      </SettingRow>
+
       <SettingRow label="Apparence" desc="Choisis le thème de l'interface.">
         <select class="select" value="dark">
           <option value="dark">Sombre</option>

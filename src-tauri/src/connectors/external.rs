@@ -11,7 +11,9 @@ use crate::memory::{self, Item};
 use base64::Engine;
 use futures_util::{stream, StreamExt};
 use rusqlite::params;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 const MAX_MESSAGES: usize = 100;
@@ -945,6 +947,29 @@ pub async fn enrich_item(
         } else {
             format!("{existing_body}\n\n{content}")
         }
+    } else if source == "mail" {
+        let mut parts = source_ref.splitn(3, ':');
+        let provider = parts.next().unwrap_or_default();
+        let kind = parts.next().unwrap_or_default();
+        let remote_id = parts
+            .next()
+            .ok_or_else(|| AppError::Invalid("référence mail incomplète".into()))?;
+        if kind != "gmail" && kind != "mail" {
+            return Err(AppError::Invalid("référence mail inconnue".into()));
+        }
+        let message = read_mail(provider, remote_id).await?;
+        let content = message["body"].as_str().unwrap_or_default();
+        if content.trim().is_empty() {
+            existing_body
+        } else {
+            format!(
+                "Objet : {}\nDe : {}\nDate : {}\n\n{}",
+                message["title"].as_str().unwrap_or(&title),
+                message["from"].as_str().unwrap_or_default(),
+                message["date"].as_str().unwrap_or_default(),
+                content
+            )
+        }
     } else {
         existing_body
     };
@@ -1044,6 +1069,28 @@ pub async fn live_search(kind: &str, query: &str) -> Vec<Value> {
     results
 }
 
+/// Recherche de messages à partir de termes déjà classés par distinctivité
+/// (mesurée sur le corpus de l'utilisateur par `retrieval::ranked_terms`).
+///
+/// C'est la voie qu'emprunte le parcours « retrouver un message » : elle sait
+/// quel mot est porteur et lequel est banal, ce qu'une simple chaîne de
+/// caractères ne dit pas.
+pub async fn live_mail_by_terms(terms: &[String], provider: &str) -> Result<Vec<Value>> {
+    if !super::oauth::has_token(provider) {
+        return Err(AppError::NotFound(format!(
+            "Le compte {provider} n'est pas connecté."
+        )));
+    }
+    let token = super::oauth::access_token(provider).await?;
+    match provider {
+        "google" => live_google_mail_terms(terms, &token).await,
+        "microsoft" => live_ms_mail_terms(terms, &token).await,
+        _ => Err(AppError::Invalid(format!(
+            "recherche de messages non prise en charge pour {provider}"
+        ))),
+    }
+}
+
 /// Variante stricte utilisée lorsqu'une requête nomme explicitement Google ou
 /// Microsoft. Elle ne doit jamais basculer silencieusement vers l'autre compte.
 pub async fn live_search_provider(kind: &str, query: &str, provider: &str) -> Result<Vec<Value>> {
@@ -1064,53 +1111,115 @@ pub async fn live_search_provider(kind: &str, query: &str, provider: &str) -> Re
     }
 }
 
-async fn live_google_mail(query: &str, token: &str) -> Result<Vec<Value>> {
-    let client = reqwest::Client::new();
-    // Gmail cherche TOUS les mots de `q` : lui passer la phrase de l'utilisateur
-    // ne ramenait jamais rien. On interroge avec les mots porteurs, puis on
-    // élargit au plus distinctif si la recherche stricte ne donne rien.
-    let terms = search_terms(query);
-    let mut tentatives = Vec::new();
-    if !terms.is_empty() {
-        tentatives.push(terms.join(" "));
-        if terms.len() > 1 {
-            tentatives.push(format!("{{{}}}", terms.join(" ")));
+/// Requêtes successives adressées à un fournisseur, de la plus précise à la
+/// plus large.
+///
+/// Les termes arrivent classés du plus DISTINCTIF au plus banal. On retire donc
+/// toujours le dernier — le plus vague — et jamais le premier.
+///
+/// L'ancienne version tentait la conjonction complète puis basculait sur une
+/// disjonction (`{a b c}`, « au moins un de ces mots »). Sur « le mail de
+/// Liverpool concernant mes tickets pour le match du 2 décembre », la
+/// conjonction ne trouvait rien — le message est en anglais, il ne contient ni
+/// « match » ni « décembre » — et la disjonction rendait tout message contenant
+/// « mail » : une facture de chaussures, une leçon d'espagnol, une promotion
+/// Google. Chercher moins de mots reste une recherche ; en chercher n'importe
+/// lequel n'en est plus une.
+pub(crate) fn narrowing_attempts(terms: &[String]) -> Vec<String> {
+    let mut attempts = Vec::new();
+    for taille in (1..=terms.len()).rev() {
+        let tentative = terms[..taille].join(" ");
+        if !attempts.contains(&tentative) {
+            attempts.push(tentative);
         }
     }
+    attempts
+}
+
+async fn live_google_mail(query: &str, token: &str) -> Result<Vec<Value>> {
+    live_google_mail_terms(&search_terms(query), token).await
+}
+
+/// Recherche Gmail à partir de termes déjà classés par distinctivité.
+pub(crate) async fn live_google_mail_terms(terms: &[String], token: &str) -> Result<Vec<Value>> {
+    let client = reqwest::Client::new();
+    let tentatives = narrowing_attempts(terms);
+    // Sans terme porteur, il n'y a rien à chercher. Envoyer la phrase brute
+    // ramènerait la boîte de réception au hasard, présentée comme une réponse.
     if tentatives.is_empty() {
-        tentatives.push(query.trim().to_string());
+        return Ok(vec![]);
     }
-    let mut list = Value::Null;
-    for tentative in &tentatives {
-        list = get_json(
+    let derniere = tentatives.len().saturating_sub(1);
+    // Une réponse non vide ne signifie pas que le bon message est dedans. Une
+    // newsletter peut satisfaire la requête stricte alors que la confirmation
+    // cherchée n'apparaît qu'au palier suivant. On réunit donc les paliers, en
+    // gardant pour chaque message la requête la plus précise qui l'a retrouvé.
+    let mut candidats: HashMap<String, f64> = HashMap::new();
+    let mut ordre = Vec::new();
+    let mut tentative_reussie = false;
+    let mut derniere_erreur = None;
+    for (rang, tentative) in tentatives.iter().enumerate() {
+        // La tentative la plus large est aussi la moins précise : on en demande
+        // davantage pour pouvoir classer nous-mêmes, plutôt que de subir
+        // l'ordre chronologique du fournisseur.
+        let plafond = if rang == derniere && tentatives.len() > 1 {
+            25
+        } else {
+            10
+        };
+        let list = get_json(
             &client,
             &format!(
-                "https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=10&q={}",
+                "https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults={plafond}&q={}",
                 urlencoding(tentative)
             ),
             token,
         )
-        .await?;
-        if list["messages"]
+        .await;
+        let list = match list {
+            Ok(list) => {
+                tentative_reussie = true;
+                list
+            }
+            Err(error) => {
+                derniere_erreur = Some(error);
+                continue;
+            }
+        };
+        let precision = (tentatives.len() - rang) as f64 / tentatives.len() as f64;
+        for id in list["messages"]
             .as_array()
-            .is_some_and(|found| !found.is_empty())
+            .into_iter()
+            .flatten()
+            .filter_map(|message| message["id"].as_str())
         {
-            break;
+            if !candidats.contains_key(id) {
+                ordre.push(id.to_string());
+            }
+            candidats
+                .entry(id.to_string())
+                .and_modify(|score| *score = score.max(precision))
+                .or_insert(precision);
         }
     }
-    let requests = list["messages"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|message| message["id"].as_str().map(str::to_string));
+    if !tentative_reussie {
+        return Err(derniere_erreur.unwrap_or_else(|| {
+            AppError::Other("aucune requête Gmail n'a pu être exécutée".into())
+        }));
+    }
+    // Plafond de sécurité : même une boîte très bruyante ne doit pas provoquer
+    // des centaines de téléchargements de corps pour une seule question.
+    ordre.truncate(80);
+    let requests = ordre.into_iter();
     let fetched = stream::iter(requests)
         .map(|id| {
             let client = client.clone();
             async move {
                 let value = get_json(
                     &client,
-                    &format!("https://gmail.googleapis.com/gmail/v1/users/me/messages/{id}?format=metadata&metadataHeaders=Subject&metadataHeaders=From&metadataHeaders=Date"),
+                    &format!(
+                        "https://gmail.googleapis.com/gmail/v1/users/me/messages/{id}?format=full"
+                    ),
                     token,
                 )
                 .await?;
@@ -1122,16 +1231,21 @@ async fn live_google_mail(query: &str, token: &str) -> Result<Vec<Value>> {
         .await;
     let mut out = Vec::new();
     for result in fetched {
-        let (id, value) = result?;
+        let Ok((id, value)) = result else { continue };
+        let payload = &value["payload"];
+        let from = gmail_header(payload, "From");
+        let date = gmail_header(payload, "Date");
+        let content: String = gmail_body(payload).chars().take(20_000).collect();
         out.push(json!({
             "item_id": format!("live:google:gmail:{id}"),
             "source": "mail",
             "source_ref": format!("google:gmail:{id}"),
-            "title": gmail_header(&value["payload"], "Subject"),
+            "title": gmail_header(payload, "Subject"),
             "path": format!("https://mail.google.com/mail/u/0/#all/{id}"),
-            "snippet": value["snippet"].as_str().unwrap_or_default(),
-            "from": gmail_header(&value["payload"], "From"),
-            "date": gmail_header(&value["payload"], "Date"),
+            "snippet": format!("De : {from}\nDate : {date}\n\n{content}"),
+            "from": from,
+            "date": date,
+            "score": candidats.get(&id).copied().unwrap_or_default(),
             "provider": "google",
             "live": true,
         }));
@@ -1333,45 +1447,113 @@ fn sort_by_score(values: &mut [Value]) {
 }
 
 async fn live_ms_mail(query: &str, token: &str) -> Result<Vec<Value>> {
+    live_ms_mail_terms(&search_terms(query), token).await
+}
+
+/// Recherche Outlook, même échelle de repli que Gmail.
+///
+/// Ici la requête n'échouait pas en silence : elle était envoyée entre
+/// guillemets, donc cherchée comme une EXPRESSION exacte. « liverpool tickets
+/// match decembre » ne figure évidemment nulle part, et la recherche rendait
+/// zéro résultat sans jamais réessayer plus court.
+pub(crate) async fn live_ms_mail_terms(terms: &[String], token: &str) -> Result<Vec<Value>> {
     let client = reqwest::Client::new();
-    // Même raison que pour Gmail : la phrase entière ne correspond à rien.
-    let terms = search_terms(query);
-    let keywords = if terms.is_empty() {
-        query.trim().to_string()
-    } else {
-        terms.join(" ")
-    };
-    let search = urlencoding(&format!("\"{keywords}\""));
-    let value = get_json(
-        &client,
-        &format!("https://graph.microsoft.com/v1.0/me/messages?$search={search}&$top=10&$select=id,subject,from,receivedDateTime,bodyPreview,webLink"),
-        token,
-    )
-    .await?;
-    Ok(value["value"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|mail| {
-            let id = mail["id"].as_str()?.to_string();
-            Some(json!({
+    let tentatives = narrowing_attempts(terms);
+    if tentatives.is_empty() {
+        return Ok(vec![]);
+    }
+    let derniere = tentatives.len().saturating_sub(1);
+    let mut candidats: HashMap<String, (f64, Value)> = HashMap::new();
+    let mut ordre = Vec::new();
+    let mut tentative_reussie = false;
+    let mut derniere_erreur = None;
+    for (rang, tentative) in tentatives.iter().enumerate() {
+        let plafond = if rang == derniere && tentatives.len() > 1 {
+            25
+        } else {
+            10
+        };
+        let search = urlencoding(&format!("\"{tentative}\""));
+        let value = get_json(
+            &client,
+            &format!("https://graph.microsoft.com/v1.0/me/messages?$search={search}&$top={plafond}&$select=id,subject,from,receivedDateTime,bodyPreview,webLink"),
+            token,
+        )
+        .await;
+        let value = match value {
+            Ok(value) => {
+                tentative_reussie = true;
+                value
+            }
+            Err(error) => {
+                derniere_erreur = Some(error);
+                continue;
+            }
+        };
+        let precision = (tentatives.len() - rang) as f64 / tentatives.len() as f64;
+        for mail in value["value"].as_array().into_iter().flatten() {
+            let Some(id) = mail["id"].as_str() else {
+                continue;
+            };
+            if !candidats.contains_key(id) {
+                ordre.push(id.to_string());
+            }
+            candidats
+                .entry(id.to_string())
+                .and_modify(|(score, _)| *score = score.max(precision))
+                .or_insert((precision, mail.clone()));
+        }
+    }
+    if !tentative_reussie {
+        return Err(derniere_erreur.unwrap_or_else(|| {
+            AppError::Other("aucune requête Outlook n'a pu être exécutée".into())
+        }));
+    }
+    ordre.truncate(80);
+    let fetched = stream::iter(ordre)
+        .map(|id| {
+            let client = client.clone();
+            async move {
+                let mail = get_json(
+                    &client,
+                    &format!("https://graph.microsoft.com/v1.0/me/messages/{id}?$select=id,subject,from,receivedDateTime,body,bodyPreview,webLink"),
+                    token,
+                )
+                .await?;
+                Ok::<_, AppError>((id, mail))
+            }
+        })
+        .buffer_unordered(10)
+        .collect::<Vec<_>>()
+        .await;
+    let mut out = Vec::new();
+    for result in fetched {
+        let Ok((id, mail)) = result else { continue };
+        let (precision, _) = candidats.get(&id).cloned().unwrap_or_default();
+        let from = mail["from"]["emailAddress"]["name"]
+            .as_str()
+            .or_else(|| mail["from"]["emailAddress"]["address"].as_str())
+            .unwrap_or_default();
+        let date = mail["receivedDateTime"].as_str().unwrap_or_default();
+        let content: String = strip_html(mail["body"]["content"].as_str().unwrap_or_default())
+            .chars()
+            .take(20_000)
+            .collect();
+        out.push(json!({
                 "item_id": format!("live:microsoft:mail:{id}"),
                 "source": "mail",
                 "source_ref": format!("microsoft:mail:{id}"),
                 "title": mail["subject"],
                 "path": mail["webLink"],
-                "snippet": mail["bodyPreview"],
-                "from": mail["from"]["emailAddress"]["name"]
-                    .as_str()
-                    .or_else(|| mail["from"]["emailAddress"]["address"].as_str())
-                    .unwrap_or_default(),
-                "date": mail["receivedDateTime"],
+                "snippet": format!("De : {from}\nDate : {date}\n\n{content}"),
+                "from": from,
+                "date": date,
+                "score": precision,
                 "provider": "microsoft",
                 "live": true,
-            }))
-        })
-        .collect())
+        }));
+    }
+    Ok(out)
 }
 
 async fn live_ms_drive(query: &str, token: &str) -> Result<Vec<Value>> {
@@ -1865,6 +2047,749 @@ pub async fn read_mail(provider: &str, id: &str) -> Result<Value> {
     Ok(resume)
 }
 
+/// Identifiants actuellement présents dans la boîte de réception distante.
+/// L'audit ne se contente pas du cache local : Gmail y contient aussi des
+/// messages déjà archivés, qui ne doivent surtout pas être « rangés » à nouveau.
+pub async fn mail_inbox_ids(provider: &str, limit: usize) -> Result<Vec<String>> {
+    let token = super::oauth::access_token(provider).await?;
+    let client = reqwest::Client::new();
+    let mut ids = Vec::new();
+    if provider == "google" {
+        let mut page: Option<String> = None;
+        while ids.len() < limit {
+            let mut url = "https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=500&labelIds=INBOX".to_string();
+            if let Some(page) = page.as_deref() {
+                url.push_str("&pageToken=");
+                url.push_str(&urlencoding(page));
+            }
+            let value = get_json(&client, &url, &token).await?;
+            ids.extend(
+                value["messages"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|message| message["id"].as_str().map(str::to_string)),
+            );
+            page = value["nextPageToken"].as_str().map(str::to_string);
+            if page.is_none() {
+                break;
+            }
+        }
+    } else if provider == "microsoft" {
+        let mut url = "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages?$top=1000&$select=id".to_string();
+        while ids.len() < limit {
+            if !url.starts_with("https://graph.microsoft.com/") {
+                return Err(AppError::Security(
+                    "Pagination Outlook sortie du domaine Microsoft.".into(),
+                ));
+            }
+            let value = get_json(&client, &url, &token).await?;
+            ids.extend(
+                value["value"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|message| message["id"].as_str().map(str::to_string)),
+            );
+            let Some(next) = value["@odata.nextLink"].as_str() else {
+                break;
+            };
+            url = next.to_string();
+        }
+    } else {
+        return Err(AppError::Invalid(
+            "Le rangement est disponible uniquement pour Gmail ou Outlook.".into(),
+        ));
+    }
+    ids.truncate(limit);
+    Ok(ids)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MailAuditMessage {
+    pub id: String,
+    pub title: String,
+    pub sender: String,
+    pub body: String,
+    pub received_at: i64,
+    /// Index de la première règle utilisateur ayant amené ce message dans
+    /// l'échantillon. Les règles sont déjà classées par priorité.
+    pub rule_index: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MailboxInventory {
+    pub message_count: usize,
+    pub conversation_count: Option<usize>,
+    pub unread_count: Option<usize>,
+    pub inspected: Vec<MailAuditMessage>,
+}
+
+async fn gmail_query_ids(
+    client: &reqwest::Client,
+    token: &str,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<String>> {
+    let mut ids = Vec::new();
+    let mut page: Option<String> = None;
+    while ids.len() < limit {
+        let remaining = limit.saturating_sub(ids.len()).min(500);
+        let mut url = format!(
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults={remaining}&q={}",
+            urlencoding(query)
+        );
+        if let Some(page) = page.as_deref() {
+            url.push_str("&pageToken=");
+            url.push_str(&urlencoding(page));
+        }
+        let value = get_json(client, &url, token).await?;
+        ids.extend(
+            value["messages"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|message| message["id"].as_str().map(str::to_string)),
+        );
+        page = value["nextPageToken"].as_str().map(str::to_string);
+        if page.is_none() {
+            break;
+        }
+    }
+    ids.truncate(limit);
+    Ok(ids)
+}
+
+fn gmail_rule_query(rule: &crate::rules::MailCleanupRule) -> String {
+    let mut parts = vec!["in:inbox".to_string()];
+    parts.extend(
+        rule.sender_terms
+            .iter()
+            .map(|term| format!("from:{}", term.replace(['\"', '\'', '(', ')'], ""))),
+    );
+    for topic in &rule.topics {
+        parts.push(match topic.as_str() {
+            "invoice" => "{facture invoice receipt reçu}".into(),
+            "booking" => "{réservation reservation booking billet ticket}".into(),
+            "marketing" => "{promotion promo newsletter offre offer}".into(),
+            "notification" => "{notification alerte digest}".into(),
+            _ => String::new(),
+        });
+    }
+    parts.retain(|part| !part.is_empty());
+    parts.join(" ")
+}
+
+/// Inventaire distant destiné au rangement. Gmail fournit ses compteurs de
+/// libellé (messages, fils et non-lus), puis Syn hydrate les cohortes réellement
+/// actionnables. Outlook permet de paginer les métadonnées de toute la boîte en
+/// quelques appels. Dans les deux cas, le petit index local n'est plus la source
+/// de vérité de l'audit.
+pub async fn mail_cleanup_inventory(
+    provider: &str,
+    rules: &[crate::rules::MailCleanupRule],
+    candidate_limit: usize,
+) -> Result<MailboxInventory> {
+    let token = super::oauth::access_token(provider).await?;
+    let client = reqwest::Client::new();
+    if provider == "google" {
+        let label = get_json(
+            &client,
+            "https://gmail.googleapis.com/gmail/v1/users/me/labels/INBOX",
+            &token,
+        )
+        .await?;
+        let message_count = label["messagesTotal"].as_u64().unwrap_or_default() as usize;
+        let conversation_count = label["threadsTotal"].as_u64().map(|value| value as usize);
+        let unread_count = label["messagesUnread"].as_u64().map(|value| value as usize);
+        let mut candidates: Vec<String> = Vec::new();
+        let mut seen = HashSet::new();
+        let mut rule_for_id: HashMap<String, usize> = HashMap::new();
+
+        // Les règles explicites passent avant les heuristiques et disposent du
+        // budget en premier. La correspondance sera revérifiée sur le contenu.
+        for (index, rule) in rules.iter().enumerate() {
+            let remaining = candidate_limit.saturating_sub(candidates.len());
+            if remaining == 0 {
+                break;
+            }
+            for id in gmail_query_ids(&client, &token, &gmail_rule_query(rule), remaining).await? {
+                rule_for_id.entry(id.clone()).or_insert(index);
+                if seen.insert(id.clone()) {
+                    candidates.push(id);
+                }
+            }
+        }
+
+        // Cohortes natives et requêtes de rappel : très bon rendement pour une
+        // boîte volumineuse, sans prétendre que les messages hors cohorte ont été
+        // lus. Les plus anciens et les promotions passent en premier.
+        for query in [
+            "in:inbox category:promotions older_than:365d",
+            "in:inbox category:promotions",
+            "in:inbox category:social older_than:90d",
+            "in:inbox category:forums older_than:90d",
+            "in:inbox category:updates older_than:180d",
+            "in:inbox older_than:365d {unsubscribe newsletter promotion promo offre offer}",
+        ] {
+            let remaining = candidate_limit.saturating_sub(candidates.len());
+            if remaining == 0 {
+                break;
+            }
+            for id in gmail_query_ids(&client, &token, query, remaining).await? {
+                if seen.insert(id.clone()) {
+                    candidates.push(id);
+                }
+            }
+        }
+
+        let candidate_count = candidates.len();
+        let fetched = stream::iter(candidates)
+            .map(|id| {
+                let client = client.clone();
+                let token = token.clone();
+                let rule_index = rule_for_id.get(&id).copied();
+                async move {
+                    let value = get_json(
+                        &client,
+                        &format!("https://gmail.googleapis.com/gmail/v1/users/me/messages/{id}?format=full"),
+                        &token,
+                    )
+                    .await?;
+                    let payload = &value["payload"];
+                    Ok::<_, AppError>(MailAuditMessage {
+                        id,
+                        title: gmail_header(payload, "Subject"),
+                        sender: gmail_header(payload, "From"),
+                        body: gmail_body(payload).chars().take(8_000).collect(),
+                        received_at: value["internalDate"]
+                            .as_str()
+                            .and_then(|raw| raw.parse::<i64>().ok())
+                            .map(|millis| millis / 1_000)
+                            .unwrap_or_default(),
+                        rule_index,
+                    })
+                }
+            })
+            .buffer_unordered(12)
+            .collect::<Vec<_>>()
+            .await;
+        let mut inspected = Vec::with_capacity(fetched.len());
+        let mut first_error = None;
+        for result in fetched {
+            match result {
+                Ok(message) => inspected.push(message),
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
+            }
+        }
+        if candidate_count > 0 && inspected.is_empty() {
+            return Err(first_error.unwrap_or_else(|| {
+                AppError::Other("Gmail n’a renvoyé aucun candidat exploitable.".into())
+            }));
+        }
+        return Ok(MailboxInventory {
+            message_count,
+            conversation_count,
+            unread_count,
+            inspected,
+        });
+    }
+
+    if provider != "microsoft" {
+        return Err(AppError::Invalid(
+            "Le rangement est disponible uniquement pour Gmail ou Outlook.".into(),
+        ));
+    }
+    let folder = get_json(
+        &client,
+        "https://graph.microsoft.com/v1.0/me/mailFolders/inbox?$select=totalItemCount,unreadItemCount",
+        &token,
+    )
+    .await?;
+    let message_count = folder["totalItemCount"].as_u64().unwrap_or_default() as usize;
+    let unread_count = folder["unreadItemCount"].as_u64().map(|value| value as usize);
+    let mut inspected = Vec::with_capacity(message_count.min(candidate_limit));
+    let mut url = "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages?$top=1000&$select=id,subject,from,receivedDateTime,bodyPreview".to_string();
+    while !url.is_empty() {
+        if !url.starts_with("https://graph.microsoft.com/") {
+            return Err(AppError::Security(
+                "Pagination Outlook sortie du domaine Microsoft.".into(),
+            ));
+        }
+        let value = get_json(&client, &url, &token).await?;
+        for message in value["value"].as_array().into_iter().flatten() {
+            let sender = message["from"]["emailAddress"]["address"]
+                .as_str()
+                .or_else(|| message["from"]["emailAddress"]["name"].as_str())
+                .unwrap_or_default()
+                .to_string();
+            inspected.push(MailAuditMessage {
+                id: message["id"].as_str().unwrap_or_default().to_string(),
+                title: message["subject"].as_str().unwrap_or_default().to_string(),
+                sender,
+                body: message["bodyPreview"].as_str().unwrap_or_default().to_string(),
+                received_at: message["receivedDateTime"]
+                    .as_str()
+                    .and_then(timestamp)
+                    .unwrap_or_default(),
+                rule_index: None,
+            });
+        }
+        url = value["@odata.nextLink"].as_str().unwrap_or_default().to_string();
+    }
+    Ok(MailboxInventory {
+        message_count,
+        conversation_count: None,
+        unread_count,
+        inspected,
+    })
+}
+
+fn header_value<'a>(headers: &'a Value, name: &str) -> Option<&'a str> {
+    headers.as_array()?.iter().find_map(|header| {
+        header["name"]
+            .as_str()
+            .filter(|value| value.eq_ignore_ascii_case(name))
+            .and_then(|_| header["value"].as_str())
+    })
+}
+
+fn safe_one_click_url(headers: &Value) -> Option<String> {
+    let one_click = header_value(headers, "List-Unsubscribe-Post")?;
+    if !one_click.eq_ignore_ascii_case("List-Unsubscribe=One-Click") {
+        return None;
+    }
+    header_value(headers, "List-Unsubscribe")?
+        .split(',')
+        .map(str::trim)
+        .map(|entry| entry.trim_matches(|character| character == '<' || character == '>'))
+        .find_map(|entry| {
+            let parsed = url::Url::parse(entry).ok()?;
+            let public_host = match parsed.host()? {
+                url::Host::Domain(host) => {
+                    !host.eq_ignore_ascii_case("localhost") && !host.ends_with(".local")
+                }
+                url::Host::Ipv4(ip) => public_ip(std::net::IpAddr::V4(ip)),
+                url::Host::Ipv6(ip) => public_ip(std::net::IpAddr::V6(ip)),
+            };
+            (public_host
+                && parsed.scheme() == "https"
+                && parsed.username().is_empty()
+                && parsed.password().is_none()
+                && parsed.host_str().is_some())
+            .then(|| parsed.to_string())
+        })
+}
+
+/// Détecte uniquement le standard RFC 8058 « one click ». Les liens HTML et
+/// les `mailto:` ne sont jamais ouverts ou suivis automatiquement.
+#[allow(clippy::redundant_iter_cloned)] // owned values keep Tauri command futures Send + 'static
+pub async fn mail_one_click_unsubscribe_options(
+    provider: &str,
+    ids: &[String],
+) -> HashMap<String, String> {
+    let Ok(token) = super::oauth::access_token(provider).await else {
+        return HashMap::new();
+    };
+    let client = reqwest::Client::new();
+    let provider = provider.to_string();
+    let results = stream::iter(ids.iter().cloned().map(|id| {
+        let client = client.clone();
+        let token = token.clone();
+        let provider = provider.clone();
+        async move {
+            let value = if provider == "google" {
+                get_json(
+                    &client,
+                    &format!(
+                        "https://gmail.googleapis.com/gmail/v1/users/me/messages/{}?format=metadata&metadataHeaders=List-Unsubscribe&metadataHeaders=List-Unsubscribe-Post",
+                        urlencoding(&id)
+                    ),
+                    &token,
+                )
+                .await
+                .ok()?
+            } else {
+                get_json(
+                    &client,
+                    &format!(
+                        "https://graph.microsoft.com/v1.0/me/messages/{}?$select=internetMessageHeaders",
+                        urlencoding(&id)
+                    ),
+                    &token,
+                )
+                .await
+                .ok()?
+            };
+            let headers = if provider == "google" {
+                &value["payload"]["headers"]
+            } else {
+                &value["internetMessageHeaders"]
+            };
+            safe_one_click_url(headers).map(|url| (id, url))
+        }
+    }))
+    .buffer_unordered(8)
+    .collect::<Vec<_>>()
+    .await;
+    results.into_iter().flatten().collect()
+}
+
+fn public_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(ip) => {
+            let [first, second, _, _] = ip.octets();
+            !ip.is_private()
+                && !ip.is_loopback()
+                && !ip.is_link_local()
+                && !ip.is_broadcast()
+                && !ip.is_documentation()
+                && !ip.is_unspecified()
+                && !ip.is_multicast()
+                && first != 0
+                && !(first == 100 && (64..=127).contains(&second))
+        }
+        std::net::IpAddr::V6(ip) => {
+            if let Some(mapped) = ip.to_ipv4_mapped() {
+                return public_ip(std::net::IpAddr::V4(mapped));
+            }
+            !ip.is_loopback()
+                && !ip.is_unspecified()
+                && !ip.is_unique_local()
+                && !ip.is_unicast_link_local()
+                && !ip.is_multicast()
+        }
+    }
+}
+
+async fn one_click_unsubscribe(url: &str) -> std::result::Result<(), String> {
+    let parsed = url::Url::parse(url).map_err(|error| error.to_string())?;
+    if parsed.scheme() != "https" || parsed.username() != "" || parsed.password().is_some() {
+        return Err("URL de désabonnement non sûre".into());
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "Hôte de désabonnement absent".to_string())?;
+    if host.eq_ignore_ascii_case("localhost") || host.ends_with(".local") {
+        return Err("Hôte local refusé".into());
+    }
+    let addresses = tokio::net::lookup_host((host, 443))
+        .await
+        .map_err(|error| error.to_string())?
+        .filter(|address| public_ip(address.ip()))
+        .collect::<Vec<_>>();
+    let address = addresses
+        .first()
+        .copied()
+        .ok_or_else(|| "Aucune adresse publique pour le désabonnement".to_string())?;
+    // Résolution épinglée + redirections interdites : l'URL issue du mail ne
+    // peut ni rebondir vers le réseau local, ni changer d'adresse après le test.
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve(host, address)
+        .build()
+        .map_err(|error| error.to_string())?;
+    let response = client
+        .post(parsed)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body("List-Unsubscribe=One-Click")
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        Err(format!("désabonnement refusé : {}", response.status()))
+    }
+}
+
+#[allow(clippy::redundant_iter_cloned)] // owned values keep Tauri command futures Send + 'static
+async fn apply_unsubscribe_urls(urls: &[String]) -> (usize, Vec<String>) {
+    let results = stream::iter(
+        urls.iter()
+            .cloned()
+            .map(|url| async move { one_click_unsubscribe(&url).await }),
+    )
+    .buffer_unordered(4)
+    .collect::<Vec<_>>()
+    .await;
+    let mut success = 0usize;
+    let mut errors = Vec::new();
+    for result in results {
+        match result {
+            Ok(()) => success += 1,
+            Err(error) => errors.push(error),
+        }
+    }
+    (success, errors)
+}
+
+async fn gmail_batch_labels(
+    client: &reqwest::Client,
+    token: &str,
+    ids: &[String],
+    add: &[&str],
+    remove: &[&str],
+) -> std::result::Result<(), String> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let response = client
+        .post("https://gmail.googleapis.com/gmail/v1/users/me/messages/batchModify")
+        .bearer_auth(token)
+        .json(&json!({"ids": ids, "addLabelIds": add, "removeLabelIds": remove}))
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    let status = response.status();
+    if status.is_success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Gmail a refusé le lot ({status}) : {}",
+            response.text().await.unwrap_or_default()
+        ))
+    }
+}
+
+async fn gmail_message_action(
+    client: &reqwest::Client,
+    token: &str,
+    id: &str,
+    action: &str,
+) -> std::result::Result<String, String> {
+    let response = client
+        .post(format!(
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/{}/{action}",
+            urlencoding(id)
+        ))
+        .bearer_auth(token)
+        .header("content-length", "0")
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    if response.status().is_success() {
+        Ok(id.to_string())
+    } else {
+        Err(format!("{id}: {}", response.status()))
+    }
+}
+
+async fn microsoft_move_message(
+    client: &reqwest::Client,
+    token: &str,
+    id: &str,
+    destination: &str,
+) -> std::result::Result<(String, String), String> {
+    let response = client
+        .post(format!(
+            "https://graph.microsoft.com/v1.0/me/messages/{}/move",
+            urlencoding(id)
+        ))
+        .bearer_auth(token)
+        .json(&json!({"destinationId": destination}))
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    let status = response.status();
+    let value: Value = response.json().await.unwrap_or_else(|_| json!({}));
+    if !status.is_success() {
+        return Err(format!("{id}: {status}"));
+    }
+    let new_id = value["id"]
+        .as_str()
+        .ok_or_else(|| format!("{id}: Outlook n'a pas rendu le nouvel identifiant"))?;
+    Ok((id.to_string(), new_id.to_string()))
+}
+
+async fn microsoft_move_messages(
+    client: &reqwest::Client,
+    token: &str,
+    ids: &[String],
+    destination: &'static str,
+) -> Vec<std::result::Result<(String, String), String>> {
+    let owned_ids = ids.to_vec();
+    stream::iter(owned_ids.into_iter().map(|id| {
+        let client = client.clone();
+        let token = token.to_string();
+        async move { microsoft_move_message(&client, &token, &id, destination).await }
+    }))
+    .buffer_unordered(8)
+    .collect::<Vec<_>>()
+    .await
+}
+
+/// Applique un plan borné et renvoie le journal nécessaire à son annulation.
+/// Les erreurs unitaires n'effacent jamais le journal des éléments déjà traités.
+pub async fn apply_mail_cleanup(
+    provider: &str,
+    archive_ids: &[String],
+    trash_ids: &[String],
+    unsubscribe_urls: &[String],
+) -> Result<(Value, Value)> {
+    let token = super::oauth::access_token(provider).await?;
+    let client = reqwest::Client::new();
+    let mut archived = Vec::new();
+    let mut trashed = Vec::new();
+    let mut errors = Vec::new();
+
+    if provider == "google" {
+        for chunk in archive_ids.chunks(1_000) {
+            match gmail_batch_labels(&client, &token, chunk, &[], &["INBOX"]).await {
+                Ok(()) => archived.extend(chunk.iter().cloned()),
+                Err(error) => errors.push(error),
+            }
+        }
+        let owned_trash = trash_ids.to_vec();
+        let results = stream::iter(owned_trash.into_iter().map(|id| {
+            let client = client.clone();
+            let token = token.clone();
+            async move { gmail_message_action(&client, &token, &id, "trash").await }
+        }))
+        .buffer_unordered(12)
+        .collect::<Vec<_>>()
+        .await;
+        for result in results {
+            match result {
+                Ok(id) => trashed.push(id),
+                Err(error) => errors.push(error),
+            }
+        }
+    } else if provider == "microsoft" {
+        for result in microsoft_move_messages(&client, &token, archive_ids, "archive").await {
+            match result {
+                Ok(pair) => archived.push(format!("{}\t{}", pair.0, pair.1)),
+                Err(error) => errors.push(error),
+            }
+        }
+        for result in microsoft_move_messages(&client, &token, trash_ids, "deleteditems").await {
+            match result {
+                Ok(pair) => trashed.push(format!("{}\t{}", pair.0, pair.1)),
+                Err(error) => errors.push(error),
+            }
+        }
+    } else {
+        return Err(AppError::Invalid("Fournisseur de plan invalide.".into()));
+    }
+    let (unsubscribed, unsubscribe_errors) = apply_unsubscribe_urls(unsubscribe_urls).await;
+    errors.extend(unsubscribe_errors);
+
+    if (!archive_ids.is_empty() || !trash_ids.is_empty())
+        && archived.is_empty()
+        && trashed.is_empty()
+        && unsubscribed == 0
+        && !errors.is_empty()
+    {
+        let detail = errors.iter().take(3).cloned().collect::<Vec<_>>().join(" ; ");
+        if detail.contains("401") || detail.contains("403") {
+            return Err(AppError::Security(format!(
+                "Le compte n'autorise pas encore le rangement. Reconnecte-le depuis Connecteurs, puis relance l'audit. {detail}"
+            )));
+        }
+        return Err(AppError::Other(format!(
+            "Aucun message n'a pu être rangé : {detail}"
+        )));
+    }
+    let report = json!({
+        "provider": provider,
+        "archived": archived.len(),
+        "trashed": trashed.len(),
+        "unsubscribed": unsubscribed,
+        "failed": errors.len(),
+        "errors": errors.iter().take(10).collect::<Vec<_>>(),
+    });
+    let undo = json!({
+        "kind": "mail_cleanup",
+        "provider": provider,
+        "archived": archived,
+        "trashed": trashed,
+        "unsubscribe_irreversible": unsubscribed,
+    });
+    Ok((report, undo))
+}
+
+pub async fn undo_mail_cleanup(undo: &Value) -> Result<String> {
+    let provider = undo["provider"]
+        .as_str()
+        .ok_or_else(|| AppError::Invalid("Fournisseur d'annulation manquant.".into()))?;
+    let token = super::oauth::access_token(provider).await?;
+    let client = reqwest::Client::new();
+    let archived = undo["archived"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str().map(str::to_string))
+        .collect::<Vec<_>>();
+    let trashed = undo["trashed"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str().map(str::to_string))
+        .collect::<Vec<_>>();
+    let mut restored = 0usize;
+    let mut failed = 0usize;
+    let irreversible = undo["unsubscribe_irreversible"].as_u64().unwrap_or(0);
+    if provider == "google" {
+        for chunk in archived.chunks(1_000) {
+            match gmail_batch_labels(&client, &token, chunk, &["INBOX"], &[]).await {
+                Ok(()) => restored += chunk.len(),
+                Err(_) => failed += chunk.len(),
+            }
+        }
+        let results = stream::iter(trashed.into_iter().map(|id| {
+                let client = client.clone();
+                let token = token.clone();
+                async move { gmail_message_action(&client, &token, &id, "untrash").await }
+            }))
+        .buffer_unordered(12)
+        .collect::<Vec<_>>()
+        .await;
+        for result in results {
+            if result.is_ok() {
+                restored += 1;
+            } else {
+                failed += 1;
+            }
+        }
+    } else if provider == "microsoft" {
+        let new_ids = archived
+            .into_iter()
+            .chain(trashed)
+            .filter_map(|pair| pair.split_once('\t').map(|(_, new_id)| new_id.to_string()));
+        let results = stream::iter(new_ids.map(|id| {
+            let client = client.clone();
+            let token = token.clone();
+            async move { microsoft_move_message(&client, &token, &id, "inbox").await }
+        }))
+        .buffer_unordered(8)
+        .collect::<Vec<_>>()
+        .await;
+        for result in results {
+            if result.is_ok() {
+                restored += 1;
+            } else {
+                failed += 1;
+            }
+        }
+    } else {
+        return Err(AppError::Invalid("Fournisseur d'annulation invalide.".into()));
+    }
+    Ok(format!(
+        "{restored} message(s) remis dans la boîte de réception{}{}.",
+        if failed > 0 {
+            format!(" ; {failed} restauration(s) ont échoué")
+        } else {
+            String::new()
+        },
+        if irreversible > 0 {
+            format!(" ; {irreversible} désabonnement(s) restent actifs")
+        } else {
+            String::new()
+        }
+    ))
+}
+
 /// Met un message à la corbeille. Jamais une suppression définitive : le
 /// message reste récupérable chez le fournisseur pendant 30 jours.
 pub async fn trash_mail(provider: &str, id: &str) -> Result<Value> {
@@ -2009,6 +2934,46 @@ fn urlencoding(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Régression du 19/08/2026 : « le mail de Liverpool concernant mes tickets
+    /// pour le match du 2 décembre » ne trouvait pas la confirmation de
+    /// réservation, mais rendait huit messages sans rapport.
+    ///
+    /// La cause tenait à la dernière tentative : une DISJONCTION. Chercher
+    /// moins de mots reste une recherche ; en chercher n'importe lequel n'en
+    /// est plus une.
+    #[test]
+    fn les_tentatives_retirent_le_mot_le_plus_banal_jamais_le_plus_porteur() {
+        let termes = [
+            "liverpool".to_string(),
+            "tickets".to_string(),
+            "match".to_string(),
+            "decembre".to_string(),
+        ];
+        assert_eq!(
+            narrowing_attempts(&termes),
+            vec![
+                "liverpool tickets match decembre",
+                "liverpool tickets match",
+                "liverpool tickets",
+                "liverpool",
+            ]
+        );
+        assert!(
+            narrowing_attempts(&termes)
+                .iter()
+                .all(|tentative| !tentative.contains('{')),
+            "aucune tentative ne doit chercher « au moins un de ces mots »"
+        );
+    }
+
+    /// Sans mot porteur, on ne cherche pas « pour la forme » : une boîte de
+    /// réception rendue au hasard serait présentée comme une réponse.
+    #[test]
+    fn sans_terme_porteur_aucune_requete_nest_envoyee() {
+        assert!(narrowing_attempts(&[]).is_empty());
+        assert!(search_terms("tu peux me le retrouver ?").is_empty());
+    }
 
     #[test]
     fn decode_un_corps_gmail_et_nettoie_le_html() {
@@ -2225,5 +3190,30 @@ mod tests {
             bavard[0].contains("'\"Jeu\"' and fullText contains '\"Vie\"'"),
             "{bavard:?}"
         );
+    }
+
+    #[test]
+    fn seul_le_desabonnement_rfc_one_click_https_est_retenu() {
+        let headers = json!([
+            {"name":"List-Unsubscribe", "value":"<mailto:leave@example.com>, <https://news.example.com/unsubscribe/token>"},
+            {"name":"List-Unsubscribe-Post", "value":"List-Unsubscribe=One-Click"}
+        ]);
+        assert_eq!(
+            safe_one_click_url(&headers).as_deref(),
+            Some("https://news.example.com/unsubscribe/token")
+        );
+        let without_post = json!([
+            {"name":"List-Unsubscribe", "value":"<https://news.example.com/unsubscribe>"}
+        ]);
+        assert!(safe_one_click_url(&without_post).is_none());
+        let insecure = json!([
+            {"name":"List-Unsubscribe", "value":"<http://127.0.0.1/unsubscribe>"},
+            {"name":"List-Unsubscribe-Post", "value":"List-Unsubscribe=One-Click"}
+        ]);
+        assert!(safe_one_click_url(&insecure).is_none());
+        assert!(!public_ip("127.0.0.1".parse().unwrap()));
+        assert!(!public_ip("10.0.0.4".parse().unwrap()));
+        assert!(!public_ip("::ffff:127.0.0.1".parse().unwrap()));
+        assert!(public_ip("1.1.1.1".parse().unwrap()));
     }
 }

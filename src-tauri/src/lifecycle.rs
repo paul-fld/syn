@@ -117,6 +117,19 @@ pub fn spawn_background_loops(app: &AppHandle) {
                     .tx
                     .send(crate::connectors::files::IndexJob::Drain(32));
                 let _ = crate::ingestion::backfill_embeddings(&core.db, &core.llm, 64).await;
+                // La toile et les habitudes suivent le même budget que l'index :
+                // elles convergent en arrière-plan, jamais au détriment d'une
+                // réponse en cours. Aucun modèle n'est appelé ici.
+                let db = core.db.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Err(e) = crate::memory::graph::build(&db, 200) {
+                        eprintln!("toile : {e}");
+                    }
+                    if let Err(e) = crate::memory::habits::learn(&db, 200) {
+                        eprintln!("habitudes : {e}");
+                    }
+                })
+                .await;
             }
             // Miroir agenda (15 min, et au réveil) : nourrit la proactivité.
             if tick % 15 == 1 || woke {

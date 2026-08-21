@@ -9,6 +9,7 @@ pub mod bus;
 pub mod connectors;
 pub mod db;
 pub mod error;
+pub mod i18n;
 pub mod ingestion;
 pub mod ipc;
 pub mod lifecycle;
@@ -128,6 +129,14 @@ pub fn run() {
             ipc::knowledge_file_groups,
             ipc::list_knowledge,
             ipc::forget_item,
+            // mémoire : toile, chronologie, habitudes
+            ipc::memory_graph,
+            ipc::memory_relations,
+            ipc::memory_timeline,
+            ipc::memory_set_identity,
+            ipc::memory_rebuild,
+            ipc::habits_list,
+            ipc::habits_decide,
             // personnes
             ipc::get_person_context,
             ipc::people_list,

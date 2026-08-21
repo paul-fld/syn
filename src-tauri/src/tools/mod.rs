@@ -5,6 +5,7 @@
 pub mod attachments;
 pub mod documents;
 pub mod docx_edit;
+pub mod mail_cleanup;
 pub mod ooxml;
 pub mod pptx_edit;
 pub mod reorganize;
@@ -71,6 +72,7 @@ pub fn catalog_for(kind: crate::router::intent::Kind) -> Vec<ToolSpec> {
             "mail.open",
             "mail.attachments",
             "memory.query",
+            "memory.timeline",
         ],
         Kind::MailCompose => &[
             "mail.search",
@@ -78,6 +80,7 @@ pub fn catalog_for(kind: crate::router::intent::Kind) -> Vec<ToolSpec> {
             "mail.send",
             "people.resolve_email",
             "people.context",
+            "memory.relations",
             "memory.query",
         ],
         Kind::DocumentCreate => &[
@@ -99,6 +102,8 @@ pub fn catalog_for(kind: crate::router::intent::Kind) -> Vec<ToolSpec> {
         // gestes courants, sans dérouler tout le catalogue.
         Kind::Conversation => &[
             "memory.query",
+            "memory.timeline",
+            "memory.relations",
             "files.search",
             "cloud.search",
             "mail.search",
@@ -275,6 +280,17 @@ pub fn catalog() -> Vec<ToolSpec> {
             SideEffect::WriteExternal,
         ),
         spec(
+            "mail.cleanup.apply",
+            "Exécute un plan de rangement de boîte mail déjà audité et confirmé. Cet outil interne n'invente jamais son plan.",
+            json!({
+                "plan_id": {"type": "string"},
+                "provider": {"type": "string", "enum": ["google", "microsoft"]},
+                "plan": {"type": "object", "description": "aperçu du plan affiché à l'utilisateur"}
+            }),
+            &["plan_id", "provider"],
+            SideEffect::WriteExternal,
+        ),
+        spec(
             "mail.draft",
             "Prépare un BROUILLON de mail (local, rien n'est envoyé).",
             json!({
@@ -388,6 +404,27 @@ pub fn catalog() -> Vec<ToolSpec> {
             json!({"fact": {"type": "string"}}),
             &["fact"],
             SideEffect::WriteLocal,
+        ),
+        // La recherche répond à « où est cette chose ? ». Ces deux outils
+        // répondent à « quand cela s'est-il passé ? » et « qui est relié à
+        // qui ? » — deux questions qu'aucune ressemblance de texte ne sait
+        // traiter.
+        spec(
+            "memory.timeline",
+            "Chronologie de la vie numérique de l'utilisateur : ce qui s'est passé et quand (mails reçus et envoyés, documents touchés, rendez-vous, engagements, actions faites par Syn). À utiliser pour toute question portant sur une PÉRIODE (hier, la semaine dernière, ce mois-ci), sur un enchaînement, ou pour reprendre un travail interrompu.",
+            json!({
+                "jours": {"type": "integer", "description": "profondeur en jours (7 par défaut)"},
+                "sujet": {"type": "string", "description": "facultatif : limite aux entrées citant cette personne, ce projet ou ce mot"}
+            }),
+            &[],
+            SideEffect::Read,
+        ),
+        spec(
+            "memory.relations",
+            "Les liens observés autour d'une personne : ses adresses, les gens qu'elle croise, les documents et rendez-vous où elle apparaît, la fréquence des échanges. À utiliser pour toute question sur QUI est relié à quoi.",
+            json!({"nom": {"type": "string", "description": "nom ou adresse de la personne"}}),
+            &["nom"],
+            SideEffect::Read,
         ),
     ]
 }
@@ -524,6 +561,23 @@ pub fn outcome_summary(tool: &str, result: &Value, vouvoie: bool) -> String {
             "Le message est dans la corbeille. Vous pouvez encore le récupérer depuis votre messagerie.",
         )
         .to_string(),
+        "mail.cleanup.apply" => {
+            let service = if field("provider") == "google" {
+                "Gmail"
+            } else {
+                "Outlook"
+            };
+            format!(
+                "Rangement {service} terminé : {} message(s) archivé(s), {} placé(s) dans la corbeille, {} désabonnement(s) confirmé(s){}.",
+                result["archived"].as_u64().unwrap_or(0),
+                result["trashed"].as_u64().unwrap_or(0),
+                result["unsubscribed"].as_u64().unwrap_or(0),
+                match result["failed"].as_u64().unwrap_or(0) {
+                    0 => String::new(),
+                    count => format!(" ; {count} opération(s) ont échoué"),
+                }
+            )
+        }
         "people.link_email" => format!(
             "C'est retenu : {} utilise l'adresse {}.",
             field("name"),
@@ -540,6 +594,8 @@ pub fn outcome_summary(tool: &str, result: &Value, vouvoie: bool) -> String {
         "tasks.create" => "Tâche créée.".into(),
         "tasks.complete" => "Tâche marquée comme faite.".into(),
         "memory.remember" => "C'est mémorisé.".into(),
+        "memory.timeline" => "Voilà ce qui s'est passé.".into(),
+        "memory.relations" => "Voilà ce que je sais de ses liens.".into(),
         // Jamais de JSON par défaut : mieux vaut une phrase vague qu'une
         // structure interne affichée à l'utilisateur.
         _ => "Action effectuée.".into(),
@@ -571,6 +627,19 @@ pub fn preview_for(tool: &str, args: &Value) -> String {
             "Mettre à la corbeille le message {} (récupérable chez le fournisseur)",
             s("source_ref")
         ),
+        "mail.cleanup.apply" => {
+            let service = if s("provider") == "google" { "Gmail" } else { "Outlook" };
+            let plan = &args["plan"];
+            format!(
+                "Ranger uniquement {service} — {} archivage(s), {} mise(s) à la corbeille, {} désabonnement(s) définitif(s) ; {} message(s) protégés, {} cas ambigu(s), {} règle(s) appliquée(s)",
+                plan["archive_count"].as_u64().unwrap_or(0),
+                plan["trash_count"].as_u64().unwrap_or(0),
+                plan["unsubscribe_count"].as_u64().unwrap_or(0),
+                plan["kept_count"].as_u64().unwrap_or(0),
+                plan["review_count"].as_u64().unwrap_or(0),
+                plan["rule_applied_count"].as_u64().unwrap_or(0),
+            )
+        }
         "mail.draft" => format!(
             "Créer un brouillon pour {} — objet : « {} »",
             s("to"),
@@ -718,6 +787,62 @@ pub async fn execute(ctx: &ToolCtx, tool: &str, args: &Value) -> Result<ToolResu
             Ok(ToolResult {
                 result: json!({"plan_id": plan_id, "plan": plan}),
                 undo: None,
+            })
+        }
+
+        "mail.cleanup.apply" => {
+            let plan_id = args["plan_id"]
+                .as_str()
+                .ok_or_else(|| AppError::Invalid("plan_id requis".into()))?;
+            let requested_provider = args["provider"]
+                .as_str()
+                .ok_or_else(|| AppError::Invalid("fournisseur requis".into()))?;
+            let plan: mail_cleanup::CleanupPlan = ctx.db.read(|connection| {
+                let (provider, raw): (String, String) = connection
+                    .query_row(
+                        "SELECT provider, plan FROM mail_cleanup_plans WHERE id=?1 AND status='pending'",
+                        [plan_id],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .map_err(|_| AppError::NotFound("plan de rangement introuvable ou déjà exécuté".into()))?;
+                if provider != requested_provider {
+                    return Err(AppError::Security(
+                        "Le fournisseur confirmé ne correspond pas au plan enregistré.".into(),
+                    ));
+                }
+                serde_json::from_str(&raw)
+                    .map_err(|_| AppError::Invalid("plan de rangement mail invalide".into()))
+            })?;
+            if plan.provider != requested_provider {
+                return Err(AppError::Security(
+                    "Le plan tente de changer de boîte mail.".into(),
+                ));
+            }
+            if plan.version != 2 {
+                return Err(AppError::Invalid(
+                    "Ce plan utilise l’ancien audit incomplet. Relance le rangement pour obtenir un plan fiable.".into(),
+                ));
+            }
+            let (archive_ids, trash_ids) = mail_cleanup::ids(&plan);
+            let unsubscribe_urls = mail_cleanup::unsubscribe_urls(&plan);
+            let (result, undo) = crate::connectors::external::apply_mail_cleanup(
+                requested_provider,
+                &archive_ids,
+                &trash_ids,
+                &unsubscribe_urls,
+            )
+            .await?;
+            mail_cleanup::mark_local_after_execution(&ctx.db, &undo)?;
+            ctx.db.with(|connection| {
+                connection.execute(
+                    "UPDATE mail_cleanup_plans SET status='executed', executed_at=?2 WHERE id=?1 AND status='pending'",
+                    rusqlite::params![plan_id, now()],
+                )?;
+                Ok(())
+            })?;
+            Ok(ToolResult {
+                result,
+                undo: Some(undo),
             })
         }
 
@@ -1288,10 +1413,51 @@ pub async fn execute(ctx: &ToolCtx, tool: &str, args: &Value) -> Result<ToolResu
 
         "people.context" => {
             let name = args["name"].as_str().unwrap_or("");
-            let context = people_conn::context(&ctx.db, name)?;
+            let mut context = people_conn::context(&ctx.db, name)?;
+            // Le carnet dit qui est la personne ; la toile dit ce qui la relie
+            // au reste — c'est cette moitié-là qui manquait.
+            if let Some(object) = context.as_object_mut() {
+                object.insert("toile".into(), crate::memory::graph::lookup(&ctx.db, name)?);
+            }
             crate::security::log_access(&ctx.db, "people", "context", Some(name));
             Ok(ToolResult {
                 result: context,
+                undo: None,
+            })
+        }
+
+        "memory.relations" => {
+            let name = args["nom"]
+                .as_str()
+                .or_else(|| args["name"].as_str())
+                .unwrap_or("")
+                .trim();
+            crate::security::log_access(&ctx.db, "memory", "relations", Some(name));
+            Ok(ToolResult {
+                result: crate::memory::graph::lookup(&ctx.db, name)?,
+                undo: None,
+            })
+        }
+
+        "memory.timeline" => {
+            let jours = args["jours"].as_i64().unwrap_or(7).clamp(1, 400);
+            let sujet = args["sujet"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let mut window = crate::memory::timeline::Window::last_days(jours, 40);
+            window.about = sujet.map(String::from);
+            let chronologie = crate::memory::timeline::grouped(&ctx.db, &window)?;
+            crate::security::log_access(&ctx.db, "memory", "timeline", sujet);
+            Ok(ToolResult {
+                result: json!({
+                    "periode": format!("{jours} derniers jours"),
+                    "sujet": sujet,
+                    "chronologie": chronologie,
+                    "note": if chronologie["total"].as_u64().unwrap_or(0) == 0 {
+                        "Rien de retrouvé sur cette période : dis-le simplement, n'invente aucun événement."
+                    } else { "" }
+                }),
                 undo: None,
             })
         }

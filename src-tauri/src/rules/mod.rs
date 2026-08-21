@@ -8,7 +8,7 @@ use crate::error::Result;
 use crate::llm::{ChatMessage, GenParams, LlmClient};
 use crate::settings::{self, VoiceProfile};
 use rusqlite::params;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -31,6 +31,125 @@ pub struct RuleOutcome {
     pub reason: Option<String>,
     pub id: Option<String>,
     pub conflict_with: Option<String>,
+}
+
+/// Consigne structurée et vérifiable pour le rangement des messages. Le texte
+/// de la règle reste affiché à l'utilisateur, mais le moteur n'exécute jamais
+/// directement une phrase libre.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MailCleanupRule {
+    pub action: String, // archive | trash | keep
+    pub provider: Option<String>,
+    pub sender_terms: Vec<String>,
+    pub topics: Vec<String>, // invoice | booking | marketing | notification
+}
+
+fn extract_mail_cleanup_rule(text: &str) -> Option<MailCleanupRule> {
+    let folded = crate::db::fold(text.trim_start_matches('#'));
+    if !["mail", "email", "courriel", "message"]
+        .iter()
+        .any(|term| folded.contains(term))
+    {
+        return None;
+    }
+    let action = if ["ne touche pas", "garde", "conserve", "protege"]
+        .iter()
+        .any(|term| folded.contains(term))
+    {
+        "keep"
+    } else if ["corbeille", "supprime", "efface"]
+        .iter()
+        .any(|term| folded.contains(term))
+    {
+        "trash"
+    } else if folded.contains("archive") {
+        "archive"
+    } else {
+        return None;
+    };
+    let provider = if folded.contains("gmail") {
+        Some("google".to_string())
+    } else if folded.contains("outlook") || folded.contains("hotmail") {
+        Some("microsoft".to_string())
+    } else {
+        None
+    };
+    let mut topics = Vec::new();
+    for (topic, words) in [
+        ("invoice", &["facture", "invoice", "recu", "receipt"][..]),
+        ("booking", &["reservation", "booking", "billet", "ticket"][..]),
+        ("marketing", &["publicite", "promo", "promotion", "newsletter", "offre"][..]),
+        ("notification", &["notification", "alerte", "digest"][..]),
+    ] {
+        if words.iter().any(|word| folded.contains(word)) {
+            topics.push(topic.to_string());
+        }
+    }
+
+    // « de/du/from/provenant de X » est le moyen le moins ambigu d'exprimer un
+    // expéditeur. Les mots fonctionnels restants ne deviennent jamais une cible.
+    let words = folded.split_whitespace().collect::<Vec<_>>();
+    let marker = words.iter().enumerate().rev().find_map(|(index, word)| {
+        matches!(*word, "de" | "du" | "from" | "par").then_some(index + 1)
+    });
+    let ignored = [
+        "gmail", "outlook", "hotmail", "mes", "mon", "ma", "les", "des", "tous",
+        "toutes", "tout", "mails", "mail", "emails",
+        "email", "messages", "message", "facture", "factures", "invoice", "invoices",
+        "recu", "recus", "receipt", "receipts", "promo", "promotions", "newsletter",
+        "notifications", "notification",
+    ];
+    let sender_terms = marker
+        .map(|start| {
+            words[start..]
+                .iter()
+                .map(|word| word.trim_matches(|c: char| !c.is_alphanumeric() && c != '.' && c != '@'))
+                .filter(|word| word.len() >= 2 && !ignored.contains(word))
+                .take(4)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if sender_terms.is_empty() && topics.is_empty() {
+        return None;
+    }
+    Some(MailCleanupRule {
+        action: action.into(),
+        provider,
+        sender_terms,
+        topics,
+    })
+}
+
+fn validate_mail_cleanup_rule(mut rule: MailCleanupRule) -> Option<MailCleanupRule> {
+    if !matches!(rule.action.as_str(), "archive" | "trash" | "keep") {
+        return None;
+    }
+    if !matches!(rule.provider.as_deref(), None | Some("google") | Some("microsoft")) {
+        return None;
+    }
+    rule.sender_terms = rule
+        .sender_terms
+        .into_iter()
+        .map(|term| crate::db::fold(&term))
+        .map(|term| {
+            term.chars()
+                .filter(|character| character.is_alphanumeric() || "@.-".contains(*character))
+                .take(80)
+                .collect::<String>()
+        })
+        .filter(|term| term.len() >= 2)
+        .take(4)
+        .collect();
+    rule.topics.retain(|topic| {
+        matches!(
+            topic.as_str(),
+            "invoice" | "booking" | "marketing" | "notification"
+        )
+    });
+    rule.topics.sort();
+    rule.topics.dedup();
+    (!rule.sender_terms.is_empty() || !rule.topics.is_empty()).then_some(rule)
 }
 
 /// Garde déterministe : les tentatives de dissolution des garanties de sécurité
@@ -103,6 +222,9 @@ fn extract_voice(text: &str) -> Option<Value> {
 }
 
 fn heuristic_kind(text: &str) -> &'static str {
+    if extract_mail_cleanup_rule(text).is_some() {
+        return "mail_cleanup";
+    }
     let l = text.to_lowercase();
     if extract_voice(text).is_some()
         || l.contains("réponds")
@@ -185,16 +307,19 @@ pub async fn add_rule(
     //    la garde déterministe et le plancher tiennent quoi qu'il arrive.
     let mut llm_kind: Option<String> = None;
     let mut llm_refusal: Option<String> = None;
+    let mut llm_mail_rule: Option<MailCleanupRule> = None;
     if let Ok(resp) = llm
         .generate(
             "Tu valides des règles utilisateur pour l'assistant Syn. Réponds UNIQUEMENT en JSON : \
-             {\"refuse\": bool, \"raison\": \"…\", \"genre\": \"style|standing|action_modifier\"}. \
+             {\"refuse\": bool, \"raison\": \"…\", \"genre\": \"style|standing|action_modifier|mail_cleanup\", \
+             \"mail_rule\": {\"action\":\"archive|trash|keep\",\"provider\":\"google|microsoft|null\",\"sender_terms\":[\"…\"],\"topics\":[\"invoice|booking|marketing|notification\"]}|null}. \
              REFUSE seulement si la règle est illégale, nuit aux droits d'autrui, ou casse la sécurité du produit. \
              ACCEPTE la tolérance au risque propre de l'utilisateur (ex. « agis seul pour ranger mes fichiers »). \
-             genre : style=ton/comportement ; standing=tâche de fond permanente ; action_modifier=modifie une action précise.",
+             genre : style=ton/comportement ; standing=tâche de fond permanente ; action_modifier=modifie une action précise ; \
+             mail_cleanup=classe des mails. Pour mail_cleanup, extrais seulement les contraintes explicitement écrites.",
             &[ChatMessage::user(format!("Règle : {text}"))],
             &[],
-            GenParams { temperature: 0.0, max_tokens: Some(200), json: true },
+            GenParams { temperature: 0.0, max_tokens: Some(350), json: true },
         )
         .await
     {
@@ -203,6 +328,11 @@ pub async fn add_rule(
                 llm_refusal = v["raison"].as_str().map(String::from).or(Some("Règle contraire aux conditions d'utilisation.".into()));
             }
             llm_kind = v["genre"].as_str().map(String::from);
+            if llm_kind.as_deref() == Some("mail_cleanup") {
+                llm_mail_rule = serde_json::from_value::<MailCleanupRule>(v["mail_rule"].clone())
+                    .ok()
+                    .and_then(validate_mail_cleanup_rule);
+            }
         }
     }
     if let Some(reason) = llm_refusal {
@@ -223,12 +353,88 @@ pub async fn add_rule(
         });
     }
 
-    let kind = llm_kind.unwrap_or_else(|| heuristic_kind(&text).to_string());
-    let voice_params = extract_voice(&text);
+    let mail_params = extract_mail_cleanup_rule(&text).or(llm_mail_rule);
+    if llm_kind.as_deref() == Some("mail_cleanup") && mail_params.is_none() {
+        let id = new_id();
+        let reason = "Je reconnais une règle de tri de mails, mais pas ses critères avec assez de précision. Indique l’action et au moins un expéditeur ou un type de message.".to_string();
+        db.with(|connection| {
+            connection.execute(
+                "INSERT INTO rules (id, text, kind, status, reason, created_at) VALUES (?1,?2,'mail_cleanup','refused',?3,?4)",
+                params![id, text, reason, now()],
+            )?;
+            Ok(())
+        })?;
+        return Ok(RuleOutcome {
+            status: "refused".into(),
+            kind: Some("mail_cleanup".into()),
+            reason: Some(reason),
+            id: Some(id),
+            conflict_with: None,
+        });
+    }
+    let kind = if mail_params.is_some() {
+        "mail_cleanup".to_string()
+    } else {
+        llm_kind.unwrap_or_else(|| heuristic_kind(&text).to_string())
+    };
+    let structured_params = mail_params
+        .as_ref()
+        .map(serde_json::to_value)
+        .transpose()?
+        .or_else(|| extract_voice(&text));
+
+    // Deux règles de tri visant exactement le même ensemble mais demandant
+    // des actions différentes doivent être arbitrées explicitement.
+    if let Some(new_rule) = &mail_params {
+        let existing: Option<String> = db.with(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT id, params FROM rules WHERE status='active' AND kind='mail_cleanup'",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?;
+            for row in rows {
+                let (id, params) = row?;
+                let Some(params) = params else { continue };
+                let Ok(other) = serde_json::from_str::<MailCleanupRule>(&params) else {
+                    continue;
+                };
+                let same_provider = other.provider == new_rule.provider
+                    || other.provider.is_none()
+                    || new_rule.provider.is_none();
+                if same_provider
+                    && other.sender_terms == new_rule.sender_terms
+                    && other.topics == new_rule.topics
+                    && other.action != new_rule.action
+                {
+                    return Ok(Some(id));
+                }
+            }
+            Ok(None)
+        })?;
+        if let Some(other_id) = existing {
+            let id = new_id();
+            let reason = "Cette règle demande une autre action qu’une règle de tri existante pour les mêmes messages. Choisis laquelle privilégier.".to_string();
+            db.with(|connection| {
+                connection.execute(
+                    "INSERT INTO rules (id, text, kind, status, params, reason, created_at) VALUES (?1,?2,'mail_cleanup','conflict',?3,?4,?5)",
+                    params![id, text, structured_params.as_ref().map(|value| value.to_string()), reason, now()],
+                )?;
+                Ok(())
+            })?;
+            return Ok(RuleOutcome {
+                status: "conflict".into(),
+                kind: Some("mail_cleanup".into()),
+                reason: Some(reason),
+                id: Some(id),
+                conflict_with: Some(other_id),
+            });
+        }
+    }
 
     // 3. Conflit (ex. tutoiement vs vouvoiement) → l'utilisateur choisit la priorité.
     let mut conflict_with: Option<String> = None;
-    if let Some(vp) = &voice_params {
+    if let Some(vp) = &structured_params {
         if let Some(new_form) = vp["formality"].as_str() {
             let existing: Option<(String, String)> = db.with(|c| {
                 Ok(c.query_row(
@@ -254,7 +460,7 @@ pub async fn add_rule(
         db.with(|c| {
             c.execute(
                 "INSERT INTO rules (id, text, kind, status, params, reason, created_at) VALUES (?1,?2,?3,'conflict',?4,?5,?6)",
-                params![id, text, kind, voice_params.as_ref().map(|v| v.to_string()), reason, now()],
+                params![id, text, kind, structured_params.as_ref().map(|v| v.to_string()), reason, now()],
             )?;
             Ok(())
         })?;
@@ -272,7 +478,7 @@ pub async fn add_rule(
     db.with(|c| {
         c.execute(
             "INSERT INTO rules (id, text, kind, status, params, created_at) VALUES (?1,?2,?3,'active',?4,?5)",
-            params![id, text, kind, voice_params.as_ref().map(|v| v.to_string()), now()],
+            params![id, text, kind, structured_params.as_ref().map(|v| v.to_string()), now()],
         )?;
         Ok(())
     })?;
@@ -429,11 +635,30 @@ pub fn active_rule_texts(db: &Db) -> Result<(Vec<String>, Vec<String>)> {
             let (text, kind) = r?;
             match kind.as_deref() {
                 Some("action_modifier") => modifiers.push(text),
-                Some("standing") => {} // géré par la proactivité
+                Some("standing") | Some("mail_cleanup") => {} // moteurs dédiés
                 _ => style.push(text),
             }
         }
         Ok((style, modifiers))
+    })
+}
+
+pub fn active_mail_cleanup_rules(db: &Db, provider: &str) -> Result<Vec<MailCleanupRule>> {
+    db.with(|connection| {
+        let mut statement = connection.prepare(
+            "SELECT params FROM rules WHERE status='active' AND kind='mail_cleanup' \
+             ORDER BY priority DESC, created_at DESC",
+        )?;
+        let rows = statement.query_map([], |row| row.get::<_, Option<String>>(0))?;
+        let mut rules = Vec::new();
+        for row in rows {
+            let Some(params) = row? else { continue };
+            let Ok(rule) = serde_json::from_str::<MailCleanupRule>(&params) else { continue };
+            if rule.provider.as_deref().is_none() || rule.provider.as_deref() == Some(provider) {
+                rules.push(rule);
+            }
+        }
+        Ok(rules)
     })
 }
 
@@ -474,5 +699,15 @@ mod tests {
             "action_modifier"
         );
         assert_eq!(heuristic_kind("#Tutoie-moi"), "style");
+    }
+
+
+    #[test]
+    fn extrait_une_regle_de_tri_mail_precise() {
+        let rule = extract_mail_cleanup_rule("archive mes mails de factures Anthropic").unwrap();
+        assert_eq!(rule.action, "archive");
+        assert_eq!(rule.topics, vec!["invoice"]);
+        assert_eq!(rule.sender_terms, vec!["anthropic"]);
+        assert_eq!(heuristic_kind("archive mes mails de factures Anthropic"), "mail_cleanup");
     }
 }

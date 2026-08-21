@@ -36,6 +36,7 @@ pub fn classify(tool: &str, args: &Value) -> RiskClass {
         // Lectures
         "memory.query" | "files.search" | "mail.search" | "cloud.search" | "calendar.list" | "tasks.list"
         | "commitments.list" | "people.context" | "people.resolve_email" | "photos.search"
+        | "memory.timeline" | "memory.relations"
         | "mail.list" | "mail.open" | "mail.attachments"
         | "system.diagnose"
         | "document.open" /* affiche un document déjà connu : ne modifie rien */
@@ -75,7 +76,10 @@ pub fn classify(tool: &str, args: &Value) -> RiskClass {
                 RiskClass::ReversibleLocal
             }
         }
-        "calendar.delete" | "mail.delete" => RiskClass::ReversibleExternal,
+        "mail.cleanup.apply" if args["plan"]["unsubscribe_count"].as_u64().unwrap_or(0) > 0 => {
+            RiskClass::Floor
+        }
+        "calendar.delete" | "mail.delete" | "mail.cleanup.apply" => RiskClass::ReversibleExternal,
 
         // Exécution d'un plan de rangement : réversible local (undo global),
         // mais soumis à la revue unique (B6) — voir needs_confirmation.
@@ -115,7 +119,7 @@ pub fn needs_confirmation(
     // Supprimer un message est réversible (corbeille), mais c'est la donnée de
     // l'utilisateur qui disparaît de sa vue. Une donnée ne s'efface jamais sans
     // qu'il l'ait vu et accepté, quel que soit son niveau d'autonomie.
-    if tool == "mail.delete" {
+    if matches!(tool, "mail.delete" | "mail.cleanup.apply") {
         return true;
     }
     match risk {
@@ -530,6 +534,26 @@ mod tests {
             false,
             "files.search"
         ));
+    }
+
+    #[test]
+    fn un_rangement_mail_massif_attend_toujours_une_confirmation() {
+        let args = json!({"provider":"google", "plan":{"archive_count":1200}});
+        let risk = classify("mail.cleanup.apply", &args);
+        assert_eq!(risk, RiskClass::ReversibleExternal);
+        for autonomy in [Autonomy::Prudent, Autonomy::Assiste, Autonomy::Autonome] {
+            assert!(needs_confirmation(
+                risk,
+                &autonomy,
+                false,
+                "mail.cleanup.apply"
+            ));
+        }
+        let avec_desabonnement = json!({
+            "provider":"google",
+            "plan":{"archive_count":1200, "unsubscribe_count":3}
+        });
+        assert_eq!(classify("mail.cleanup.apply", &avec_desabonnement), RiskClass::Floor);
     }
 }
 

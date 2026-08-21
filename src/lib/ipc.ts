@@ -34,6 +34,7 @@ export interface Settings {
   autostart: boolean;
   voice: VoiceProfile;
   theme: string;
+  answer_language: "auto" | "fr" | "en";
   voice_input_enabled: boolean;
   voice_output_enabled: boolean;
   bar_shortcut: string;
@@ -48,6 +49,7 @@ export interface Settings {
   notify_commitments: boolean;
   notify_system: boolean;
   notify_rules: boolean;
+  notify_reflexes: boolean;
   work_notification_policy: "urgent" | "relevant";
   cloud_escalation: boolean;
   sensitive_consent: boolean;
@@ -370,6 +372,17 @@ export const ipc = {
 
   // connaissances
   knowledgeStats: () => invoke<any>("knowledge_stats"),
+  // La toile, la chronologie et les habitudes observées.
+  memoryGraph: () => invoke<any>("memory_graph"),
+  memoryRelations: (nom: string) => invoke<any>("memory_relations", { nom }),
+  memoryTimeline: (jours?: number, sujet?: string | null, limite?: number) =>
+    invoke<any>("memory_timeline", { jours, sujet, limite }),
+  memorySetIdentity: (address: string, mine: boolean) =>
+    invoke<void>("memory_set_identity", { address, mine }),
+  memoryRebuild: () => invoke<any>("memory_rebuild"),
+  habitsList: () => invoke<any[]>("habits_list"),
+  habitsDecide: (id: string, accepte: boolean) =>
+    invoke<void>("habits_decide", { id, accepte }),
   knowledgeFileGroups: () => invoke<any[]>("knowledge_file_groups"),
   listKnowledge: (source: string | null, filter: string | null, limit?: number) =>
     invoke<any[]>("list_knowledge", { source, filter, limit }),

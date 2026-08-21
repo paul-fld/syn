@@ -204,7 +204,14 @@ pub(crate) fn is_request_filler(word: &str) -> bool {
         | "ton" | "ta" | "ces" | "ses" | "son" | "sa" | "cette" | "cet"
         | "que" | "qui" | "quoi" | "dont" | "quel" | "quelle" | "mien"
         // Les mots qui nomment le contenant, pas le contenu.
+        //
+        // « mail », « message », « courriel » en font partie : dans « retrouve
+        // le mail de Liverpool », le mot « mail » dit OÙ chercher, jamais QUOI.
+        // Envoyé à Gmail, il ramenait la boîte entière — presque tous les
+        // messages contiennent « mail » dans leur pied de page.
         | "document" | "documents" | "fichier" | "fichiers" | "dossier" | "dossiers"
+        | "mail" | "mails" | "email" | "emails" | "courriel" | "courriels"
+        | "message" | "messages" | "inbox" | "boite"
         // Formulation, anglais.
         | "the" | "and" | "where" | "what" | "which" | "please" | "can" | "you"
         | "find" | "show" | "open" | "get" | "give" | "search" | "looking"
@@ -316,7 +323,18 @@ pub(crate) fn subject_span(query: &str) -> Option<String> {
 pub(crate) fn keywords(query: &str) -> Vec<String> {
     let mut out: Vec<String> = vec![];
     for raw in crate::db::fold(query).split(|c: char| !c.is_alphanumeric()) {
-        if raw.chars().count() < 3 || STOPWORDS_FR.contains(&raw) {
+        // Un token court qui porte un chiffre (« Q3 », « T2 », « 26 ») est au
+        // contraire le plus discriminant d'une demande.
+        let chiffre = raw.chars().any(|c| c.is_ascii_digit());
+        let minimum = if chiffre { 2 } else { 3 };
+        if raw.chars().count() < minimum || STOPWORDS_FR.contains(&raw) {
+            continue;
+        }
+        // Les mots de formulation et ceux qui nomment le CONTENANT (« mail »,
+        // « fichier », « google ») ne sont jamais du contenu. Sans ce filtre,
+        // « le mail de Liverpool » cherchait « mail » — présent dans le pied de
+        // page de presque tous les messages.
+        if is_request_filler(raw) {
             continue;
         }
         let k = stem(raw);
@@ -325,6 +343,184 @@ pub(crate) fn keywords(query: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// Un terme de recherche et sa rareté dans le corpus de l'utilisateur.
+#[derive(Debug, Clone)]
+pub struct RankedTerm {
+    pub text: String,
+    /// Nombre d'éléments contenant ce terme, plafonné (voir `DF_CAP`).
+    pub frequency: i64,
+}
+
+impl RankedTerm {
+    /// Poids d'un terme dans un score de pertinence. Un mot présent partout ne
+    /// prouve rien ; un mot rare désigne presque à lui seul ce qu'on cherche.
+    pub fn weight(&self) -> f32 {
+        if self.frequency <= 0 {
+            1.0
+        } else {
+            1.0 / (1.0 + (self.frequency as f32).ln())
+        }
+    }
+}
+
+/// Au-delà de ce plafond, un terme est « banal » : inutile de compter plus loin,
+/// et le comptage reste borné quelle que soit la taille du corpus.
+const DF_CAP: i64 = 400;
+
+/// Termes de la demande, du plus DISTINCTIF au plus banal.
+///
+/// La distinctivité n'est pas devinée : elle est MESURÉE sur le corpus de
+/// l'utilisateur. Dans sa messagerie, « mail » ou « décembre » apparaissent
+/// partout, « liverpool » dans une poignée de messages — c'est donc ce
+/// dernier qui porte la demande.
+///
+/// Cet ordre est ce qui permet ensuite de retirer des mots un par un sans
+/// perdre le sujet : on abandonne toujours le plus banal d'abord.
+pub fn ranked_terms(db: &Db, query: &str, source: Option<&str>) -> Vec<RankedTerm> {
+    ranked_terms_from(db, query, &[], source)
+}
+
+/// Même chose, en tenant compte de mots proposés par le modèle — typiquement
+/// les équivalents anglais d'une demande écrite en français.
+///
+/// Ces mots ne bénéficient d'AUCUNE faveur : ils passent par la même mesure de
+/// rareté que les autres. Un mot inventé sera simplement absent du corpus, donc
+/// classé « inconnu », donc jamais mis en tête de la recherche. C'est ce qui
+/// permet de faire confiance au modèle sans lui donner le dernier mot.
+pub fn ranked_terms_from(
+    db: &Db,
+    query: &str,
+    extra: &[String],
+    source: Option<&str>,
+) -> Vec<RankedTerm> {
+    let mut mots = keywords(query);
+    for mot in extra {
+        let plie = crate::db::fold(mot);
+        let plie = stem(&plie);
+        if !plie.is_empty() && !mots.contains(&plie) && !is_request_filler(&plie) {
+            mots.push(plie);
+        }
+    }
+    let mut terms: Vec<RankedTerm> = mots
+        .into_iter()
+        .map(|text| {
+            let frequency = document_frequency(db, &text, source);
+            RankedTerm { text, frequency }
+        })
+        .collect();
+    // Un terme ABSENT du corpus local ne prouve pas qu'il est rare : il peut
+    // simplement ne pas encore être indexé (une boîte cloud n'est jamais copiée
+    // en entier). Le traiter comme le plus distinctif reviendrait à bâtir toute
+    // la recherche sur le mot dont on ne sait rien. Il prend donc un rang
+    // neutre : après les mots rares mais attestés, avant les mots banals.
+    let inconnu = DF_CAP / 4;
+    terms.sort_by_key(|term| {
+        if term.frequency == 0 {
+            inconnu
+        } else {
+            term.frequency
+        }
+    });
+    terms
+}
+
+/// Combien d'éléments contiennent ce terme (plafonné à `DF_CAP`).
+fn document_frequency(db: &Db, term: &str, source: Option<&str>) -> i64 {
+    let source_clause = match source {
+        Some("files") => " AND i.source='files'",
+        Some("mail") => " AND i.source='mail'",
+        Some("cloud") => " AND i.source='cloud'",
+        Some(_) => " AND 0",
+        None => "",
+    };
+    let sql = format!(
+        "SELECT COUNT(*) FROM (
+           SELECT f.item_id FROM items_fts f
+           JOIN items i ON i.id = f.item_id
+           WHERE items_fts MATCH ?1 AND i.status='active'{source_clause}
+           LIMIT {DF_CAP}
+         )"
+    );
+    db.read(|c| {
+        let mut stmt = c.prepare(&sql)?;
+        Ok(stmt
+            .query_row([format!("\"{}\"*", term.replace('"', ""))], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap_or(0))
+    })
+    .unwrap_or(0)
+}
+
+/// Les écritures possibles d'une date citée dans la demande.
+///
+/// « le match du 2 décembre » doit pouvoir reconnaître « Wed 2 Dec 2026 » dans
+/// un message écrit en anglais. Ce n'est pas un dictionnaire de tournures — la
+/// liste des mois est un fait du calendrier, fermé et fini, au même titre que
+/// les accents que `syn_fold` normalise.
+pub fn date_variants(query: &str) -> Vec<String> {
+    const MOIS: [(&str, &str, &str); 12] = [
+        ("janvier", "january", "jan"),
+        ("fevrier", "february", "feb"),
+        ("mars", "march", "mar"),
+        ("avril", "april", "apr"),
+        ("mai", "may", "may"),
+        ("juin", "june", "jun"),
+        ("juillet", "july", "jul"),
+        ("aout", "august", "aug"),
+        ("septembre", "september", "sep"),
+        ("octobre", "october", "oct"),
+        ("novembre", "november", "nov"),
+        ("decembre", "december", "dec"),
+    ];
+    let folded = crate::db::fold(query);
+    let mots: Vec<&str> = folded
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|mot| !mot.is_empty())
+        .collect();
+    let mut variants = vec![];
+    for (index, mot) in mots.iter().enumerate() {
+        let Some((rang, (fr, en, abrege))) = MOIS
+            .iter()
+            .enumerate()
+            .find(|(_, (fr, en, abrege))| *mot == *fr || *mot == *en || *mot == *abrege)
+        else {
+            continue;
+        };
+        // Le jour peut précéder (« 2 décembre ») ou suivre (« december 2 »).
+        let jour = mots
+            .get(index.wrapping_sub(1))
+            .filter(|_| index > 0)
+            .and_then(|mot| mot.parse::<u32>().ok())
+            .or_else(|| {
+                mots.get(index + 1)
+                    .and_then(|mot| mot.parse::<u32>().ok())
+                    .filter(|jour| *jour <= 31)
+            });
+        let Some(jour) = jour.filter(|jour| (1..=31).contains(jour)) else {
+            variants.push(fr.to_string());
+            variants.push(en.to_string());
+            continue;
+        };
+        let numero = rang + 1;
+        for forme in [
+            format!("{jour} {fr}"),
+            format!("{jour} {en}"),
+            format!("{jour} {abrege}"),
+            format!("{en} {jour}"),
+            format!("{abrege} {jour}"),
+            format!("{jour}/{numero}"),
+            format!("{jour:02}/{numero:02}"),
+            format!("{numero}/{jour}"),
+        ] {
+            if !variants.contains(&forme) {
+                variants.push(forme);
+            }
+        }
+    }
+    variants
 }
 
 fn metadata_keyword_hits(result: &Retrieved, kws: &[String]) -> usize {
@@ -1336,5 +1532,77 @@ mod tests {
             "le cache cloud doit répondre, et sans laisser passer un fichier local"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+    /// La distinctivité se MESURE : dans une messagerie française, « mail » et
+    /// « décembre » sont partout, « liverpool » dans une poignée de messages.
+    /// C'est cet ordre qui permet ensuite de retirer des mots sans perdre le
+    /// sujet de la demande.
+    #[test]
+    fn les_mots_porteurs_se_classent_par_rarete_reelle() {
+        let dir = std::env::temp_dir().join(format!("syn-idf-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("t.db"), &"9".repeat(64)).unwrap();
+        db.with(|c| {
+            // Une boîte ordinaire : tout le monde parle de décembre et signe
+            // ses messages d'un pied de page contenant « mail ».
+            for index in 0..30 {
+                c.execute(
+                    "INSERT INTO items (id, source, source_ref, type, title, body, ingested_at, status)
+                     VALUES (?1,'mail',?1,'email','Nouvelle offre',
+                             'Rendez-vous en decembre. Cet e-mail vous est adresse automatiquement.',
+                             1,'active')",
+                    rusqlite::params![format!("bruit{index}")],
+                )?;
+            }
+            c.execute(
+                "INSERT INTO items (id, source, source_ref, type, title, body, ingested_at, status)
+                 VALUES ('lfc','mail','google:mail:1','email','Liverpool FC Booking Confirmation',
+                         'Thank you for your booking with Liverpool Football Club. Ticket. Liverpool v Sunderland - Wed 2 Dec 2026',
+                         1,'active')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let termes = ranked_terms(
+            &db,
+            "le mail de liverpool concernant mes tickets pour le match du 2 décembre",
+            Some("mail"),
+        );
+        let mots: Vec<&str> = termes.iter().map(|t| t.text.as_str()).collect();
+        assert!(
+            !mots.contains(&"mail"),
+            "« mail » nomme le contenant, pas le contenu : {mots:?}"
+        );
+        assert_eq!(
+            mots.first().copied(),
+            Some("liverpool"),
+            "le mot le plus rare porte la demande : {mots:?}"
+        );
+        assert!(
+            mots.iter().position(|m| *m == "ticket")
+                < mots.iter().position(|m| *m == "decembre"),
+            "« décembre » est banal dans cette boîte : {mots:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// « le match du 2 décembre » doit reconnaître « Wed 2 Dec 2026 » : le
+    /// message est en anglais, la demande en français.
+    #[test]
+    fn une_date_citee_se_reconnait_dans_les_deux_langues() {
+        let variantes = date_variants("mes tickets pour le match du 2 décembre");
+        assert!(variantes.contains(&"2 dec".to_string()), "{variantes:?}");
+        assert!(variantes.contains(&"2 december".to_string()), "{variantes:?}");
+        assert!(variantes.contains(&"2 decembre".to_string()), "{variantes:?}");
+        assert!(
+            crate::db::fold("Liverpool v Sunderland - Wed 2 Dec 2026")
+                .contains(variantes.iter().find(|v| *v == "2 dec").unwrap()),
+        );
+        assert!(
+            date_variants("retrouve la facture d'électricité").is_empty(),
+            "sans date citée, aucune variante"
+        );
     }
 }

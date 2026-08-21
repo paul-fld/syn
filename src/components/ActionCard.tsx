@@ -162,8 +162,112 @@ function MailSendView(props: { input: unknown }): JSX.Element {
   );
 }
 
+interface MailCleanupPreview {
+  provider: "google" | "microsoft";
+  scanned: number;
+  indexed: number;
+  conversation_count?: number | null;
+  unread_count?: number | null;
+  archive_count: number;
+  trash_count: number;
+  unsubscribe_count: number;
+  kept_count: number;
+  review_count: number;
+  untouched_count: number;
+  rule_applied_count: number;
+  deferred_count: number;
+  archive_examples: Array<{ title: string; sender: string; reason: string }>;
+  trash_examples: Array<{ title: string; sender: string; reason: string }>;
+  unsubscribe_examples: Array<{ sender: string; message_count: number }>;
+  top_bulk_senders: Array<[string, number]>;
+  action_groups: Array<{ sender: string; action: "archive" | "trash"; reason: string; count: number }>;
+}
+
+function cleanupFromInput(input: unknown): MailCleanupPreview | null {
+  const plan = (input as { plan?: MailCleanupPreview } | null)?.plan;
+  return plan && (plan.provider === "google" || plan.provider === "microsoft") ? plan : null;
+}
+
+function MailCleanupPlanView(props: { input: unknown }): JSX.Element {
+  const plan = () => cleanupFromInput(props.input);
+  return (
+    <Show when={plan()} keyed>
+      {(current) => (
+        <div class="reorganize-plan mail-cleanup-plan">
+          <div class="reorganize-plan-stats">
+            <span><strong>{current.scanned}</strong> messages recensés</span>
+            <Show when={current.conversation_count != null && current.conversation_count !== current.scanned}>
+              <span><strong>{current.conversation_count}</strong> conversations</span>
+            </Show>
+            <span><strong>{current.indexed}</strong> candidats inspectés</span>
+            <span><strong>{current.archive_count}</strong> à archiver</span>
+            <span><strong>{current.trash_count}</strong> à la corbeille</span>
+            <span><strong>{current.unsubscribe_count}</strong> désabonnements</span>
+            <span><strong>{current.kept_count}</strong> protégés après analyse</span>
+            <span><strong>{current.review_count}</strong> cas ambigus</span>
+            <span><strong>{current.untouched_count}</strong> laissés en place</span>
+            <Show when={current.rule_applied_count > 0}>
+              <span><strong>{current.rule_applied_count}</strong> classés par tes règles</span>
+            </Show>
+          </div>
+          <details class="reorganize-plan-details">
+            <summary>Voir des exemples et les principaux expéditeurs</summary>
+            <div class="reorganize-moves">
+              <For each={current.action_groups ?? []}>
+                {(group) => (
+                  <div class="reorganize-move">
+                    <span class="reorganize-file" title={group.sender}>{group.sender}</span>
+                    <span class="reorganize-destination">
+                      {group.action === "trash" ? "Corbeille" : "Archiver"} · {group.count}
+                    </span>
+                    <span class="reorganize-reason">{group.reason}</span>
+                  </div>
+                )}
+              </For>
+              <For each={current.archive_examples}>
+                {(mail) => (
+                  <div class="reorganize-move">
+                    <span class="reorganize-file" title={mail.title}>{mail.title}</span>
+                    <span class="reorganize-destination">Archiver</span>
+                    <span class="reorganize-reason">{mail.sender} · {mail.reason}</span>
+                  </div>
+                )}
+              </For>
+              <For each={current.trash_examples}>
+                {(mail) => (
+                  <div class="reorganize-move quarantine">
+                    <span class="reorganize-file" title={mail.title}>{mail.title}</span>
+                    <span class="reorganize-destination">Corbeille</span>
+                    <span class="reorganize-reason">{mail.sender} · {mail.reason}</span>
+                  </div>
+                )}
+              </For>
+              <For each={current.unsubscribe_examples}>
+                {(entry) => (
+                  <div class="reorganize-move quarantine">
+                    <span class="reorganize-file" title={entry.sender}>{entry.sender}</span>
+                    <span class="reorganize-destination">Désabonnement définitif</span>
+                    <span class="reorganize-reason">standard sécurisé « one click » · {entry.message_count} message(s)</span>
+                  </div>
+                )}
+              </For>
+            </div>
+          </details>
+          <Show when={current.unsubscribe_count > 0}>
+            <div class="sub">Les déplacements de messages sont annulables. Un désabonnement confirmé ne peut pas être annulé automatiquement.</div>
+          </Show>
+          <Show when={current.deferred_count > 0}>
+            <div class="sub">{current.deferred_count} message(s) seront traités lors d’un prochain passage afin de borner cette exécution.</div>
+          </Show>
+        </div>
+      )}
+    </Show>
+  );
+}
+
 /// Ce que Syn est en train de faire, dit avec les mots de l'action en cours.
 function workingLabel(tool: string): string {
+  if (tool === "mail.cleanup.apply") return "Syn range et vérifie la boîte sélectionnée…";
   if (tool.startsWith("mail.")) return "Syn envoie le message…";
   if (tool.startsWith("document.")) return "Syn écrit le document…";
   if (tool.startsWith("calendar.")) return "Syn met l’agenda à jour…";
@@ -237,6 +341,9 @@ export function ActionCard(props: { action: PendingAction }): JSX.Element {
       </Show>
       <Show when={props.action.tool === "files.apply_reorganize_plan"}>
         <ReorganizePlanView input={props.action.input} />
+      </Show>
+      <Show when={props.action.tool === "mail.cleanup.apply"}>
+        <MailCleanupPlanView input={props.action.input} />
       </Show>
       <Show when={busy()}>
         <div class="action-working-shimmer" role="status">

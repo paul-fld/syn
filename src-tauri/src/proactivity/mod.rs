@@ -3,6 +3,7 @@
 //! Un surfaçage sans raison affichée est un bug.
 
 pub mod briefs;
+pub mod reflexes;
 
 use crate::bus::{Bus, BusEvent};
 use crate::connectors::system as system_conn;
@@ -34,6 +35,7 @@ fn kind_enabled(settings: &crate::settings::Settings, kind: &str) -> bool {
         "commitment" => settings.notify_commitments,
         "system" => settings.notify_system,
         "rule" => settings.notify_rules,
+        "reflexe" => settings.notify_reflexes,
         _ => true,
     }
 }
@@ -43,7 +45,10 @@ fn allowed_in_work_mode(settings: &crate::settings::Settings, candidate: &Candid
         return true;
     }
     settings.work_notification_policy == "relevant"
-        && matches!(candidate.kind.as_str(), "event" | "commitment" | "rule")
+        && matches!(
+            candidate.kind.as_str(),
+            "event" | "commitment" | "rule" | "reflexe"
+        )
 }
 
 fn notification_allowed(settings: &crate::settings::Settings, candidate: &Candidate) -> bool {
@@ -243,9 +248,15 @@ pub async fn evaluate_tick(db: &Db, bus: &Bus) -> Result<()> {
     }
 
     // — Événements imminents (<30 min) —
+    //
+    // Les rendez-vous AVEC INVITÉS sont traités par le réflexe de préparation de
+    // réunion, qui dit la même chose en y ajoutant les derniers échanges : les
+    // annoncer deux fois serait du bruit.
     let events: Vec<Value> = db.read(|c| {
         let mut stmt = c.prepare(
-            "SELECT title, \"start\" FROM events WHERE \"start\" > ?1 AND \"start\" <= ?2",
+            "SELECT title, \"start\" FROM events
+             WHERE \"start\" > ?1 AND \"start\" <= ?2
+               AND COALESCE(attendees,'[]') IN ('[]','')",
         )?;
         let rows = stmt.query_map(params![now(), now() + 1800], |r| {
             Ok(serde_json::json!({"title": r.get::<_, String>(0)?, "start": r.get::<_, i64>(1)?}))
@@ -333,6 +344,11 @@ pub async fn evaluate_tick(db: &Db, bus: &Bus) -> Result<()> {
                 Ok(())
             });
         }
+    }
+
+    // — Réflexes de vie (messages sans réponse, réunions, engagements…) —
+    if let Err(e) = reflexes::evaluate(db, bus) {
+        eprintln!("réflexes : {e}");
     }
 
     // — Brief de démarrage (gate jour + activité + heure-plancher) —

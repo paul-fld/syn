@@ -249,7 +249,7 @@ pub const TURNS: &[TurnCase] = {
 /// reste : mesurer plutôt que supposer. Aucune de ces formulations ne figure
 /// dans le calibrage du modèle.
 pub const MAIL_ACTIONS: &[(&str, super::intent::MailAction)] = {
-    use super::intent::MailAction::{Afficher, Lister, Retrouver, Supprimer};
+    use super::intent::MailAction::{Afficher, Lister, Ranger, Retrouver, Supprimer};
     &[
         ("montre-moi mes derniers mails", Lister),
         ("j'ai des non-lus ?", Lister),
@@ -263,6 +263,9 @@ pub const MAIL_ACTIONS: &[(&str, super::intent::MailAction)] = {
         ("supprime la newsletter Decathlon", Supprimer),
         ("vire ce spam de ma boîte", Supprimer),
         ("mets le mail de relance à la corbeille", Supprimer),
+        ("fais le ménage dans toute ma boîte Gmail", Ranger),
+        ("organise mes vieux messages Outlook", Ranger),
+        ("ma messagerie déborde, trie tout ça", Ranger),
         // ——— Sans le verbe attendu : c'est là que la mesure devient utile ———
         ("j'ai quoi de neuf dans ma messagerie ?", Lister),
         ("quoi de nouveau côté mails ?", Lister),

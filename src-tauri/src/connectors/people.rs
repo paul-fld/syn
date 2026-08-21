@@ -107,6 +107,37 @@ pub fn context(db: &Db, name: &str) -> Result<Value> {
     })
 }
 
+/// Correspondants déjà rencontrés, tels que la toile les a enregistrés
+/// (`memory::graph::note_contact`). Le nom affiché comme l'adresse peuvent
+/// désigner la personne ; les plus fréquents d'abord, car c'est le plus souvent
+/// d'eux qu'on parle.
+fn known_contacts_matching(db: &Db, folded_name: &str) -> Result<Vec<Value>> {
+    db.read(|c| {
+        let mut stmt = c.prepare(
+            "SELECT address, COALESCE(display_name,'') FROM contacts
+             WHERE syn_fold(COALESCE(display_name,'')) LIKE '%'||?1||'%'
+                OR syn_fold(substr(address, 1, instr(address,'@')-1)) LIKE '%'||?1||'%'
+             ORDER BY observations DESC LIMIT 10",
+        )?;
+        let rows = stmt.query_map(params![folded_name], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        let mut out = vec![];
+        for row in rows {
+            let (address, display) = row?;
+            if !valid_email(&address) {
+                continue;
+            }
+            out.push(json!({
+                "name": if display.is_empty() { address.clone() } else { display },
+                "email": address,
+                "source": "correspondants connus",
+            }));
+        }
+        Ok(out)
+    })
+}
+
 /// Correspondants connus par les mails déjà synchronisés (Gmail, Outlook,
 /// Apple Mail). Sans cela, Syn ignorait des adresses qu'il avait pourtant sous
 /// les yeux : l'utilisateur devait lui dicter une adresse figurant dans sa
@@ -167,7 +198,7 @@ fn correspondents_matching(db: &Db, folded_name: &str) -> Result<Vec<Value>> {
 }
 
 /// Découpe `Nom <adresse>` ou une adresse nue. Rend `(nom, adresse)`.
-fn split_address(entry: &str) -> Option<(String, String)> {
+pub fn split_address(entry: &str) -> Option<(String, String)> {
     let entry = entry.trim();
     if let Some(open) = entry.rfind('<') {
         let email = entry[open + 1..].trim_end_matches('>').trim().to_lowercase();
@@ -223,9 +254,17 @@ pub fn resolve_email(db: &Db, name: &str) -> Result<Value> {
         }
         Ok(out)
     })?;
-    // Le carnet d'adresses explicite prime ; les mails déjà synchronisés
+    // Le carnet d'adresses explicite prime ; les correspondants déjà rencontrés
     // complètent quand il ne dit rien.
+    //
+    // Ces correspondants sont désormais tenus à jour par la construction de la
+    // toile (table `contacts`) : une recherche indexée, au lieu de relire 200
+    // corps de mails à chaque « écris à Julie ». Le balayage reste en dernier
+    // recours, pour les messages que la toile n'a pas encore traités.
     let mut matches = matches;
+    if matches.is_empty() {
+        matches = known_contacts_matching(db, &folded)?;
+    }
     if matches.is_empty() {
         matches = correspondents_matching(db, &folded)?;
     }
@@ -389,6 +428,32 @@ mod correspondents_tests {
         let unknown = resolve_email(&db, "Bertrand").unwrap();
         assert_eq!(unknown["resolved"], false, "{unknown}");
         assert!(unknown["matches"].as_array().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Une fois la toile construite, la même résolution passe par la table
+    /// `contacts` (recherche indexée) au lieu de relire les corps de mails.
+    #[test]
+    fn la_toile_resout_le_destinataire_sans_relire_les_mails() {
+        let dir = std::env::temp_dir().join(format!("syn-corresp-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("t.db"), &"7".repeat(64)).unwrap();
+        crate::memory::graph::note_contact(&db, "camille.roux@exemple.fr", "Camille Roux", 10)
+            .unwrap();
+
+        let par_le_nom = resolve_email(&db, "Camille").unwrap();
+        assert_eq!(par_le_nom["resolved"], true, "{par_le_nom}");
+        assert_eq!(par_le_nom["matches"][0]["email"], "camille.roux@exemple.fr");
+        assert_eq!(par_le_nom["matches"][0]["source"], "correspondants connus");
+
+        // Aucun mail en base : la réponse ne vient donc pas du balayage.
+        let aucun_mail: i64 = db
+            .read(|c| Ok(c.query_row("SELECT COUNT(*) FROM items", [], |r| r.get(0))?))
+            .unwrap();
+        assert_eq!(aucun_mail, 0);
+
+        let inconnu = resolve_email(&db, "Bertrand").unwrap();
+        assert_eq!(inconnu["resolved"], false, "{inconnu}");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -32,6 +32,8 @@ const NOTIFICATION_TITLE: Record<string, string> = {
   event: "Événement à venir",
   commitment: "Échéance à venir",
   rule: "Règle déclenchée",
+  // Les réflexes portent leur propre raison (« Message resté sans réponse »,
+  // « Réunion imminente »…) : elle est plus parlante qu'un titre générique.
 };
 
 export function Archives(): JSX.Element {
@@ -139,7 +141,15 @@ export function Archives(): JSX.Element {
         <For each={surfacings() ?? []}>
           {(s: any) => (
             <div class="row-line" style={{ "align-items": "flex-start" }}>
-              <Icon name={s.kind === "system" ? "gauge" : s.kind === "brief" ? "bell" : "bell-dot"} size={14} />
+              <Icon
+                name={
+                  s.kind === "system" ? "gauge"
+                  : s.kind === "brief" ? "bell"
+                  : s.kind === "reflexe" ? "eye"
+                  : "bell-dot"
+                }
+                size={14}
+              />
               <span class="grow" style={{ "white-space": "normal" }}>
                 <b>{NOTIFICATION_TITLE[s.kind] ?? s.reason}</b>
                 <Show when={s.body}>

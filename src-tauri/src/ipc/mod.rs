@@ -507,6 +507,17 @@ pub fn reject_action(state: State<'_, AppState>, action_id: String) -> Result<()
     let core = state.core()?;
     let action = actions::get_action(&core.db, &action_id)?;
     actions::set_action_result(&core.db, &action_id, "rejected", None, None)?;
+    if action.tool == "mail.cleanup.apply" {
+        if let Some(plan_id) = action.input["plan_id"].as_str() {
+            core.db.with(|connection| {
+                connection.execute(
+                    "UPDATE mail_cleanup_plans SET status='rejected' WHERE id=?1 AND status='pending'",
+                    [plan_id],
+                )?;
+                Ok(())
+            })?;
+        }
+    }
     // Un envoi refusé est un envoi abandonné : sans cet effacement, le parcours
     // reproposait la même carte au tour suivant.
     if action.tool == "mail.send" {
@@ -530,7 +541,7 @@ pub fn reject_action(state: State<'_, AppState>, action_id: String) -> Result<()
 }
 
 #[tauri::command]
-pub fn undo_action(state: State<'_, AppState>, action_id: String) -> Result<String> {
+pub async fn undo_action(state: State<'_, AppState>, action_id: String) -> Result<String> {
     let core = state.core()?;
     let action = actions::get_action(&core.db, &action_id)?;
     if action.status != "executed" {
@@ -541,7 +552,13 @@ pub fn undo_action(state: State<'_, AppState>, action_id: String) -> Result<Stri
     let undo = action
         .undo
         .ok_or_else(|| AppError::Invalid("cette action n'a pas de journal d'annulation".into()))?;
-    let report = actions::apply_undo(&core.db, &undo)?;
+    let report = if undo["kind"].as_str() == Some("mail_cleanup") {
+        let report = crate::connectors::external::undo_mail_cleanup(&undo).await?;
+        crate::tools::mail_cleanup::mark_local_after_undo(&core.db, &undo)?;
+        report
+    } else {
+        actions::apply_undo(&core.db, &undo)?
+    };
     actions::set_action_result(&core.db, &action_id, "undone", Some(&report), None)?;
     core.bus.emit(BusEvent::ActionResolved {
         action_id,
@@ -1086,6 +1103,92 @@ pub fn knowledge_stats(state: State<'_, AppState>) -> Result<Value> {
         let facts: i64 = c.query_row("SELECT COUNT(*) FROM items WHERE type='fact' AND status='active'", [], |r| r.get(0))?;
         Ok(json!({"by_type": by, "people": people, "embeddings": embeddings, "facts": facts}))
     })
+}
+
+// ————————————————— La toile, la ligne de temps, les habitudes —————————————————
+
+/// Ce que Syn a tissé : nombre de liens, principaux correspondants, et les
+/// adresses qu'il croit être celles de l'utilisateur (à confirmer).
+///
+/// Tout est montrable : une mémoire qu'on ne peut pas inspecter est une mémoire
+/// qu'on ne peut pas corriger.
+#[tauri::command]
+pub fn memory_graph(state: State<'_, AppState>) -> Result<Value> {
+    let core = state.core()?;
+    Ok(json!({
+        "stats": crate::memory::graph::stats(&core.db)?,
+        "correspondants": crate::memory::graph::top_correspondents(&core.db, 12)?,
+        "identites": crate::memory::graph::list_identity_candidates(&core.db)?,
+        "identites_retenues": crate::memory::graph::self_addresses(&core.db),
+    }))
+}
+
+#[tauri::command]
+pub fn memory_relations(state: State<'_, AppState>, nom: String) -> Result<Value> {
+    let core = state.core()?;
+    crate::memory::graph::lookup(&core.db, &nom)
+}
+
+#[tauri::command]
+pub fn memory_timeline(
+    state: State<'_, AppState>,
+    jours: Option<i64>,
+    sujet: Option<String>,
+    limite: Option<usize>,
+) -> Result<Value> {
+    let core = state.core()?;
+    let mut window =
+        crate::memory::timeline::Window::last_days(jours.unwrap_or(14).clamp(1, 400), limite.unwrap_or(60));
+    window.about = sujet.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    crate::memory::timeline::grouped(&core.db, &window)
+}
+
+/// L'utilisateur confirme (ou corrige) une adresse qui est la sienne. Sans
+/// cela, Syn ne peut pas distinguer un message reçu d'un message envoyé.
+#[tauri::command]
+pub fn memory_set_identity(state: State<'_, AppState>, address: String, mine: bool) -> Result<()> {
+    let core = state.core()?;
+    crate::memory::graph::set_self_address(&core.db, &address, mine)
+}
+
+/// Les habitudes observées : celles qui attendent un avis, et celles déjà
+/// confirmées. Chacune porte ce dont Syn l'a déduite.
+#[tauri::command]
+pub fn habits_list(state: State<'_, AppState>) -> Result<Vec<Value>> {
+    let core = state.core()?;
+    let mut list = crate::memory::habits::list_all(&core.db)?;
+    for habit in list.iter_mut() {
+        let phrase = crate::memory::habits::describe(habit);
+        if let Some(object) = habit.as_object_mut() {
+            object.insert("phrase".into(), json!(phrase));
+        }
+    }
+    Ok(list)
+}
+
+/// L'utilisateur tranche : une habitude confirmée entre dans le comportement de
+/// Syn, une habitude rejetée n'y revient jamais par la porte des observations.
+#[tauri::command]
+pub fn habits_decide(state: State<'_, AppState>, id: String, accepte: bool) -> Result<()> {
+    let core = state.core()?;
+    crate::memory::habits::decide(&core.db, &id, accepte)
+}
+
+/// Reconstruit la toile de zéro. Elle est dérivée des sources déjà indexées :
+/// la jeter ne perd rien, et c'est le bon geste après une correction d'identité.
+#[tauri::command]
+pub async fn memory_rebuild(state: State<'_, AppState>) -> Result<Value> {
+    let core = state.core()?;
+    let db = core.db.clone();
+    let resultat = tauri::async_runtime::spawn_blocking(move || {
+        crate::memory::graph::rebuild(&db)?;
+        let liens = crate::memory::graph::build(&db, 5_000)?;
+        let habitudes = crate::memory::habits::learn(&db, 2_000)?;
+        crate::error::Result::Ok(json!({"elements_relus": liens, "habitudes": habitudes}))
+    })
+    .await
+    .map_err(|e| crate::error::AppError::Other(format!("reconstruction interrompue : {e}")))??;
+    Ok(resultat)
 }
 
 /// Vue compacte des fichiers connus : l'interface n'a pas à afficher des

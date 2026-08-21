@@ -68,6 +68,42 @@ export function Programmations(): JSX.Element {
         </div>
       </div>
 
+      <div class="card">
+        <div class="card-title">
+          <Icon name="eye" size={15} /> Ce que Syn remarque tout seul
+        </div>
+        <div class="empty-note">
+          Chaque réflexe est déterministe et explicable : Syn te dit toujours ce qu'il a vu.
+          Coupe ceux qui ne te servent pas.
+        </div>
+        <div class="row-line">
+          <Icon name="bell-dot" size={14} />
+          <span class="grow">
+            Tous les réflexes
+            <span class="sub"> interrupteur général</span>
+          </span>
+          <Toggle
+            checked={settings()?.notify_reflexes ?? true}
+            onChange={(v) => patch({ notify_reflexes: v })}
+          />
+        </div>
+        <For each={(triggers() ?? []).filter((t: any) => t.source === "system")}>
+          {(t: any) => (
+            <div class="row-line">
+              <Icon name="workflow" size={14} />
+              <span class="grow">
+                {t.reason_template}
+                <span class="sub">
+                  {" "}· priorité {t.priority}
+                  <Show when={t.last_fired}> · dernier signalement {fmtDate(t.last_fired)}</Show>
+                </span>
+              </span>
+              <Toggle checked={t.enabled} onChange={(v) => ipc.triggerToggle(t.id, v).then(() => refetch())} />
+            </div>
+          )}
+        </For>
+      </div>
+
       <div class="section-label">Règles automatiques</div>
       <Show when={(triggers() ?? []).filter((t: any) => t.source === "rule").length === 0}>
         <div class="empty-note">

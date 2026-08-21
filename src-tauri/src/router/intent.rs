@@ -74,6 +74,8 @@ pub enum MailAction {
     Afficher,
     /// Le mettre à la corbeille.
     Supprimer,
+    /// Auditer puis ranger une boîte entière, après revue du plan.
+    Ranger,
 }
 
 /// L'étape en cours d'un parcours, quand il y en a une.
@@ -180,6 +182,7 @@ Choisis UNE intention, d'après ce que l'utilisateur veut obtenir :
     "lister"    — voir sa boîte, ses derniers messages, ses non-lus ;
     "afficher"  — lire le contenu d'un message ;
     "supprimer" — le mettre à la corbeille.
+    "ranger"     — auditer, trier ou nettoyer une boîte mail entière.
 
 - "mail_compose" — il veut qu'un message PARTE vers une personne nommée. Le
   critère est la présence d'un destinataire humain et d'un acte de parole qui
@@ -329,6 +332,10 @@ const CALIBRATION: &[(&str, &str)] = &[
         r#"{"intent":"mail_search","scope":"any","subject":"cette newsletter","mail_action":"supprimer"}"#,
     ),
     (
+        "fais du tri dans toute ma boîte Gmail",
+        r#"{"intent":"mail_search","scope":"google","subject":"","mail_action":"ranger"}"#,
+    ),
+    (
         "dis à Karim que le rendez-vous est décalé",
         r#"{"intent":"mail_compose","scope":"any","subject":"Karim"}"#,
     ),
@@ -387,6 +394,7 @@ fn parse_mail_action(value: Option<&str>) -> Option<MailAction> {
         "lister" | "liste" | "voir" => Some(MailAction::Lister),
         "afficher" | "lire" | "ouvrir" => Some(MailAction::Afficher),
         "supprimer" | "effacer" | "corbeille" => Some(MailAction::Supprimer),
+        "ranger" | "trier" | "nettoyer" | "organiser" => Some(MailAction::Ranger),
         _ => None,
     }
 }
@@ -587,7 +595,7 @@ fn validated_scope(proposed: Scope, text: &str) -> Scope {
         // Les noms de produits comptent au même titre que ceux des services :
         // « le Word du budget » nomme bien un écosystème.
         Scope::Google => mentions(&[
-            "google", "drive", "gdocs", "gsheet", "gslide", "docs", "sheets", "slides",
+            "google", "gmail", "drive", "gdocs", "gsheet", "gslide", "docs", "sheets", "slides",
         ]),
         Scope::Microsoft => mentions(&[
             "onedrive",
@@ -698,6 +706,16 @@ pub fn fallback(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gmail_et_outlook_verrouillent_reellement_la_portee_mail() {
+        assert_eq!(validated_scope(Scope::Google, "range ma boîte Gmail"), Scope::Google);
+        assert_eq!(
+            validated_scope(Scope::Microsoft, "clean up Outlook"),
+            Scope::Microsoft
+        );
+        assert_eq!(parse_mail_action(Some("organiser")), Some(MailAction::Ranger));
+    }
 
     #[test]
     fn le_json_du_modele_est_lu_meme_entoure_de_texte() {

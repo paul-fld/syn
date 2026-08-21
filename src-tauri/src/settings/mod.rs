@@ -65,6 +65,11 @@ pub struct Settings {
     // Personnalisation
     pub voice: VoiceProfile,
     pub theme: String, // "dark" (V1)
+    /// Langue des réponses : "auto" (celle de l'utilisateur, détectée), "fr", "en".
+    /// La langue de TRAVAIL de Syn (consignes internes, requêtes aux services)
+    /// est l'anglais quoi qu'il arrive : ce réglage ne concerne que ce que
+    /// l'utilisateur lit.
+    pub answer_language: String,
     // Accessibilité
     pub voice_input_enabled: bool,
     pub voice_output_enabled: bool,
@@ -81,6 +86,10 @@ pub struct Settings {
     pub notify_commitments: bool,
     pub notify_system: bool,
     pub notify_rules: bool,
+    /// Interrupteur général des réflexes (messages sans réponse, réunions à
+    /// préparer…). Chaque réflexe reste débrayable individuellement dans
+    /// « Mes programmations ».
+    pub notify_reflexes: bool,
     pub work_notification_policy: String, // urgent | relevant
     // Confidentialité
     pub cloud_escalation: bool,  // opt-in, OFF par défaut (invariant 2)
@@ -123,6 +132,7 @@ impl Default for Settings {
             autostart: false,
             voice: VoiceProfile::default(),
             theme: "dark".into(),
+            answer_language: "auto".into(),
             voice_input_enabled: false,
             voice_output_enabled: false,
             // 🔎 tranché au build : Option+Espace, sans conflit avec Spotlight (Cmd+Espace).
@@ -138,6 +148,7 @@ impl Default for Settings {
             notify_commitments: true,
             notify_system: true,
             notify_rules: true,
+            notify_reflexes: true,
             work_notification_policy: "urgent".into(),
             cloud_escalation: false,
             // Décision produit (14/08/2026) : Syn lit tout par défaut — la

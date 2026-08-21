@@ -103,8 +103,15 @@ pub async fn backfill_embeddings(db: &Db, llm: &Arc<dyn LlmClient>, limit: usize
     let embed_model = crate::settings::load(db)?.embed_model;
     let pending: Vec<(String, String, i64, String)> = db.with(|c| {
         let mut stmt = c.prepare(
-            "SELECT item_id, model, chunk_index, text FROM embeddings
-             WHERE vector IS NULL AND model=?2 LIMIT ?1",
+            "SELECT e.item_id,e.model,e.chunk_index,e.text FROM embeddings e
+             LEFT JOIN enrichment_queue q ON q.item_id=e.item_id
+             LEFT JOIN items i ON i.id=e.item_id
+             WHERE e.vector IS NULL AND e.model=?2
+               AND COALESCE(q.state,'pending')!='processing'
+             ORDER BY COALESCE(q.access_count,0) DESC,
+                      COALESCE(q.base_priority,0) DESC,
+                      COALESCE(i.mtime,i.ingested_at,0) DESC
+             LIMIT ?1",
         )?;
         let rows = stmt.query_map(rusqlite::params![limit as i64, embed_model], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
@@ -136,7 +143,7 @@ pub async fn backfill_embeddings(db: &Db, llm: &Arc<dyn LlmClient>, limit: usize
         // serait jamais indexé — c'est ce qui rendait Drive et OneDrive muets.
         let mut done = c.prepare(
             "UPDATE enrichment_queue SET
-                 state=CASE WHEN source='cloud' AND state IN ('pending','error')
+                 state=CASE WHEN source IN ('cloud','mail') AND state IN ('pending','error')
                             THEN state ELSE 'embedded' END,
                  embedding_ready=1,lexical_ready=1,updated_at=?2
              WHERE item_id=?1",

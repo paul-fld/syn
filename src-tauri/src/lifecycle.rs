@@ -112,11 +112,6 @@ pub fn spawn_background_loops(app: &AppHandle) {
                     .map(|settings| settings.indexing_paused)
                     .unwrap_or(true)
             {
-                let _ = core
-                    .indexer
-                    .tx
-                    .send(crate::connectors::files::IndexJob::Drain(32));
-                let _ = crate::ingestion::backfill_embeddings(&core.db, &core.llm, 64).await;
                 // La toile et les habitudes suivent le même budget que l'index :
                 // elles convergent en arrière-plan, jamais au détriment d'une
                 // réponse en cours. Aucun modèle n'est appelé ici.
@@ -157,7 +152,7 @@ pub fn spawn_background_loops(app: &AppHandle) {
             }
             // Les comptes cloud déjà autorisés restent frais sans intervention.
             // Une panne fournisseur n'interrompt jamais les autres boucles.
-            if tick % 30 == 5 {
+            if tick % 5 == 1 || woke {
                 for provider in ["google", "microsoft"] {
                     if crate::connectors::is_connected(&core.db, provider) {
                         let db = core.db.clone();
@@ -175,6 +170,30 @@ pub fn spawn_background_loops(app: &AppHandle) {
                     }
                 }
             }
+        }
+    });
+
+    // Rattrapage lexical/sémantique indépendant de la proactivité. Une cadence
+    // de dix secondes rend le catalogue profond rapidement convergent, mais le
+    // garde-fou système le suspend dès que la machine n'est plus idle/branchée.
+    let handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            let state = handle.state::<AppState>();
+            let Ok(core) = state.core() else { continue };
+            if !crate::connectors::system::background_enrichment_allowed()
+                || crate::settings::load(&core.db)
+                    .map(|settings| settings.indexing_paused)
+                    .unwrap_or(true)
+            {
+                continue;
+            }
+            let _ = core
+                .indexer
+                .tx
+                .send(crate::connectors::files::IndexJob::Drain(16));
+            let _ = crate::ingestion::backfill_embeddings(&core.db, &core.llm, 64).await;
         }
     });
 }

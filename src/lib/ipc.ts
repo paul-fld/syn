@@ -276,6 +276,12 @@ export interface IndexStatus {
   fallback_count: number;
   full_scan_count: number;
   folders: { path: string; last_indexed: number | null }[];
+  cloud_bootstraps: Array<{
+    provider: "google" | "microsoft";
+    resource: "gmail" | "mail" | "drive";
+    processed: number;
+    total: number | null;
+  }>;
 }
 
 export interface HardwareProfile {

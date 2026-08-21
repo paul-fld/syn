@@ -62,6 +62,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0015_mail_cleanup_audit_v2",
         include_str!("../../migrations/0015_mail_cleanup_audit_v2.sql"),
     ),
+    (
+        "0016_connector_bootstrap",
+        include_str!("../../migrations/0016_connector_bootstrap.sql"),
+    ),
 ];
 
 /// Normalisation de recherche : minuscules + suppression des diacritiques

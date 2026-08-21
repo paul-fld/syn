@@ -14,11 +14,26 @@ use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 
-const MAX_MESSAGES: usize = 100;
+const MAX_MESSAGES: usize = 500;
 const MAX_FILES: usize = 500;
 const MAX_CLOUD_FILE_BYTES: u64 = 20 * 1024 * 1024;
+static ACTIVE_SYNCS: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+fn begin_sync(provider: &str) -> bool {
+    ACTIVE_SYNCS
+        .lock()
+        .map(|mut active| active.insert(provider.to_string()))
+        .unwrap_or(false)
+}
+
+fn end_sync(provider: &str) {
+    if let Ok(mut active) = ACTIVE_SYNCS.lock() {
+        active.remove(provider);
+    }
+}
 
 pub async fn sync(
     provider: &str,
@@ -48,21 +63,25 @@ pub async fn sync(
             None,
             Some("Accès immédiat actif · préparation progressive du cache en arrière-plan"),
         )?;
+        if !begin_sync(provider) {
+            return Ok(json!({"status":"connected", "preparing":true, "already_running":true}));
+        }
         let provider_owned = provider.to_string();
         let db_owned = db.clone();
         let llm_owned = llm.clone();
         let bus_owned = bus.clone();
         let model_owned = embed_model.to_string();
         tauri::async_runtime::spawn(async move {
-            if let Err(error) = sync_materialize(
+            let result = sync_materialize(
                 &provider_owned,
                 &db_owned,
                 &llm_owned,
                 &bus_owned,
                 &model_owned,
             )
-            .await
-            {
+            .await;
+            end_sync(&provider_owned);
+            if let Err(error) = result {
                 let _ = super::set_diagnostic(
                     &db_owned,
                     &provider_owned,
@@ -76,7 +95,12 @@ pub async fn sync(
             "mail":0, "files":0, "events":0
         }));
     }
-    sync_materialize(provider, db, llm, bus, embed_model).await
+    if !begin_sync(provider) {
+        return Ok(json!({"status":"connected", "syncing":true, "already_running":true}));
+    }
+    let result = sync_materialize(provider, db, llm, bus, embed_model).await;
+    end_sync(provider);
+    result
 }
 
 async fn sync_materialize(
@@ -150,13 +174,44 @@ fn progress(bus: &Bus, provider: &str, pct: f32, message: &str) {
 }
 
 async fn get_json(client: &reqwest::Client, url: &str, token: &str) -> Result<Value> {
-    let response = client.get(url).bearer_auth(token).send().await?;
-    let status = response.status();
-    let value: Value = response.json().await?;
-    if !status.is_success() {
-        return Err(AppError::Other(format!("API cloud {status} : {value}")));
+    for attempt in 0..3u32 {
+        match client.get(url).bearer_auth(token).send().await {
+            Ok(response) => {
+                let status = response.status();
+                let retry_after = response
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse::<u64>().ok());
+                let payload = response.text().await?;
+                let value: Value = serde_json::from_str(&payload)
+                    .unwrap_or_else(|_| json!({"message": payload}));
+                if status.is_success() {
+                    return Ok(value);
+                }
+                if (status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                    || status.is_server_error())
+                    && attempt < 2
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        retry_after.unwrap_or(1).min(5) * 1_000,
+                    ))
+                    .await;
+                    continue;
+                }
+                return Err(AppError::Other(format!("API cloud {status} : {value}")));
+            }
+            Err(error) if attempt < 2 => {
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    250 * 2u64.pow(attempt),
+                ))
+                .await;
+                let _ = error;
+            }
+            Err(error) => return Err(error.into()),
+        }
     }
-    Ok(value)
+    Err(AppError::Other("API cloud temporairement indisponible".into()))
 }
 
 fn load_cursor(db: &Db, provider: &str, resource: &str) -> Result<Option<String>> {
@@ -202,6 +257,82 @@ fn save_cursor(db: &Db, provider: &str, resource: &str, cursor: &str, delta: boo
                full_sync_count=full_sync_count+excluded.full_sync_count,
                delta_sync_count=delta_sync_count+excluded.delta_sync_count",
             params![provider, resource, cursor, now(), !delta, delta],
+        )?;
+        Ok(())
+    })
+}
+
+#[derive(Debug, Clone)]
+struct BootstrapState {
+    continuation: Option<String>,
+    watermark: Option<String>,
+    processed: usize,
+    total: Option<usize>,
+}
+
+fn load_bootstrap(db: &Db, provider: &str, resource: &str) -> Result<Option<BootstrapState>> {
+    db.with(|connection| {
+        connection
+            .query_row(
+                "SELECT continuation,watermark,processed,total
+                 FROM connector_bootstrap_state WHERE provider=?1 AND resource=?2",
+                params![provider, resource],
+                |row| {
+                    Ok(BootstrapState {
+                        continuation: row.get(0)?,
+                        watermark: row.get(1)?,
+                        processed: row.get::<_, i64>(2)?.max(0) as usize,
+                        total: row.get::<_, Option<i64>>(3)?.map(|value| value.max(0) as usize),
+                    })
+                },
+            )
+            .map(Some)
+            .or_else(|error| {
+                if error == rusqlite::Error::QueryReturnedNoRows {
+                    Ok(None)
+                } else {
+                    Err(error.into())
+                }
+            })
+    })
+}
+
+fn save_bootstrap(
+    db: &Db,
+    provider: &str,
+    resource: &str,
+    continuation: Option<&str>,
+    watermark: Option<&str>,
+    processed: usize,
+    total: Option<usize>,
+) -> Result<()> {
+    db.with(|connection| {
+        connection.execute(
+            "INSERT INTO connector_bootstrap_state
+             (provider,resource,continuation,watermark,processed,total,updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7)
+             ON CONFLICT(provider,resource) DO UPDATE SET
+               continuation=excluded.continuation,watermark=excluded.watermark,
+               processed=excluded.processed,total=excluded.total,updated_at=excluded.updated_at",
+            params![
+                provider,
+                resource,
+                continuation,
+                watermark,
+                processed as i64,
+                total.map(|value| value as i64),
+                now()
+            ],
+        )?;
+        Ok(())
+    })
+}
+
+fn clear_bootstrap(db: &Db, provider: &str, resource: &str) -> Result<()> {
+    db.with(|connection| {
+        connection.execute(
+            "DELETE FROM connector_bootstrap_state WHERE provider=?1 AND resource=?2",
+            params![provider, resource],
         )?;
         Ok(())
     })
@@ -280,6 +411,16 @@ async fn ingest(
         mtime: created_at,
         status: "active".into(),
     };
+    let age_days = created_at
+        .map(|created| now().saturating_sub(created) / 86_400)
+        .unwrap_or(i64::MAX);
+    let base_priority = match item.source.as_str() {
+        "mail" if age_days <= 30 => 950.0,
+        "mail" if age_days <= 365 => 650.0,
+        "mail" => 180.0,
+        "cloud" => 450.0,
+        _ => 300.0,
+    };
     // Une première synchro peut importer des centaines d'objets. Les stocker et
     // les rendre cherchables par FTS ne doit pas attendre un appel d'embedding
     // par objet : le rattrapage global les vectorise ensuite par lots de 64.
@@ -315,7 +456,7 @@ async fn ingest(
                 id,
                 source,
                 item.source_ref,
-                if item.source == "mail" { 700.0 } else { 450.0 },
+                base_priority,
                 !body.trim().is_empty(),
                 now(),
                 changed
@@ -386,15 +527,17 @@ async fn sync_google_mail(
 ) -> Result<usize> {
     let client = reqwest::Client::new();
     let previous = load_cursor(db, "google", "gmail_history")?;
-    let mut ids = Vec::new();
-    let mut removed = Vec::new();
-    let mut next_history = None;
     let mut delta = previous.is_some();
+    let mut ids = HashSet::new();
+    let mut removed = HashSet::new();
+    let mut next_history = None;
 
     if let Some(history_id) = previous.as_deref() {
         let mut page = None;
         loop {
-            let mut url = format!("https://gmail.googleapis.com/gmail/v1/users/me/history?startHistoryId={history_id}&historyTypes=messageAdded&historyTypes=messageDeleted&maxResults=500");
+            // Sans filtre `historyTypes`, Gmail renvoie aussi les changements de
+            // libellés : archivage, retour en boîte et déplacement restent frais.
+            let mut url = format!("https://gmail.googleapis.com/gmail/v1/users/me/history?startHistoryId={history_id}&maxResults=500");
             if let Some(value) = page.as_deref() {
                 url.push_str("&pageToken=");
                 url.push_str(&urlencoding(value));
@@ -403,13 +546,11 @@ async fn sync_google_mail(
                 Ok(value) => {
                     for history in value["history"].as_array().cloned().unwrap_or_default() {
                         ids.extend(
-                            history["messagesAdded"]
+                            history["messages"]
                                 .as_array()
                                 .into_iter()
                                 .flatten()
-                                .filter_map(|entry| {
-                                    entry["message"]["id"].as_str().map(str::to_string)
-                                }),
+                                .filter_map(|entry| entry["id"].as_str().map(str::to_string)),
                         );
                         removed.extend(
                             history["messagesDeleted"]
@@ -432,6 +573,7 @@ async fn sync_google_mail(
                     // où une reliste complète est nécessaire.
                     delta = false;
                     ids.clear();
+                    clear_bootstrap(db, "google", "gmail")?;
                     break;
                 }
                 Err(error) => return Err(error),
@@ -440,16 +582,37 @@ async fn sync_google_mail(
     }
 
     if !delta {
-        // Capture le watermark avant la reliste : un message arrivé pendant la
-        // pagination sera repris au prochain history.list, jamais perdu.
-        let profile = get_json(
-            &client,
-            "https://gmail.googleapis.com/gmail/v1/users/me/profile",
-            token,
-        )
-        .await?;
-        next_history = profile["historyId"].as_str().map(str::to_string);
-        let mut page = None;
+        let state = if let Some(state) = load_bootstrap(db, "google", "gmail")? {
+            state
+        } else {
+            // Watermark capturé avant le catalogue : les arrivées concurrentes
+            // seront reprises par history.list après la dernière page.
+            let profile = get_json(
+                &client,
+                "https://gmail.googleapis.com/gmail/v1/users/me/profile",
+                token,
+            )
+            .await?;
+            let state = BootstrapState {
+                continuation: None,
+                watermark: profile["historyId"].as_str().map(str::to_string),
+                processed: 0,
+                total: profile["messagesTotal"].as_u64().map(|value| value as usize),
+            };
+            save_bootstrap(
+                db,
+                "google",
+                "gmail",
+                None,
+                state.watermark.as_deref(),
+                0,
+                state.total,
+            )?;
+            state
+        };
+        let mut page = state.continuation;
+        let mut processed = state.processed;
+        let total = state.total;
         loop {
             let mut url = format!(
                 "https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults={MAX_MESSAGES}"
@@ -459,33 +622,92 @@ async fn sync_google_mail(
                 url.push_str(&urlencoding(value));
             }
             let value = get_json(&client, &url, token).await?;
-            ids.extend(
+            let page_ids =
                 value["messages"]
                     .as_array()
                     .into_iter()
                     .flatten()
-                    .filter_map(|message| message["id"].as_str().map(str::to_string)),
-            );
-            page = value["nextPageToken"].as_str().map(str::to_string);
-            if page.is_none() {
+                    .filter_map(|message| message["id"].as_str().map(str::to_string))
+                    .collect::<Vec<_>>();
+            let page_count = ingest_gmail_catalog_page(
+                db,
+                llm,
+                bus,
+                embed_model,
+                token,
+                &client,
+                page_ids,
+            )
+            .await?;
+            processed += page_count;
+            let next = value["nextPageToken"].as_str().map(str::to_string);
+            if let Some(next_page) = next.as_deref() {
+                save_bootstrap(
+                    db,
+                    "google",
+                    "gmail",
+                    Some(next_page),
+                    state.watermark.as_deref(),
+                    processed,
+                    total,
+                )?;
+                let denominator = total.unwrap_or(processed.max(1)).max(1);
+                progress(
+                    bus,
+                    "google",
+                    8.0 + 32.0 * processed.min(denominator) as f32 / denominator as f32,
+                    &format!("Gmail : {processed}/{denominator} métadonnées disponibles…"),
+                );
+                page = Some(next_page.to_string());
+            } else {
+                let watermark = state.watermark.as_deref().ok_or_else(|| {
+                    AppError::Other("watermark Gmail initial manquant".into())
+                })?;
+                save_cursor(db, "google", "gmail_history", watermark, false)?;
+                clear_bootstrap(db, "google", "gmail")?;
                 break;
             }
         }
+        return Ok(processed);
     }
-    for id in removed {
+
+    for id in &removed {
         remove_remote_item(db, &format!("google:gmail:{id}"))?;
     }
-    ids.sort();
-    ids.dedup();
-    let requests = ids.into_iter();
-    let fetched = stream::iter(requests)
+    ids.retain(|id| !removed.contains(id));
+    let count = ingest_gmail_catalog_page(
+        db,
+        llm,
+        bus,
+        embed_model,
+        token,
+        &client,
+        ids.into_iter().collect(),
+    )
+    .await?;
+    if let Some(cursor) = next_history {
+        save_cursor(db, "google", "gmail_history", &cursor, true)?;
+    }
+    Ok(count)
+}
+
+async fn ingest_gmail_catalog_page(
+    db: &Db,
+    llm: &Arc<dyn LlmClient>,
+    bus: &Bus,
+    embed_model: &str,
+    token: &str,
+    client: &reqwest::Client,
+    ids: Vec<String>,
+) -> Result<usize> {
+    let fetched = stream::iter(ids)
         .map(|id| {
             let client = client.clone();
             async move {
                 let value = get_json(
                     &client,
                     &format!(
-                        "https://gmail.googleapis.com/gmail/v1/users/me/messages/{id}?format=full"
+                        "https://gmail.googleapis.com/gmail/v1/users/me/messages/{id}?format=metadata&metadataHeaders=Subject&metadataHeaders=From&metadataHeaders=To&metadataHeaders=Date&metadataHeaders=List-ID"
                     ),
                     token,
                 )
@@ -493,30 +715,23 @@ async fn sync_google_mail(
                 Ok::<_, AppError>((id, value))
             }
         })
-        // Première hydratation volontairement douce : l'UI et les recherches
-        // gardent la priorité sur le débit de téléchargement Gmail.
-        .buffer_unordered(4)
+        .buffer_unordered(16)
         .collect::<Vec<_>>()
         .await;
     let mut count = 0;
-    let total = fetched.len().max(1);
-    for (index, result) in fetched.into_iter().enumerate() {
-        if index % 10 == 0 {
-            progress(
-                bus,
-                "google",
-                8.0 + 32.0 * index as f32 / total as f32,
-                &format!("Gmail : {index}/{total} messages…"),
-            );
-        }
-        let (id, value) = result?;
+    for result in fetched {
+        let (id, value) = match result {
+            Ok(value) => value,
+            Err(error) if error.to_string().contains("404") => continue,
+            Err(error) => return Err(error),
+        };
         let payload = &value["payload"];
         let subject = gmail_header(payload, "Subject");
         let from = gmail_header(payload, "From");
         let to = gmail_header(payload, "To");
         let date = gmail_header(payload, "Date");
-        let content = gmail_body(payload);
-        let body = format!("De : {from}\nÀ : {to}\nDate : {date}\nObjet : {subject}\n\n{content}");
+        let snippet = value["snippet"].as_str().unwrap_or_default();
+        let body = format!("De : {from}\nÀ : {to}\nDate : {date}\nObjet : {subject}\n\n{snippet}");
         let created = value["internalDate"]
             .as_str()
             .and_then(|v| v.parse::<i64>().ok())
@@ -543,9 +758,6 @@ async fn sync_google_mail(
         .await?;
         count += 1;
     }
-    if let Some(cursor) = next_history {
-        save_cursor(db, "google", "gmail_history", &cursor, delta)?;
-    }
     Ok(count)
 }
 
@@ -558,9 +770,7 @@ async fn sync_google_drive(
 ) -> Result<usize> {
     let client = reqwest::Client::new();
     let previous = load_cursor(db, "google", "drive_changes")?;
-    let delta = previous.is_some();
-    let mut files = Vec::new();
-    let next_cursor;
+    let mut count = 0usize;
     if let Some(mut page) = previous {
         loop {
             let fields = urlencoding("nextPageToken,newStartPageToken,changes(removed,fileId,file(id,name,mimeType,modifiedTime,webViewLink,size,description,trashed))");
@@ -572,31 +782,56 @@ async fn sync_google_drive(
                 {
                     remove_remote_item(db, &format!("google:drive:{id}"))?;
                 } else if change["file"].is_object() {
-                    files.push(change["file"].clone());
+                    count += ingest_google_drive_page(
+                        db,
+                        llm,
+                        bus,
+                        embed_model,
+                        vec![change["file"].clone()],
+                    )
+                    .await?;
                 }
             }
             if let Some(next) = value["nextPageToken"].as_str() {
                 page = next.to_string();
             } else {
-                next_cursor = value["newStartPageToken"]
+                let next_cursor = value["newStartPageToken"]
                     .as_str()
                     .unwrap_or(&page)
                     .to_string();
+                save_cursor(db, "google", "drive_changes", &next_cursor, true)?;
                 break;
             }
         }
     } else {
-        let start = get_json(
-            &client,
-            "https://www.googleapis.com/drive/v3/changes/startPageToken",
-            token,
-        )
-        .await?;
-        next_cursor = start["startPageToken"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
-        let mut page = None;
+        let state = if let Some(state) = load_bootstrap(db, "google", "drive")? {
+            state
+        } else {
+            let start = get_json(
+                &client,
+                "https://www.googleapis.com/drive/v3/changes/startPageToken",
+                token,
+            )
+            .await?;
+            let state = BootstrapState {
+                continuation: None,
+                watermark: start["startPageToken"].as_str().map(str::to_string),
+                processed: 0,
+                total: None,
+            };
+            save_bootstrap(
+                db,
+                "google",
+                "drive",
+                None,
+                state.watermark.as_deref(),
+                0,
+                None,
+            )?;
+            state
+        };
+        count = state.processed;
+        let mut page = state.continuation;
         loop {
             let fields = urlencoding("nextPageToken,files(id,name,mimeType,modifiedTime,webViewLink,size,description,trashed)");
             let mut url = format!("https://www.googleapis.com/drive/v3/files?pageSize={MAX_FILES}&q=trashed%3Dfalse&fields={fields}");
@@ -605,24 +840,54 @@ async fn sync_google_drive(
                 url.push_str(&urlencoding(value));
             }
             let value = get_json(&client, &url, token).await?;
-            files.extend(value["files"].as_array().cloned().unwrap_or_default());
-            page = value["nextPageToken"].as_str().map(str::to_string);
-            if page.is_none() {
+            count += ingest_google_drive_page(
+                db,
+                llm,
+                bus,
+                embed_model,
+                value["files"].as_array().cloned().unwrap_or_default(),
+            )
+            .await?;
+            let next = value["nextPageToken"].as_str().map(str::to_string);
+            if let Some(next_page) = next.as_deref() {
+                save_bootstrap(
+                    db,
+                    "google",
+                    "drive",
+                    Some(next_page),
+                    state.watermark.as_deref(),
+                    count,
+                    None,
+                )?;
+                progress(
+                    bus,
+                    "google",
+                    55.0,
+                    &format!("Google Drive : {count} fichiers catalogués…"),
+                );
+                page = Some(next_page.to_string());
+            } else {
+                let cursor = state.watermark.as_deref().ok_or_else(|| {
+                    AppError::Other("watermark Google Drive initial manquant".into())
+                })?;
+                save_cursor(db, "google", "drive_changes", cursor, false)?;
+                clear_bootstrap(db, "google", "drive")?;
                 break;
             }
         }
     }
-    let mut count = 0;
-    let total = files.len().max(1);
-    for (index, file) in files.into_iter().enumerate() {
-        if index % 10 == 0 {
-            progress(
-                bus,
-                "google",
-                42.0 + 44.0 * index as f32 / total as f32,
-                &format!("Google Drive : {index}/{total} fichiers…"),
-            );
-        }
+    Ok(count)
+}
+
+async fn ingest_google_drive_page(
+    db: &Db,
+    llm: &Arc<dyn LlmClient>,
+    bus: &Bus,
+    embed_model: &str,
+    files: Vec<Value>,
+) -> Result<usize> {
+    let mut count = 0usize;
+    for file in files {
         let Some(id) = file["id"].as_str() else {
             continue;
         };
@@ -643,8 +908,9 @@ async fn sync_google_drive(
         // Le catalogue Drive est immédiatement recherchable par nom, type et
         // description. Télécharger/extracter des dizaines de fichiers ici
         // recréerait une synchronisation bloquante.
-        let content: Option<String> = None;
-        let body = format!("Nom : {name}\nType : {mime}\nDescription : {description}\nEmplacement cloud : Google Drive\n\n{}", content.unwrap_or_default());
+        let body = format!(
+            "Nom : {name}\nType : {mime}\nDescription : {description}\nEmplacement cloud : Google Drive"
+        );
         ingest(
             db,
             llm,
@@ -662,9 +928,6 @@ async fn sync_google_drive(
         )
         .await?;
         count += 1;
-    }
-    if !next_cursor.is_empty() {
-        save_cursor(db, "google", "drive_changes", &next_cursor, delta)?;
     }
     Ok(count)
 }
@@ -712,86 +975,122 @@ async fn sync_ms_mail(
     let client = reqwest::Client::new();
     let previous = load_cursor(db, "microsoft", "mail_delta")?;
     let delta = previous.is_some();
-    let mut url = previous.unwrap_or_else(|| format!("https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages/delta?$top={MAX_MESSAGES}&$select=id,subject,from,toRecipients,receivedDateTime,bodyPreview,body,webLink"));
-    let mut messages = Vec::new();
-    let cursor;
+    let initial_url = format!("https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages/delta?$top={MAX_MESSAGES}&$select=id,subject,from,toRecipients,receivedDateTime,bodyPreview,webLink");
+    let mut processed = 0usize;
+    let mut total = None;
+    let mut url = if let Some(cursor) = previous {
+        cursor
+    } else if let Some(state) = load_bootstrap(db, "microsoft", "mail")? {
+        processed = state.processed;
+        total = state.total;
+        state.continuation.unwrap_or(initial_url)
+    } else {
+        let folder = get_json(
+            &client,
+            "https://graph.microsoft.com/v1.0/me/mailFolders/inbox?$select=totalItemCount",
+            token,
+        )
+        .await?;
+        total = folder["totalItemCount"].as_u64().map(|value| value as usize);
+        save_bootstrap(
+            db,
+            "microsoft",
+            "mail",
+            Some(&initial_url),
+            None,
+            0,
+            total,
+        )?;
+        initial_url
+    };
     loop {
-        let response = client
-            .get(&url)
-            .bearer_auth(token)
-            .header("Prefer", "outlook.body-content-type=\"text\"")
-            .send()
-            .await?;
-        let status = response.status();
-        let value: Value = response.json().await?;
-        if !status.is_success() {
-            return Err(AppError::Other(format!(
-                "Microsoft Graph {status} : {value}"
-            )));
+        if !url.starts_with("https://graph.microsoft.com/") {
+            return Err(AppError::Security(
+                "Pagination Outlook sortie du domaine Microsoft.".into(),
+            ));
         }
+        let value = get_json(&client, &url, token).await?;
+        let mut page_count = 0usize;
         for message in value["value"].as_array().cloned().unwrap_or_default() {
             if message["@removed"].is_object() {
                 if let Some(id) = message["id"].as_str() {
                     remove_remote_item(db, &format!("microsoft:mail:{id}"))?;
                 }
-            } else {
-                messages.push(message);
+                continue;
             }
-        }
-        if let Some(next) = value["@odata.nextLink"].as_str() {
-            url = next.to_string();
-        } else {
-            cursor = value["@odata.deltaLink"]
+            let Some(id) = message["id"].as_str() else {
+                continue;
+            };
+            let subject = message["subject"]
                 .as_str()
-                .unwrap_or(&url)
+                .unwrap_or("(sans objet)")
                 .to_string();
-            break;
+            let from = message["from"]["emailAddress"]["address"]
+                .as_str()
+                .unwrap_or("");
+            let recipients = message["toRecipients"]
+                .as_array()
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(|recipient| recipient["emailAddress"]["address"].as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            let preview = message["bodyPreview"].as_str().unwrap_or("");
+            let body = format!("De : {from}\nÀ : {recipients}\nObjet : {subject}\n\n{preview}");
+            ingest(
+                db,
+                llm,
+                bus,
+                embed_model,
+                "mail",
+                format!("microsoft:mail:{id}"),
+                "email",
+                subject,
+                body,
+                message["receivedDateTime"].as_str().and_then(timestamp),
+                message["webLink"].as_str().map(str::to_string),
+                Some("message/rfc822".into()),
+                None,
+            )
+            .await?;
+            page_count += 1;
         }
-    }
-    for message in &messages {
-        let Some(id) = message["id"].as_str() else {
+        processed += page_count;
+        if let Some(next) = value["@odata.nextLink"].as_str() {
+            if !delta {
+                save_bootstrap(
+                    db,
+                    "microsoft",
+                    "mail",
+                    Some(next),
+                    None,
+                    processed,
+                    total,
+                )?;
+                let denominator = total.unwrap_or(processed.max(1)).max(1);
+                progress(
+                    bus,
+                    "microsoft",
+                    8.0 + 32.0 * processed.min(denominator) as f32 / denominator as f32,
+                    &format!("Outlook : {processed}/{denominator} métadonnées disponibles…"),
+                );
+            }
+            url = next.to_string();
             continue;
-        };
-        let subject = message["subject"]
-            .as_str()
-            .unwrap_or("(sans objet)")
-            .to_string();
-        let from = message["from"]["emailAddress"]["address"]
-            .as_str()
-            .unwrap_or("");
-        let recipients = message["toRecipients"]
-            .as_array()
-            .map(|values| {
-                values
-                    .iter()
-                    .filter_map(|v| v["emailAddress"]["address"].as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            })
-            .unwrap_or_default();
-        let content = message["body"]["content"]
-            .as_str()
-            .unwrap_or_else(|| message["bodyPreview"].as_str().unwrap_or(""));
-        let body = format!("De : {from}\nÀ : {recipients}\nObjet : {subject}\n\n{content}");
-        ingest(
-            db,
-            llm,
-            bus,
-            embed_model,
-            "mail",
-            format!("microsoft:mail:{id}"),
-            "email",
-            subject,
-            body,
-            message["receivedDateTime"].as_str().and_then(timestamp),
-            message["webLink"].as_str().map(str::to_string),
-            Some("message/rfc822".into()),
-            None,
-        )
-        .await?;
+        }
+        let cursor = value["@odata.deltaLink"].as_str().ok_or_else(|| {
+            AppError::Other("Microsoft n’a pas renvoyé de curseur delta mail".into())
+        })?;
+        save_cursor(db, "microsoft", "mail_delta", cursor, delta)?;
+        if !delta {
+            clear_bootstrap(db, "microsoft", "mail")?;
+        }
+        break;
     }
-    save_cursor(db, "microsoft", "mail_delta", &cursor, delta)?;
-    Ok(messages.len())
+    Ok(processed)
 }
 
 async fn sync_ms_drive(
@@ -804,33 +1103,82 @@ async fn sync_ms_drive(
     let client = reqwest::Client::new();
     let previous = load_cursor(db, "microsoft", "drive_delta")?;
     let delta = previous.is_some();
-    let mut url = previous.unwrap_or_else(|| format!("https://graph.microsoft.com/v1.0/me/drive/root/delta?$top={MAX_FILES}&$select=id,name,file,folder,size,lastModifiedDateTime,webUrl,deleted"));
-    let mut files = Vec::new();
-    let cursor;
+    let initial_url = format!("https://graph.microsoft.com/v1.0/me/drive/root/delta?$top={MAX_FILES}&$select=id,name,file,folder,size,lastModifiedDateTime,webUrl,deleted");
+    let mut count = 0usize;
+    let mut url = if let Some(cursor) = previous {
+        cursor
+    } else if let Some(state) = load_bootstrap(db, "microsoft", "drive")? {
+        count = state.processed;
+        state.continuation.unwrap_or(initial_url)
+    } else {
+        save_bootstrap(
+            db,
+            "microsoft",
+            "drive",
+            Some(&initial_url),
+            None,
+            0,
+            None,
+        )?;
+        initial_url
+    };
     loop {
+        if !url.starts_with("https://graph.microsoft.com/") {
+            return Err(AppError::Security(
+                "Pagination OneDrive sortie du domaine Microsoft.".into(),
+            ));
+        }
         let value = get_json(&client, &url, token).await?;
-        files.extend(value["value"].as_array().cloned().unwrap_or_default());
+        count += ingest_ms_drive_page(
+            db,
+            llm,
+            bus,
+            embed_model,
+            value["value"].as_array().cloned().unwrap_or_default(),
+        )
+        .await?;
         if let Some(next) = value["@odata.nextLink"].as_str() {
+            if !delta {
+                save_bootstrap(
+                    db,
+                    "microsoft",
+                    "drive",
+                    Some(next),
+                    None,
+                    count,
+                    None,
+                )?;
+                progress(
+                    bus,
+                    "microsoft",
+                    55.0,
+                    &format!("OneDrive : {count} éléments catalogués…"),
+                );
+            }
             url = next.to_string();
         } else {
-            cursor = value["@odata.deltaLink"]
+            let cursor = value["@odata.deltaLink"]
                 .as_str()
-                .unwrap_or(&url)
-                .to_string();
+                .ok_or_else(|| AppError::Other("curseur delta OneDrive manquant".into()))?;
+            save_cursor(db, "microsoft", "drive_delta", cursor, delta)?;
+            if !delta {
+                clear_bootstrap(db, "microsoft", "drive")?;
+            }
             break;
         }
     }
-    let mut count = 0;
-    let total = files.len().max(1);
-    for (index, file) in files.into_iter().enumerate() {
-        if index % 10 == 0 {
-            progress(
-                bus,
-                "microsoft",
-                42.0 + 44.0 * index as f32 / total as f32,
-                &format!("OneDrive : {index}/{total} fichiers…"),
-            );
-        }
+    Ok(count)
+}
+
+async fn ingest_ms_drive_page(
+    db: &Db,
+    llm: &Arc<dyn LlmClient>,
+    bus: &Bus,
+    embed_model: &str,
+    files: Vec<Value>,
+) -> Result<usize> {
+    let mut count = 0usize;
+    for file in files {
         if file["deleted"].is_object() {
             if let Some(id) = file["id"].as_str() {
                 remove_remote_item(db, &format!("microsoft:drive:{id}"))?;
@@ -851,10 +1199,8 @@ async fn sync_ms_drive(
             .as_str()
             .unwrap_or("application/octet-stream")
             .to_string();
-        let content: Option<String> = None;
         let body = format!(
-            "Nom : {name}\nType : {mime}\nEmplacement cloud : Microsoft OneDrive\n\n{}",
-            content.unwrap_or_default()
+            "Nom : {name}\nType : {mime}\nEmplacement cloud : Microsoft OneDrive"
         );
         ingest(
             db,
@@ -874,7 +1220,6 @@ async fn sync_ms_drive(
         .await?;
         count += 1;
     }
-    save_cursor(db, "microsoft", "drive_delta", &cursor, delta)?;
     Ok(count)
 }
 
@@ -3032,6 +3377,47 @@ mod tests {
             "un redémarrage doit reprendre page-1 et incrémenter uniquement delta_sync_count"
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn une_synchro_initiale_reprend_exactement_sa_page_suivante() {
+        let root = std::env::temp_dir().join(format!("syn-bootstrap-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let db = Db::open(&root.join("test.db"), &"3".repeat(64)).unwrap();
+
+        save_bootstrap(
+            &db,
+            "google",
+            "gmail_messages",
+            Some("page-42"),
+            Some("history-9000"),
+            20_500,
+            Some(100_000),
+        )
+        .unwrap();
+        let state = load_bootstrap(&db, "google", "gmail_messages")
+            .unwrap()
+            .expect("le point de reprise doit exister");
+        assert_eq!(state.continuation.as_deref(), Some("page-42"));
+        assert_eq!(state.watermark.as_deref(), Some("history-9000"));
+        assert_eq!(state.processed, 20_500);
+        assert_eq!(state.total, Some(100_000));
+
+        clear_bootstrap(&db, "google", "gmail_messages").unwrap();
+        assert!(load_bootstrap(&db, "google", "gmail_messages")
+            .unwrap()
+            .is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn deux_synchros_du_meme_connecteur_ne_se_lancent_pas_en_parallele() {
+        let provider = format!("test-{}", uuid::Uuid::new_v4());
+        assert!(begin_sync(&provider));
+        assert!(!begin_sync(&provider));
+        end_sync(&provider);
+        assert!(begin_sync(&provider));
+        end_sync(&provider);
     }
 
     #[test]

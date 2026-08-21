@@ -158,6 +158,27 @@ impl AppState {
                 let _ = crate::connectors::messages::sync(&db, &llm, &bus, &embed_model).await;
             });
         }
+        // Les connecteurs cloud reprennent immédiatement leur curseur au
+        // démarrage. Le verrou par fournisseur empêche cette reprise de doubler
+        // une synchronisation déjà lancée par la connexion ou la boucle de fond.
+        for provider in ["google", "microsoft"] {
+            if crate::connectors::is_connected(&core.db, provider) {
+                let db = core.db.clone();
+                let llm = core.llm.clone();
+                let bus = core.bus.clone();
+                let embed_model = settings.embed_model.clone();
+                tauri::async_runtime::spawn(async move {
+                    let _ = crate::connectors::external::sync(
+                        provider,
+                        &db,
+                        &llm,
+                        &bus,
+                        &embed_model,
+                    )
+                    .await;
+                });
+            }
+        }
         Ok(core)
     }
 

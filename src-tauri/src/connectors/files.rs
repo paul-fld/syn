@@ -271,6 +271,14 @@ pub enum IndexJob {
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
+pub struct CloudBootstrapStatus {
+    pub provider: String,
+    pub resource: String,
+    pub processed: i64,
+    pub total: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
 pub struct IndexStatus {
     pub running: bool,
     pub phase: String,
@@ -292,6 +300,7 @@ pub struct IndexStatus {
     pub fallback_count: i64,
     pub full_scan_count: i64,
     pub folders: Vec<FolderStatus>,
+    pub cloud_bootstraps: Vec<CloudBootstrapStatus>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -733,6 +742,25 @@ impl Indexer {
             }
             Ok(out)
         })?;
+        let cloud_bootstraps = db.read(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT provider,resource,processed,total FROM connector_bootstrap_state
+                 ORDER BY provider,resource",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok(CloudBootstrapStatus {
+                    provider: row.get(0)?,
+                    resource: row.get(1)?,
+                    processed: row.get(2)?,
+                    total: row.get(3)?,
+                })
+            })?;
+            let mut statuses = Vec::new();
+            for row in rows {
+                statuses.push(row?);
+            }
+            Ok(statuses)
+        })?;
         let running = self.running.load(Ordering::SeqCst);
         let catalog_ready =
             !folders.is_empty() && folders.iter().all(|folder| folder.last_indexed.is_some());
@@ -777,6 +805,7 @@ impl Indexer {
             fallback_count,
             full_scan_count,
             folders,
+            cloud_bootstraps,
         })
     }
 }

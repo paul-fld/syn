@@ -227,6 +227,29 @@ export function Connecteurs(): JSX.Element {
             </span>
           </div>
         </Show>
+        <For each={indexStatus()?.cloud_bootstraps ?? []}>
+          {(bootstrap) => {
+            const service = bootstrap.provider === "google"
+              ? (bootstrap.resource === "gmail" ? "Gmail" : "Google Drive")
+              : (bootstrap.resource === "mail" ? "Outlook" : "OneDrive");
+            const denominator = bootstrap.total ?? bootstrap.processed;
+            const pct = bootstrap.total
+              ? Math.min(100, bootstrap.processed * 100 / Math.max(1, bootstrap.total))
+              : null;
+            return (
+              <div class="sub" style={{ "margin-top": "8px", color: "var(--text-secondary)" }}>
+                Catalogue {service} disponible progressivement : {bootstrap.processed}
+                {bootstrap.total != null ? `/${denominator}` : " éléments"}
+                <Show when={pct != null}>
+                  <div class="progress-track">
+                    <div class="progress-fill" style={{ width: `${pct}%` }} />
+                  </div>
+                </Show>
+                <span class="muted">La recherche directe reste disponible pendant cette préparation.</span>
+              </div>
+            );
+          }}
+        </For>
         <Show when={(indexStatus()?.pending_embeddings ?? 0) > 0}>
           <div class="sub muted" style={{ "margin-top": "6px" }}>
             {indexStatus()!.pending_embeddings} passages seront analysés lorsque le moteur local sera disponible.
